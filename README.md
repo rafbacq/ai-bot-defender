@@ -26,5 +26,5 @@ This is your chance to shape how organizations defend their digital assets & gai
 Abigael Kipkorir . Nicole Li . Cole Burke . Paola Di Bono . Tristan Carter
 
 ## Resources
-https://arguslab.pratt.duke.edu/research/
-https://www.paladincapgroup.com/wp-content/uploads/2025/06/AI-Tech-Stack-Report.pdf
+1. https://arguslab.pratt.duke.edu/research/
+2. https://www.paladincapgroup.com/wp-content/uploads/2025/06/AI-Tech-Stack-Report.pdf
