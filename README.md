@@ -23,7 +23,7 @@ This is your chance to shape how organizations defend their digital assets & gai
 
 ## Team
 
-Grace Zhan · Jack Yi · Nithi Vechalapu · Raphael Karamagi
+Abigael Kipkorir . Nicole Li . Cole Burke . Paola Di Bono . Tristan Carter
 
 ## Resources
 https://arguslab.pratt.duke.edu/research/
