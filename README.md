@@ -1,6 +1,5 @@
 # AI Bot Defender 
 ### Code+ 2026 — Duke Office of Information Technology
-> **Draft** — subject to change as scope is confirmed with stakeholders
 
 ---
 
