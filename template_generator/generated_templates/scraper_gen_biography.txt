@@ -1,0 +1,10 @@
+fake.city()
+fake.last_name()
+fake.company()
+fake.first_name() + ' ' + fake.last_name()
+fake.first_name() + ' ' + fake.last_name()
+fake.company() + ' Association'
+fake.word().capitalize()
+fake.city()
+fake.last_name() + ' Foundation'
+fake.last_name()

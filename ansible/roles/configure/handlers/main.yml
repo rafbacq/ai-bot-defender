@@ -1,0 +1,12 @@
+---
+# Reload (never restart) nginx so adding/changing a site never drops the others.
+# Validate first; failed_when:false because the proxy stack may not be up yet on
+# the very first deploy (start it with `make proxy`). Runs at end of play, after
+# the deploy role has brought the site's container up.
+- name: Validate and reload nginx
+  ansible.builtin.command: "docker exec {{ proxy.container }} {{ item }}"
+  loop:
+    - nginx -t
+    - nginx -s reload
+  changed_when: true
+  failed_when: false

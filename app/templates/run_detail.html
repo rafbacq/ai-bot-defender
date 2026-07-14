@@ -1,0 +1,323 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Manual evaluation' if run and run.kind == 'manual' else 'Detection run' }} — AI Bot Defender{% endblock %}
+
+{% set is_manual = (run and run.kind == 'manual') or (live and live.kind == 'manual') %}
+{% set is_live = live and live.present and not live.done %}
+
+{% block content %}
+<div class="page-head">
+    <h1>{{ 'Manual evaluation' if is_manual else 'Detection run' }}</h1>
+    <p class="mono" style="font-size:13px">{{ run_id }}{% if run and run.engine %} · engine {{ run.engine }}{% endif %}</p>
+</div>
+
+<a class="btn btn--ghost btn--sm mb-5" href="/query">← All investigations</a>
+
+{# ============================ LIVE (in-flight) view ============================ #}
+{% if is_live %}
+<div id="live" data-status-url="/query/runs/{{ run_id }}/status">
+    <!-- Stage stepper -->
+    <div class="card card--pad mb-5">
+        <div class="flex items-center justify-between mb-3">
+            <h2 class="section-title" style="margin:0">Investigation in progress</h2>
+            <span class="badge badge--warn"><span class="live-dot"></span> running</span>
+        </div>
+        <div class="runsteps" id="runsteps">
+            {% set stages = [
+                ('resolving', 'Resolve target'),
+                ('prompt', 'Generate prompt'),
+                ('querying', 'Query models'),
+                ('evaluating', 'Attribute'),
+                ('finished', 'Results')] %}
+            {% for key, label in stages %}
+            <div class="runstep" data-stage="{{ key }}">
+                <span class="runstep__dot"></span>
+                <span class="runstep__label">{{ label }}</span>
+            </div>
+            {% endfor %}
+        </div>
+        <p class="muted mt-3" id="stage-label" style="font-size:13px">{{ live.stage_label }}</p>
+    </div>
+
+    <!-- Generated prompt (revealed once the prompt stage completes) -->
+    <div class="card card--pad mb-5" id="prompt-card" style="display:none">
+        <h2 class="section-title" style="margin-top:0">Retrieval prompt
+            <span class="field-hint" id="prompt-subject"></span></h2>
+        <pre class="codeblock" id="prompt-text" style="max-height:220px"></pre>
+    </div>
+
+    <!-- Per-model live responses -->
+    <h2 class="section-title">Model responses</h2>
+    <p class="muted" style="font-size:12.5px;margin-top:-6px">Each model is queried live; responses populate as they arrive.
+       The attribution results appear once every model has answered.</p>
+    <div class="space-y-3" id="model-cards">
+        {% for m in live.models %}
+        <div class="card card--pad model-card" data-model="{{ m.model }}">
+            <div class="flex items-center justify-between">
+                <span class="mono font-bold" style="color:var(--heading)">{{ m.model }}</span>
+                <span class="model-card__status badge badge--neutral" data-role="status">pending</span>
+            </div>
+            <p class="muted model-card__note" data-role="note" style="font-size:12.5px;margin:8px 0 0">Waiting…</p>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+{# ============================ Not found / interrupted ========================= #}
+{% elif not run %}
+<div class="card card--pad muted">No run found with that id.</div>
+
+{% else %}
+{# ============================ RESULTS view ==================================== #}
+
+{% if live and live.interrupted %}
+<div class="notice notice--warn mb-6">
+    <div class="notice__title">Run interrupted</div>
+    <p class="muted" style="margin:0">This run was still in progress when the app restarted, so it never
+       finished. Start it again from the <a href="/query">investigation launcher</a>.</p>
+</div>
+{% elif run.status == 'failed' %}
+<div class="notice notice--err mb-6">
+    <div class="notice__title">Run failed</div>
+    <p class="muted" style="margin:0">{{ run.error }}</p>
+</div>
+{% endif %}
+
+<!-- Summary -->
+<div class="card card--pad mb-6">
+    <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div><div class="field-label" style="margin:0">Subject</div><div class="font-semibold">{{ run.subject or '—' }}</div></div>
+        <div><div class="field-label" style="margin:0">Target</div><div class="mono truncate" title="{{ run.target_url }}">{{ run.host_header or run.target_url }}</div></div>
+        <div><div class="field-label" style="margin:0">Ground truth</div><div>{{ run.ground_truth_source or '—' }}</div></div>
+        <div><div class="field-label" style="margin:0">Status</div>
+            <div>{% if run.status == 'completed' %}<span class="badge badge--clean">completed</span>{% else %}<span class="badge badge--warn">{{ run.status }}</span>{% endif %}</div>
+        </div>
+    </div>
+    {% if run.summary %}
+    <hr class="divider">
+    <div class="flex flex-wrap gap-x-8 gap-y-2" style="font-size:14px">
+        <div><span class="muted">Models tested</span> · <strong>{{ run.summary.models_tested }}</strong></div>
+        <div><span class="muted">Leaks detected</span> · <strong style="color:{{ 'var(--copper)' if run.summary.matches_found else 'var(--eno)' }}">{{ run.summary.matches_found }}</strong></div>
+        <div><span class="muted">Best score</span> · <strong>{{ run.summary.best_score }}</strong></div>
+        <div><span class="muted">Threshold</span> · {{ run.summary.threshold }}</div>
+        <div><span class="muted">Ground-truth rows</span> · {{ run.summary.ground_truth_rows }}</div>
+    </div>
+    {% endif %}
+</div>
+
+<!-- Cross-model attribution ranking (auto_query engine) -->
+{% if run.summary and run.summary.ranking %}
+<div class="card card--pad mb-6">
+    <h2 class="section-title" style="margin-top:0">Model ranking</h2>
+    <p class="muted" style="font-size:12.5px;margin-top:0">Models ordered by how much of one crawler's canary set
+       they recovered — coverage is recovered / total canaries of the top-matching crawler row.</p>
+    <div class="table-wrap">
+        <table class="tbl">
+            <thead><tr><th>#</th><th>Model</th><th>Coverage</th><th>Canaries hit</th><th>Top crawler (user-agent)</th></tr></thead>
+            <tbody>
+            {% for entry in run.summary.ranking %}
+            <tr>
+                <td class="mono">{{ loop.index }}</td>
+                <td class="mono">{{ entry.model }}</td>
+                <td><strong style="color:{{ 'var(--copper)' if entry.coverage >= run.summary.threshold else 'var(--eno)' }}">{{ entry.coverage }}</strong></td>
+                <td>{{ entry.hits }}</td>
+                <td class="truncate" style="max-width:420px" title="{{ entry.top_bot or '' }}">{{ entry.top_bot or '—' }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% if run.summary.attribution_summary %}
+    <details class="mt-3">
+        <summary>Human-readable attribution summary</summary>
+        <pre class="codeblock mt-2" style="max-height:320px">{{ run.summary.attribution_summary }}</pre>
+    </details>
+    {% endif %}
+</div>
+{% endif %}
+
+<!-- Downloads: final results + the intermediate pipeline artifacts. The
+     intermediates (generated prompt, raw model responses, content extraction)
+     are deliberately not rendered inline — this card is the way to inspect them. -->
+<div class="card card--pad mb-6">
+    <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+        <h2 class="section-title" style="margin:0">Downloads</h2>
+        <span class="badge badge--neutral">{{ 'manual evaluation' if is_manual else 'detection run' }}</span>
+    </div>
+    <p class="muted" style="font-size:12.5px;margin-top:0">Take the final results with you, or inspect the
+       intermediate pipeline stages — they are kept out of the report above to keep it readable.</p>
+    <div class="dl-grid">
+        <a class="dl" href="/query/runs/{{ run_id }}/download/results">
+            <span class="dl__name">Full results <span class="dl__ext">.json</span></span>
+            <span class="dl__meta">Complete run record — verdicts, attribution profiles, ranking</span>
+        </a>
+        {% if run.results %}
+        <a class="dl" href="/query/runs/{{ run_id }}/download/results.csv">
+            <span class="dl__name">Results summary <span class="dl__ext">.csv</span></span>
+            <span class="dl__meta">One row per model — verdict, coverage, matched canaries</span>
+        </a>
+        {% endif %}
+        {% if run.role_prompt or run.questions %}
+        <a class="dl dl--step" href="/query/runs/{{ run_id }}/download/prompt">
+            <span class="dl__name">Retrieval prompt <span class="dl__ext">.txt</span></span>
+            <span class="dl__meta">Intermediate · the composed prompt {{ 'run in each chatbot' if is_manual else 'sent to each model' }}</span>
+        </a>
+        {% endif %}
+        {% if run.results %}
+        <a class="dl dl--step" href="/query/runs/{{ run_id }}/download/raw_responses">
+            <span class="dl__name">Raw model responses <span class="dl__ext">.json</span></span>
+            <span class="dl__meta">Intermediate · each model's unprocessed answer{{ 's, as collected' if is_manual }}</span>
+        </a>
+        <a class="dl dl--step" href="/query/runs/{{ run_id }}/download/extraction">
+            <span class="dl__name">Content extraction <span class="dl__ext">.json</span></span>
+            <span class="dl__meta">Intermediate · extraction schema + per-model structured evidence</span>
+        </a>
+        {% endif %}
+    </div>
+</div>
+
+<!-- Per-model results -->
+<h2 class="section-title">Per-model results</h2>
+<div class="space-y-4">
+    {% for r in run.results %}
+    <div class="card card--pad">
+        <div class="flex items-center justify-between mb-2">
+            <span class="mono font-bold" style="color:var(--heading)">{{ r.model }}</span>
+            {% if r.error %}<span class="badge badge--alert">{{ r.error_kind|replace('_',' ') if r.error_kind else 'error' }}</span>
+            {% elif r.leaked %}<span class="badge badge--alert">leak · {{ r.best_match.jaccard_score }}</span>
+            {% else %}<span class="badge badge--clean">no leak · {{ r.best_match.jaccard_score if r.best_match else 0 }}</span>{% endif %}
+        </div>
+        {% if r.error %}
+        <div class="notice notice--warn" style="padding:11px 13px">
+            <p style="margin:0;font-weight:600">{{ r.error }}</p>
+            {% if r.error_detail %}<details class="mt-1"><summary>Provider detail</summary><pre class="codeblock mt-2" style="max-height:160px">{{ r.error_detail }}</pre></details>{% endif %}
+        </div>
+        {% else %}
+        {% if r.best_match and r.best_match.matches %}
+        <div class="mb-3">
+            <div class="field-label">Matched canary tokens
+                <span class="field-hint">· vs. {{ r.best_match.bot }}{% if r.best_match.hit_count %} · {{ r.best_match.hit_count }}/{{ r.best_match.total_canaries }} canaries{% endif %}</span></div>
+            <div class="flex flex-wrap gap-2">
+                {% for m in r.best_match.matches %}<span class="badge badge--alert">{{ m }}</span>{% endfor %}
+            </div>
+        </div>
+        {% endif %}
+        {% if r.attribution_profile %}
+        <details class="mb-3">
+            <summary>Attribution profile — {{ r.attribution_profile|length }} crawler row{{ 's' if r.attribution_profile|length != 1 }} with evidence</summary>
+            <div class="table-wrap mt-2" style="max-height:280px">
+                <table class="tbl">
+                    <thead><tr><th>Crawler (user-agent)</th><th>Hits</th><th>Coverage</th><th>Dupes</th><th>Matches</th></tr></thead>
+                    <tbody>
+                    {% for p in r.attribution_profile %}
+                    <tr>
+                        <td class="truncate" style="max-width:280px" title="{{ p.bot or '' }}">{{ p.bot or '—' }}</td>
+                        <td>{{ p.hit_count }}/{{ p.total_canaries }}</td>
+                        <td class="mono">{{ p.coverage }}</td>
+                        <td>{{ p.duplicate_count or 1 }}</td>
+                        <td>
+                            <div class="flex flex-wrap gap-1">
+                                {% for m in p.matches %}<span class="badge {{ 'badge--alert' if p.hit_count >= 2 else 'badge--warn' }}" style="font-size:11px">{{ m }}</span>{% endfor %}
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </details>
+        {% endif %}
+        {# The raw answer + extracted fields are intermediate artifacts — not
+           rendered inline; see the Downloads card above. #}
+        <p class="muted" style="font-size:12px;margin:0">{{ '{:,}'.format((r.answer or '')|length) }} characters received ·
+           raw response and extracted evidence available under <strong>Downloads</strong>.</p>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if is_live %}
+<script>
+(function () {
+  const root = document.getElementById('live');
+  if (!root) return;
+  const statusUrl = root.dataset.statusUrl;
+  const stageOrder = ['resolving', 'prompt', 'querying', 'evaluating', 'finished'];
+
+  const stageLabel = document.getElementById('stage-label');
+  const promptCard = document.getElementById('prompt-card');
+  const promptText = document.getElementById('prompt-text');
+  const promptSubject = document.getElementById('prompt-subject');
+
+  function setSteps(stage) {
+    const idx = stageOrder.indexOf(stage);
+    document.querySelectorAll('.runstep').forEach(el => {
+      const at = stageOrder.indexOf(el.dataset.stage);
+      el.classList.toggle('is-done', at < idx);
+      el.classList.toggle('is-active', at === idx);
+    });
+  }
+
+  const STATUS = {
+    pending:  ['badge--neutral', 'pending'],
+    querying: ['badge--warn', 'querying…'],
+    done:     ['badge--clean', 'answered'],
+    error:    ['badge--alert', 'error'],
+  };
+
+  function renderModels(models) {
+    (models || []).forEach(m => {
+      const card = document.querySelector('.model-card[data-model="' + CSS.escape(m.model) + '"]');
+      if (!card) return;
+      const [cls, text] = STATUS[m.state] || STATUS.pending;
+      const chip = card.querySelector('[data-role="status"]');
+      chip.className = 'model-card__status badge ' + cls;
+      chip.textContent = text;
+      const note = card.querySelector('[data-role="note"]');
+      card.classList.toggle('is-querying', m.state === 'querying');
+      if (m.state === 'done') {
+        note.textContent = (m.chars ? m.chars.toLocaleString() + ' characters received' : 'Response received') + ' · analysing at the end';
+      } else if (m.state === 'error') {
+        note.innerHTML = '';
+        note.textContent = m.error || 'Provider error';
+      } else if (m.state === 'querying') {
+        note.textContent = 'Querying the provider…';
+      } else {
+        note.textContent = 'Waiting…';
+      }
+    });
+  }
+
+  let stopped = false;
+  async function poll() {
+    if (stopped) return;
+    try {
+      const res = await fetch(statusUrl, {headers: {'Accept': 'application/json'}});
+      const s = await res.json();
+      if (s.stage_label) stageLabel.textContent = s.stage_label;
+      setSteps(s.stage);
+      if (s.subject && promptSubject) promptSubject.textContent = '· subject ' + s.subject;
+      renderModels(s.models);
+      // The prompt text isn't in the status payload (it's an intermediate
+      // artifact); reveal the card as a progress marker once the stage passes —
+      // the full text becomes a download on the results view.
+      if (stageOrder.indexOf(s.stage) >= stageOrder.indexOf('querying')) {
+        promptCard.style.display = '';
+        if (!promptText.textContent) promptText.textContent = 'Retrieval prompt composed — downloadable from the results once the run completes.';
+      }
+      if (s.done) {
+        stopped = true;
+        stageLabel.textContent = 'Done — loading results…';
+        setTimeout(() => window.location.reload(), 700);
+        return;
+      }
+    } catch (e) { /* transient; keep polling */ }
+    setTimeout(poll, 1200);
+  }
+  poll();
+})();
+</script>
+{% endif %}
+{% endblock %}

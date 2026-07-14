@@ -1,0 +1,117 @@
+# Unified web app for AI Bot Defender (replaces the old Streamlit UI stack).
+#
+# Path-mirroring: the project is mounted at the SAME absolute path inside the
+# container as on the host so `docker compose` / `ansible-playbook` (run from
+# inside, talking to the host daemon via the mounted socket) resolve build
+# contexts identically on both sides. The app also joins proxy_net so it can
+# scrape honeypot sites through the reverse proxy by container name.
+#
+# Run from the project root:  docker compose -f docker-compose.app.yml up -d --build
+name: ai-bot-defender-app
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    container_name: ai-bot-defender-app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      PROJECT_ROOT: ${PWD}
+      # WSL bind mounts can appear world-writable, which prevents Ansible from
+      # auto-discovering ansible.cfg unless its path is explicit.
+      ANSIBLE_CONFIG: ${PWD}/ansible/ansible.cfg
+      # Reach the reverse proxy by its container name on the shared network.
+      PROXY_HTTP_ENTRY: http://proxy-nginx
+      # Central log DB (logdb) — reached DIRECTLY via psycopg2 (services/logdb.py +
+      # crawler_graph). Locally this is the logdb container by name over proxy_net
+      # (logdb joins proxy_net in docker-compose.proxy.yml); on AWS, override
+      # LOGDB_HOST with the RDS endpoint (and creds via Secrets) — no code change.
+      LOGDB_HOST: ${LOGDB_HOST:-logdb}
+      LOGDB_PORT: ${LOGDB_PORT:-5432}
+      LOGDB_USER: ${LOGDB_USER:-logger}
+      LOGDB_PASS: ${LOGDB_PASS:-logger}
+      LOGDB_NAME: ${LOGDB_NAME:-site_logs}
+      # Per-site honeypot DBs (querying/ground_truth.py + provenance): empty by
+      # default, so reads go through `docker compose exec` into each site's db
+      # container. On AWS set SITEDB_HOST to the RDS endpoint (+ SITEDB_PASS,
+      # optionally SITEDB_USER) for a direct connection — no code change.
+      SITEDB_HOST: ${SITEDB_HOST:-}
+      SITEDB_PORT: ${SITEDB_PORT:-5432}
+      SITEDB_USER: ${SITEDB_USER:-}
+      SITEDB_PASS: ${SITEDB_PASS:-password}
+      # Querying providers (override to use real APIs). The legacy QUERY_*
+      # vars still steer the provenance layer (querying/); detection now runs
+      # on the auto_query engine below.
+      QUERY_TARGET_PROVIDER: ${QUERY_TARGET_PROVIDER:-mock}
+      QUERY_EXTRACTOR_PROVIDER: ${QUERY_EXTRACTOR_PROVIDER:-mock}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-https://api.openai.com/v1}
+      # auto_query detection engine: the internal GPT-4.1 client (attribute/
+      # schema/extraction — falls back to offline heuristics when unset) and
+      # the LiteLLM provider keys for the registered target models. All default
+      # empty so the app still boots and demos offline via the mock/* models.
+      OPENAI_API_KEY_INTERNAL: ${OPENAI_API_KEY_INTERNAL:-}
+      OPENAI_API_BASE_INTERNAL: ${OPENAI_API_BASE_INTERNAL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      # Template Generator: persist the Qwen3-1.7B base model across restarts so it
+      # only downloads once (into the hf-cache volume below).
+      HF_HOME: /opt/hf-cache
+      # Account sessions + the reviewed-access workflow. Set strong SECRET_KEY /
+      # ADMIN_SECRET values in the git-ignored project .env before deployment.
+      SECRET_KEY: ${SECRET_KEY:-dev-only-change-me}
+      ADMIN_SECRET: ${ADMIN_SECRET:-change-me-admin-password}
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8000}
+      GOOGLE_FORM_URL: ${GOOGLE_FORM_URL:-https://forms.gle/FJV94zCQwi29z36f9}
+      SMTP_EMAIL: ${SMTP_EMAIL:-}
+      SMTP_APP_PASSWORD: ${SMTP_APP_PASSWORD:-}
+      SESSION_HTTPS_ONLY: ${SESSION_HTTPS_ONLY:-false}
+    working_dir: ${PWD}
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    volumes:
+      - ${PWD}:${PWD}
+      - /var/run/docker.sock:/var/run/docker.sock
+      - hf-cache:/opt/hf-cache
+    networks: [default, proxy_net]
+    # Pass the host NVIDIA GPU to the app so the Template Generator runs on the GPU.
+    # Requires Docker GPU support (NVIDIA Container Toolkit / Docker Desktop WSL2).
+    # If `up` fails because no GPU can be reserved, delete this `deploy:` block —
+    # template generation then falls back to CPU (much slower, still works).
+
+  # Dedicated self-play trainer (Direction 2). Same image as the app (torch +
+  # torch_geometric baked in) but runs NO web server — it is an idle container we
+  # `exec` PPO/PSRO into (`make selfplay-*`) so long training never competes with
+  # the FastAPI event loop. CPU is plenty (small policy + few-hundred-node graph),
+  # so no GPU block — it can't fail on GPU reservation. Gated behind the `trainer`
+  # compose profile, so a plain `make app` never starts it.
+  trainer:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    container_name: ai-bot-defender-trainer
+    profiles: ["trainer"]
+    environment:
+      PROJECT_ROOT: ${PWD}
+      LOGDB_HOST: ${LOGDB_HOST:-logdb}
+      LOGDB_PORT: ${LOGDB_PORT:-5432}
+      LOGDB_USER: ${LOGDB_USER:-logger}
+      LOGDB_PASS: ${LOGDB_PASS:-logger}
+      LOGDB_NAME: ${LOGDB_NAME:-site_logs}
+    working_dir: ${PWD}
+    command: ["sleep", "infinity"]
+    volumes:
+      - ${PWD}:${PWD}
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [default, proxy_net]
+
+volumes:
+  hf-cache:
+
+networks:
+  proxy_net:
+    external: true

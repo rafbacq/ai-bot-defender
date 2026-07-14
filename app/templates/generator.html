@@ -1,0 +1,435 @@
+{% extends "base.html" %}
+{% block title %}Template Generator — AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="page-head">
+    <h1>Template Generator</h1>
+    <p>Author a new honeypot page with the fine-tuned model, or hand-edit the text of an
+       existing one. Each template lives in <span class="mono">website/templates/</span> as a
+       <span class="mono">scraper&lt;N&gt;.html</span> flavor — ready to pick when you deploy a site.</p>
+</div>
+
+{% if job %}
+<!-- Live progress for a running background generation job. The poller in the
+     scripts block drives the bar/steps and, when the job finishes, reloads into
+     the standard result notice (?ok=N). -->
+<div class="genprog" id="genprog" data-status-url="/generator/status/{{ job }}">
+    <div class="genprog__head">
+        <div>
+            <div class="genprog__eyebrow">
+                <span class="live-dot" id="genprog-livedot"></span>
+                <span id="genprog-stage">Starting…</span>
+            </div>
+            <h2 class="genprog__title" id="genprog-label">Preparing the generator…</h2>
+        </div>
+        <div class="genprog__pct"><span id="genprog-pct">0</span><span class="genprog__pct-sign">%</span></div>
+    </div>
+
+    <div class="genprog__bar" id="genprog-barwrap" role="progressbar"
+         aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Generation progress">
+        <div class="genprog__fill" id="genprog-fill" style="width:0%"></div>
+    </div>
+
+    <ol class="genprog__steps" id="genprog-steps">
+        <li class="genstep" data-stage="loading"><span class="genstep__dot"></span>Load model</li>
+        <li class="genstep" data-stage="generating"><span class="genstep__dot"></span>Generate content</li>
+        <li class="genstep" data-stage="finalizing"><span class="genstep__dot"></span>Finalize</li>
+        <li class="genstep" data-stage="done"><span class="genstep__dot"></span>Done</li>
+    </ol>
+
+    <details class="genprog__logwrap">
+        <summary>Live log</summary>
+        <pre class="codeblock genprog__log" id="genprog-log">Waiting for the generator to start…</pre>
+    </details>
+
+    <p class="genprog__hint muted">Generation runs on the server — keep this tab open and the
+       result will appear here automatically when it's done.</p>
+</div>
+{% endif %}
+
+{% if ok %}
+<div class="notice {{ 'notice--ok' if ok == '1' else 'notice--err' }} mb-6">
+    <div class="flex items-center gap-2 mb-1">
+        <span class="badge {{ 'badge--clean' if ok == '1' else 'badge--alert' }}">{{ 'Generated' if ok == '1' else 'Failed' }}</span>
+        {% if gen_installed %}
+        <span class="font-semibold">
+            Installed {{ gen_installed|length }} template{{ '' if gen_installed|length == 1 else 's' }}:
+            {% for t in gen_installed %}<span class="mono">{{ t.filename }}</span>{{ ', ' if not loop.last }}{% endfor %}
+        </span>
+        {% elif ok == '1' %}
+        <span class="font-semibold">No templates were produced.</span>
+        {% else %}
+        <span class="font-semibold">Generation did not complete.</span>
+        {% endif %}
+        {% if gen_installed %}<a class="ml-1" href="/sites">Deploy a site ↗</a>{% endif %}
+    </div>
+    {% if gen_output %}
+    <details class="mt-1" {{ 'open' if ok != '1' else '' }}>
+        <summary>Model output</summary>
+        <pre class="codeblock mt-2" style="max-height:320px">{{ gen_output }}</pre>
+    </details>
+    {% endif %}
+</div>
+{% endif %}
+
+{% if saved %}
+<div class="notice {{ 'notice--ok' if saved == '1' else 'notice--err' }} mb-6">
+    <div class="flex items-center gap-2">
+        <span class="badge {{ 'badge--clean' if saved == '1' else 'badge--alert' }}">{{ 'Saved' if saved == '1' else 'Not saved' }}</span>
+        <span class="font-semibold">{{ edit_msg or ('Template saved.' if saved == '1' else 'Edit could not be saved.') }}</span>
+    </div>
+    {% if saved == '1' and edit_info %}
+    <p class="muted mt-1" style="font-size:0.85rem">
+        Canary slots on the page:
+        {% if edit_info.canary_slots %}
+            {% for n in edit_info.canary_slots %}<span class="mono">var{{ n }}</span>{{ ', ' if not loop.last }}{% endfor %}
+            ({{ edit_info.canary_slots|length }} of 10).
+        {% else %}
+            <span class="badge badge--alert">none</span> — this page no longer renders any canary tokens.
+        {% endif %}
+    </p>
+    <p class="muted" style="font-size:0.85rem">
+        <a href="/sites">Redeploy any site</a> using this flavor to serve the updated page.
+    </p>
+    {% endif %}
+</div>
+{% endif %}
+
+<!-- Generate form -->
+<div class="card card--pad">
+    <h2 class="text-lg font-bold text-navy mb-4">Generate a template</h2>
+    <form method="post" action="/generator/run" class="grid sm:grid-cols-2 gap-4">
+        <div class="sm:col-span-2">
+            <label class="field-label">Category</label>
+            <select class="input" name="template_type" id="template_type">
+                {% for t in types %}
+                <option value="{{ t.id }}" data-description="{{ t.description }}"
+                        {{ 'selected' if t.id == 'towns' else '' }}>{{ t.label }}</option>
+                {% endfor %}
+            </select>
+            <p id="type-desc" class="field-hint mt-1"></p>
+        </div>
+        <div class="sm:col-span-2 muted" style="font-size:0.85rem">
+            One template per category per run. Each page ships with its own
+            category-typed varList (10 Faker canary expressions), applied as a
+            per-site <span class="mono">canary_tokens</span> override when you deploy it.
+            Titles and content are checked against the dedup registry so repeat runs
+            never produce the same fake facts.
+        </div>
+        <div class="sm:col-span-2 muted" style="font-size:0.85rem">
+            Generation runs the fine-tuned model (Qwen3-1.7B + LoRA) and can take a few
+            minutes ("All categories" much longer). It needs the
+            <span class="mono">template_generator</span> Python
+            environment (torch + transformers + peft); the app runs it with
+            <span class="mono">{{ interpreter }}</span>
+            (override via the <span class="mono">TEMPLATE_GEN_PYTHON</span> env var).
+        </div>
+        <div class="sm:col-span-2">
+            <button type="submit" class="btn btn--primary">Generate &amp; store</button>
+        </div>
+    </form>
+</div>
+
+<!-- Inline editor for an already-stored template -->
+<section class="mt-8" id="edit">
+    <h2 class="section-title">Edit a stored template</h2>
+    <div class="card card--pad">
+        {% if templates_list %}
+        <div class="flex flex-wrap items-end gap-3 mb-4">
+            <div>
+                <label class="field-label" for="edit-select">Template</label>
+                <select class="input" id="edit-select">
+                    {% for t in templates_list %}
+                    <option value="{{ t.version }}" {% if edit_version and t.version|string == edit_version %}selected{% endif %}>{{ t.filename }}{% if t.category %} — {{ t.category.replace('_', ' ').title() }}{% endif %}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <button type="button" class="btn btn--ghost" id="edit-reload">Reload from disk</button>
+            <label class="flex items-center gap-2 muted" style="font-size:0.85rem">
+                <input type="checkbox" id="edit-live" checked> Live preview
+            </label>
+            <span id="edit-slots" class="muted" style="font-size:0.85rem"></span>
+        </div>
+
+        <form method="post" action="/generator/edit" id="edit-form" class="grid lg:grid-cols-2 gap-4">
+            <input type="hidden" name="version" id="edit-version" value="">
+            <div>
+                <label class="field-label" for="edit-source">HTML source</label>
+                <textarea class="input mono" name="html" id="edit-source" spellcheck="false"
+                          style="min-height:460px; width:100%; resize:vertical; white-space:pre; overflow-wrap:normal; overflow-x:auto"></textarea>
+                <div class="flex items-center gap-3 mt-3">
+                    <button type="submit" class="btn btn--primary">Save changes</button>
+                    <button type="button" class="btn btn--ghost" id="edit-refresh" style="display:none">Update preview</button>
+                    <span id="edit-status" class="muted" style="font-size:0.85rem"></span>
+                </div>
+            </div>
+            <div>
+                <label class="field-label">Live preview <span class="muted">(placeholders shown literally)</span></label>
+                <iframe id="edit-preview" class="preview" style="min-height:460px; width:100%"></iframe>
+            </div>
+        </form>
+        {% else %}
+        <p class="muted">No templates stored yet. Generate your first one above.</p>
+        {% endif %}
+    </div>
+</section>
+
+<!-- Templates currently in website/templates -->
+<section class="mt-8">
+    <h2 class="section-title">In website/templates ({{ templates_list|length }})</h2>
+    <div class="card">
+        {% if templates_list %}
+        <div class="table-wrap">
+            <table class="tbl">
+                <thead><tr><th>Template</th><th>Version</th><th>Category</th><th></th></tr></thead>
+                <tbody>
+                {% for t in templates_list %}
+                    <tr>
+                        <td class="font-semibold mono">{{ t.filename }}</td>
+                        <td>scraper{{ t.version }}</td>
+                        <td>{{ t.category.replace('_', ' ').title() if t.category else '—' }}</td>
+                        <td>
+                            <a href="/sites/template/{{ t.version }}" target="_blank">View ↗</a>
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="card--pad muted">No templates stored yet. Generate your first one above.</div>
+        {% endif %}
+    </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Keep the selected type's description visible.
+  const typeSel = document.getElementById('template_type');
+  const typeDesc = document.getElementById('type-desc');
+  function showTypeDesc() {
+    if (!typeSel || !typeDesc) return;
+    const opt = typeSel.options[typeSel.selectedIndex];
+    typeDesc.textContent = opt ? (opt.dataset.description || '') : '';
+  }
+  if (typeSel) { typeSel.addEventListener('change', showTypeDesc); showTypeDesc(); }
+
+  // --- Inline template editor ---------------------------------------------
+  const editSel = document.getElementById('edit-select');
+  const editVersion = document.getElementById('edit-version');
+  const editSource = document.getElementById('edit-source');
+  const editPreview = document.getElementById('edit-preview');
+  const editSlots = document.getElementById('edit-slots');
+  const editStatus = document.getElementById('edit-status');
+  const editLive = document.getElementById('edit-live');
+  const editRefresh = document.getElementById('edit-refresh');
+
+  // Assigning srcdoc reloads the iframe document, which parks the new document at
+  // the top. Track where the preview was scrolled and put it back on every reload,
+  // so a debounced live re-render (or a save round-trip) doesn't yank the user away
+  // from the part of the page they are editing. The srcdoc iframe is same-origin,
+  // so its window is readable; guard anyway and degrade to the old behaviour.
+  const PREVIEW_SCROLL_KEY = 'abd:generator:previewScroll';
+  let previewScroll = { x: 0, y: 0 };
+
+  if (editPreview) {
+    editPreview.addEventListener('load', () => {
+      const win = editPreview.contentWindow;
+      if (!win) return;
+      try {
+        if (previewScroll.x || previewScroll.y) win.scrollTo(previewScroll.x, previewScroll.y);
+        // Each reload makes a fresh window, so re-arm the tracker on the new one.
+        win.addEventListener('scroll', () => {
+          previewScroll = { x: win.scrollX, y: win.scrollY };
+        }, { passive: true });
+      } catch (err) { /* not same-origin: nothing to restore */ }
+    });
+  }
+
+  function updatePreview() {
+    if (editPreview) editPreview.srcdoc = editSource.value;
+  }
+
+  // Report which {{ varN }} canary slots the current text still renders, so the
+  // user notices if an edit dropped one (server re-checks on save).
+  function updateSlots() {
+    if (!editSlots) return;
+    const found = new Set();
+    // Built from a string so the literal braces are not parsed as a Jinja tag.
+    const re = new RegExp('\\{\\{\\s*var(\\d+)\\s*\\}\\}', 'g');
+    let m;
+    while ((m = re.exec(editSource.value)) !== null) found.add(parseInt(m[1], 10));
+    const nums = Array.from(found).sort((a, b) => a - b);
+    if (nums.length === 0) {
+      editSlots.innerHTML = '<span class="badge badge--alert">no canary slots</span>';
+    } else {
+      editSlots.textContent = 'Canary slots: ' + nums.map(n => 'var' + n).join(', ')
+        + ' (' + nums.length + '/10)';
+    }
+  }
+
+  async function loadEditSource() {
+    if (!editSel) return;
+    const version = editSel.value;
+    editVersion.value = version;
+    editStatus.textContent = 'Loading…';
+    try {
+      const res = await fetch('/sites/template/' + version);
+      editSource.value = await res.text();
+      editStatus.textContent = '';
+    } catch (err) {
+      editStatus.textContent = 'Could not load template source.';
+    }
+    updatePreview();
+    updateSlots();
+  }
+
+  // The "Update preview" button only matters when live preview is off — with it
+  // on, edits render automatically. Show the button only while live is unchecked.
+  function syncPreviewButton() {
+    if (!editRefresh || !editLive) return;
+    editRefresh.style.display = editLive.checked ? 'none' : '';
+  }
+
+  if (editSel) {
+    // Saving posts and redirects back here, so the preview offset has to survive a
+    // full page load. Hand it over the reload, keyed to the template being edited.
+    const editForm = document.getElementById('edit-form');
+    if (editForm) {
+      editForm.addEventListener('submit', () => {
+        sessionStorage.setItem(PREVIEW_SCROLL_KEY,
+          JSON.stringify({ version: editVersion.value, x: previewScroll.x, y: previewScroll.y }));
+      });
+    }
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(PREVIEW_SCROLL_KEY) || 'null');
+      if (saved && String(saved.version) === String(editSel.value)) {
+        previewScroll = { x: saved.x, y: saved.y };
+      }
+    } catch (err) { /* malformed entry: start at the top */ }
+    sessionStorage.removeItem(PREVIEW_SCROLL_KEY);
+
+    // Switching templates is a different document — start it at the top.
+    editSel.addEventListener('change', () => { previewScroll = { x: 0, y: 0 }; loadEditSource(); });
+    document.getElementById('edit-reload').addEventListener('click', loadEditSource);
+    if (editRefresh) editRefresh.addEventListener('click', () => { updatePreview(); updateSlots(); });
+    editLive.addEventListener('change', () => {
+      syncPreviewButton();
+      if (editLive.checked) updatePreview();  // re-sync the preview when turning live back on
+    });
+    syncPreviewButton();
+    let liveTimer = null;
+    editSource.addEventListener('input', () => {
+      updateSlots();
+      if (!editLive.checked) return;
+      clearTimeout(liveTimer);
+      liveTimer = setTimeout(updatePreview, 400);  // debounce live rendering
+    });
+    loadEditSource();
+  }
+</script>
+
+<script>
+  // --- Live generation progress -------------------------------------------
+  // Polls /generator/status/{job}, animates the bar + stepper, and on completion
+  // reloads into the standard result notice (the status endpoint stashes the
+  // full result server-side keyed to ?ok=N).
+  (function () {
+    const el = document.getElementById('genprog');
+    if (!el) return;
+
+    const statusUrl = el.dataset.statusUrl;
+    const fill = document.getElementById('genprog-fill');
+    const barwrap = document.getElementById('genprog-barwrap');
+    const pctEl = document.getElementById('genprog-pct');
+    const labelEl = document.getElementById('genprog-label');
+    const stageEl = document.getElementById('genprog-stage');
+    const logEl = document.getElementById('genprog-log');
+    const liveDot = document.getElementById('genprog-livedot');
+    const steps = Array.from(document.querySelectorAll('#genprog-steps .genstep'));
+
+    const STAGE_ORDER = ['loading', 'generating', 'finalizing', 'done'];
+    const STAGE_NAMES = {
+      queued: 'Queued', loading: 'Loading model', generating: 'Generating',
+      finalizing: 'Finalizing', done: 'Done', error: 'Failed', missing: 'Not found',
+    };
+
+    // Prevent double-submit: disable the Generate button while a job runs.
+    const genBtn = document.querySelector('form[action="/generator/run"] button[type="submit"]');
+    if (genBtn) { genBtn.disabled = true; genBtn.classList.add('is-disabled'); }
+
+    // Count-up tween so the percentage animates smoothly toward each target.
+    let shown = 0, target = 0, raf = null;
+    function tick() {
+      const diff = target - shown;
+      shown = Math.abs(diff) < 0.5 ? target : shown + diff * 0.2;
+      pctEl.textContent = Math.round(shown);
+      raf = shown === target ? null : requestAnimationFrame(tick);
+    }
+    function setPct(p) {
+      target = Math.max(0, Math.min(100, p));
+      fill.style.width = target + '%';
+      barwrap.setAttribute('aria-valuenow', Math.round(target));
+      if (!raf) raf = requestAnimationFrame(tick);
+    }
+
+    function setSteps(stage) {
+      let idx = STAGE_ORDER.indexOf(stage);
+      if (stage === 'queued') idx = 0;
+      steps.forEach((s) => {
+        const sIdx = STAGE_ORDER.indexOf(s.dataset.stage);
+        const done = stage === 'done' ? true : idx > sIdx;
+        s.classList.toggle('is-done', done);
+        s.classList.toggle('is-active', idx === sIdx && stage !== 'done');
+      });
+    }
+
+    function finish(ok) {
+      el.classList.add(ok ? 'is-ok' : 'is-err');
+      if (ok) { setPct(100); steps.forEach((s) => { s.classList.add('is-done'); s.classList.remove('is-active'); }); }
+      if (liveDot) liveDot.style.display = 'none';
+      // Let the final frame paint, then reload into the result notice.
+      setTimeout(() => { window.location = '/generator?ok=' + (ok ? 1 : 0); }, ok ? 800 : 1200);
+    }
+
+    let stopped = false;
+    async function poll() {
+      if (stopped) return;
+      let data;
+      try {
+        const res = await fetch(statusUrl, { cache: 'no-store' });
+        data = await res.json();
+      } catch (e) {
+        setTimeout(poll, 1500);  // transient network error — keep trying
+        return;
+      }
+
+      if (typeof data.percent === 'number') setPct(data.percent);
+      if (data.label) labelEl.textContent = data.label;
+      if (data.stage) stageEl.textContent = STAGE_NAMES[data.stage] || data.stage;
+      if (typeof data.log === 'string' && logEl && data.log) {
+        const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8;
+        logEl.textContent = data.log;
+        if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+      }
+      setSteps(data.stage || 'loading');
+
+      if (data.done) {
+        stopped = true;
+        if (data.status === 'missing') {
+          el.classList.add('is-err');
+          labelEl.textContent = data.label || 'This generation job was not found.';
+          if (liveDot) liveDot.style.display = 'none';
+          setTimeout(() => { window.location = '/generator'; }, 2500);
+          return;
+        }
+        finish(!!data.ok);
+        return;
+      }
+      setTimeout(poll, 1000);
+    }
+    poll();
+  })();
+</script>
+{% endblock %}

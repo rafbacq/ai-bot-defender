@@ -1,0 +1,10 @@
+fake.last_name()
+fake.first_name() + ' ' + fake.last_name()
+fake.first_name() + ' ' + fake.last_name()
+'The ' + fake.city() + ' ' + fake.word().capitalize() + 's'
+fake.word().capitalize()
+fake.city()
+fake.word().capitalize()
+fake.last_name() + ' Training Ground'
+fake.city() + ' Athletic Club'
+fake.company()

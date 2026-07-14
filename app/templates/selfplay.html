@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+{% block title %}Adversarial Self-Play · AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="page-head">
+    <span class="eyebrow">Direction 2 · Co-evolving crawler ⇄ honeypot</span>
+    <h1>Adversarial Self-Play</h1>
+    <p>A learned crawler is trained (PPO-Lagrangian, a constrained MDP) to harvest honeypot
+       content while evading the <em>production</em> detector. The evasions it discovers harden a
+       <strong>robust detector</strong> that runs as a second opinion on Crawler Analytics — and the
+       infrastructure it must buy to defeat each fingerprint layer becomes a measured
+       <strong>cost-to-evade curve</strong>.</p>
+    <p class="mt-2"><a class="nav-card__cta" href="/logs">← Back to Crawler Analytics</a></p>
+</div>
+
+{% if error %}
+<div class="rounded-lg border border-red-400/40 bg-red-500/10 px-4 py-3 mb-6 text-sm">{{ error }}</div>
+{% endif %}
+
+{% if not status.available %}
+<div class="rounded-lg border border-amber-400/40 bg-amber-500/10 px-4 py-3 mb-6 text-sm">
+    The <code>selfplay</code> package is not importable in this environment
+    {% if status.import_error %}(<code>{{ status.import_error }}</code>){% endif %}.
+</div>
+{% endif %}
+
+<!-- Launch controls -->
+<section class="mb-10">
+    <h2 class="section-title">Run</h2>
+    <div class="grid md:grid-cols-3 gap-4">
+        <form method="post" action="/selfplay/run" class="rounded-xl border border-slate-300/20 p-4">
+            <h3 class="font-semibold mb-1">v1 · Train attacker</h3>
+            <p class="text-sm opacity-70 mb-3">PPO-Lagrangian crawler vs. the frozen production detector → robust detector + cost-to-evade curve.</p>
+            <input type="hidden" name="kind" value="train">
+            <label class="block text-xs opacity-70">Iterations
+                <input name="iterations" type="number" placeholder="50" class="mt-1 w-full rounded border border-slate-300/30 bg-transparent px-2 py-1"></label>
+            <label class="block text-xs opacity-70 mt-2">Risk mode
+                <select name="risk_mode" class="mt-1 w-full rounded border border-slate-300/30 bg-transparent px-2 py-1">
+                    <option value="expectation">expectation</option>
+                    <option value="cvar">CVaR (tail-robust)</option>
+                </select></label>
+            <button class="mt-3 w-full rounded bg-teal-600 hover:bg-teal-500 text-white text-sm py-2"
+                    {% if not status.torch or status.job.status == 'running' %}disabled{% endif %}>Launch training</button>
+        </form>
+
+        <form method="post" action="/selfplay/run" class="rounded-xl border border-slate-300/20 p-4">
+            <h3 class="font-semibold mb-1">v2 · Co-evolve (PSRO)</h3>
+            <p class="text-sm opacity-70 mb-3">Two-player population self-play; tracks exploitability as the detector becomes robust to learned evasion.</p>
+            <input type="hidden" name="kind" value="coevolve">
+            <button class="mt-3 w-full rounded bg-indigo-600 hover:bg-indigo-500 text-white text-sm py-2"
+                    {% if not status.torch or status.job.status == 'running' %}disabled{% endif %}>Launch co-evolution</button>
+        </form>
+
+        <form method="post" action="/selfplay/run" class="rounded-xl border border-slate-300/20 p-4">
+            <h3 class="font-semibold mb-1">v2 · Content policy</h3>
+            <p class="text-sm opacity-70 mb-3">Closed-loop: a Thompson-sampling bandit optimizes canary designs by <em>provable ingestion</em> (Min-K% membership).</p>
+            <input type="hidden" name="kind" value="ingest">
+            <button class="mt-3 w-full rounded bg-amber-600 hover:bg-amber-500 text-white text-sm py-2"
+                    {% if status.job.status == 'running' %}disabled{% endif %}>Run ingestion loop</button>
+        </form>
+    </div>
+    {% if not status.torch %}
+    <p class="text-xs opacity-60 mt-2">Training needs torch + torch_geometric (present in the app/trainer image). The ingestion loop runs anywhere.</p>
+    {% endif %}
+
+    <div id="job-box" class="mt-4 {% if status.job.status not in ('running','done','error') %}hidden{% endif %}">
+        <div class="text-sm mb-1">Job: <span id="job-kind">{{ status.job.kind }}</span> —
+            <span id="job-status" class="font-semibold">{{ status.job.status }}</span></div>
+        <pre id="job-log" class="text-xs rounded bg-black/40 p-3 max-h-56 overflow-auto whitespace-pre-wrap"></pre>
+    </div>
+</section>
+
+{% if report %}
+{% set s = report.summary %}
+<!-- Headline result -->
+<section class="mb-10">
+    <h2 class="section-title">Latest result — {{ report.kind }}</h2>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div class="stat"><div class="stat__value">{{ '%.2f'|format(s.baseline_evasion_rate) }} → {{ '%.2f'|format(s.final_evasion_rate) }}</div><div class="stat__label">Evasion (baseline → learned)</div></div>
+        <div class="stat"><div class="stat__value">{{ '%.3f'|format(s.baseline_mean_D) }} → {{ '%.3f'|format(s.final_mean_D) }}</div><div class="stat__label">Detector score D</div></div>
+        <div class="stat"><div class="stat__value">{{ s.robust_val_auc if s.robust_val_auc is not none else '—' }}</div><div class="stat__label">Robust detector AUC</div></div>
+        <div class="stat"><div class="stat__value">{{ '%.0f'|format(s.final_harvest) if s.final_harvest is not none else '—' }}</div><div class="stat__label">Harvest (content)</div></div>
+    </div>
+    {% if report.calibration %}
+    <p class="text-xs opacity-70 mt-2">Phase-0 calibration:
+        {% if report.calibration.passed %}<span class="text-teal-400">indistinguishable ✓</span>{% else %}<span class="text-amber-400">not passed</span>{% endif %}
+        (adversarial AUC {{ report.calibration.adversarial_auc }}, KS {{ report.calibration.ks_features_passed }}/{{ report.calibration.ks_features_total }},
+        n_real={{ report.calibration.n_real_endpoints }}).</p>
+    {% endif %}
+</section>
+
+<!-- Cost-to-evade curve -->
+<section class="mb-10">
+    <h2 class="section-title">Cost-to-evade</h2>
+    <div class="grid lg:grid-cols-2 gap-6 items-start">
+        {% if has_curve %}
+        <img src="/selfplay/curve.png?t={{ s.duration_s }}" alt="training + cost-to-evade curves" class="rounded-lg border border-slate-300/20 w-full">
+        {% endif %}
+        {% if report.cost_to_evade %}
+        <table class="w-full text-sm">
+            <thead><tr class="text-left opacity-60"><th class="py-1">Stack rung</th><th>Infra cost</th><th>Evasion</th><th>Mean D</th></tr></thead>
+            <tbody>
+            {% for r in report.cost_to_evade %}
+            <tr class="border-t border-slate-300/10"><td class="py-1">{{ r.stack }}</td><td>{{ r.infra_cost }}</td>
+                <td>{{ '%.2f'|format(r.evasion_rate) }}</td><td>{{ '%.3f'|format(r.mean_D) }}</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </div>
+    {% if report.ablation %}
+    <p class="text-xs opacity-70 mt-3">Per-factor ablation (evasion lost when each lever is downgraded to the naive choice):
+        {% for name, f in report.ablation.factors.items() %}<span class="mr-3"><code>{{ name }}</code> {{ '%+.2f'|format(f.evasion_drop) }}</span>{% endfor %}</p>
+    {% endif %}
+</section>
+{% endif %}
+
+<!-- Robust detector second opinion -->
+<section class="mb-10">
+    <h2 class="section-title">Robust detector — live second opinion</h2>
+    <form method="post" action="/selfplay/score-live" class="inline">
+        <button class="rounded bg-slate-600 hover:bg-slate-500 text-white text-sm px-3 py-1.5"
+                {% if not status.robust_detector_trained %}disabled{% endif %}>Score current traffic</button>
+    </form>
+    {% if robust %}
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
+        <div class="stat"><div class="stat__value">{{ robust.n_endpoints }}</div><div class="stat__label">Endpoints scored</div></div>
+        <div class="stat"><div class="stat__value">{{ robust.n_prod_flagged }}</div><div class="stat__label">Production flagged</div></div>
+        <div class="stat"><div class="stat__value">{{ robust.n_robust_flagged }}</div><div class="stat__label">Robust flagged</div></div>
+        <div class="stat"><div class="stat__value text-amber-400">{{ robust.n_robust_only }}</div><div class="stat__label">Caught by robust only</div></div>
+    </div>
+    {% if robust.predictions %}
+    <table class="w-full text-sm mt-4">
+        <thead><tr class="text-left opacity-60"><th class="py-1">IP</th><th>Robust prob</th><th>Robust</th><th>Production</th><th>Agree</th></tr></thead>
+        <tbody>
+        {% for r in robust.predictions[:15] %}
+        <tr class="border-t border-slate-300/10"><td class="py-1 font-mono text-xs">{{ r.ip }}</td><td>{{ '%.3f'|format(r.robust_prob) }}</td>
+            <td>{{ '⚑' if r.robust_flag else '·' }}</td><td>{{ '⚑' if r.prod_flag else '·' }}</td>
+            <td>{% if r.agree %}<span class="opacity-50">=</span>{% else %}<span class="text-amber-400">⚠</span>{% endif %}</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+    {% else %}
+    <p class="text-sm opacity-70 mt-3">No live second opinion yet. Train a detector, then score current traffic (needs the proxy stack + logdb running).</p>
+    {% endif %}
+</section>
+
+<!-- Emergent strategies -->
+{% if strategies %}
+<section class="mb-10">
+    <h2 class="section-title">Emergent-strategy log</h2>
+    <pre class="text-xs rounded bg-black/30 p-3 max-h-64 overflow-auto">{% for e in strategies %}{{ e }}
+{% endfor %}</pre>
+</section>
+{% endif %}
+
+{% block scripts %}
+<script>
+(function () {
+  const box = document.getElementById('job-box');
+  const running = {{ 'true' if status.job.status == 'running' else 'false' }};
+  function poll() {
+    fetch('/selfplay/status').then(r => r.json()).then(st => {
+      const job = st.job || {};
+      document.getElementById('job-status').textContent = job.status || 'idle';
+      document.getElementById('job-kind').textContent = job.kind || '';
+      const log = document.getElementById('job-log');
+      if (st.log_tail) log.textContent = st.log_tail;
+      if (box) box.classList.remove('hidden');
+      if (job.status === 'running') setTimeout(poll, 3000);
+      else if (job.status === 'done') setTimeout(() => location.reload(), 1200);
+    }).catch(() => {});
+  }
+  if (running) poll();
+})();
+</script>
+{% endblock %}
+{% endblock %}

@@ -1,0 +1,10 @@
+fake.city()
+fake.word().capitalize()
+fake.first_name() + ' ' + fake.last_name()
+fake.last_name()
+fake.word().capitalize()
+fake.first_name() + ' ' + fake.last_name()
+fake.last_name() + ' Hall'
+fake.word().capitalize() + ' Commission'
+fake.city()
+fake.company() + ' Organization'

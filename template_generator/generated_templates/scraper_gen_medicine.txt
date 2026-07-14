@@ -1,0 +1,10 @@
+fake.word().capitalize()
+fake.word().capitalize()
+fake.first_name() + ' ' + fake.last_name()
+fake.last_name() + ' Hospital'
+fake.last_name() + ' Clinic'
+fake.last_name()
+fake.last_name() + ' Laboratory'
+fake.city()
+fake.last_name() + ' Medical Center'
+fake.company() + ' Health Organization'

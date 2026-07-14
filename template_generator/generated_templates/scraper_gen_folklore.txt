@@ -1,0 +1,10 @@
+fake.first_name()
+fake.city()
+fake.last_name()
+fake.last_name()
+fake.first_name() + ' ' + fake.last_name()
+'The ' + fake.word().capitalize() + ' Spirit'
+fake.word().capitalize()
+fake.state()
+fake.last_name() + ' Folklore Society'
+fake.last_name() + ' Sacred Site'

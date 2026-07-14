@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Approve access · AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="auth-shell auth-shell--wide">
+    <div class="page-head">
+        <span class="eyebrow">Argus Lab only</span>
+        <h1>Review access requests</h1>
+        <p>After reviewing the external form response, approve its email and institution or notify the applicant that it was declined.</p>
+    </div>
+
+    {% if error %}
+    <div class="notice notice--err auth-notice" role="alert">
+        <div class="notice__title">Action needs attention</div>
+        <div>{{ error }}</div>
+    </div>
+    {% endif %}
+    {% if message %}
+    <div class="notice notice--ok auth-notice" role="status">
+        <div class="notice__title">Access request updated</div>
+        <div>{{ message }}</div>
+    </div>
+    {% endif %}
+
+    <div class="auth-admin-grid">
+        <section class="card card--pad auth-card">
+            <h2 class="auth-card__title">Approve request</h2>
+            <p class="muted">This makes the email eligible for one account and sends an invitation when SMTP is configured.</p>
+            <form method="post" action="/admin/approve" class="auth-form">
+                <label>
+                    <span class="field-label">Institutional email</span>
+                    <input class="input" type="email" name="email" required maxlength="254" autocomplete="off">
+                </label>
+                <label>
+                    <span class="field-label">Institution</span>
+                    <select class="input" name="institution" required>
+                        <option value="" disabled selected>Select institution</option>
+                        {% for inst in institutions %}
+                        <option value="{{ inst }}">{{ inst }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <button type="submit" class="btn btn--primary">Approve request</button>
+            </form>
+        </section>
+
+        <section class="card card--pad auth-card">
+            <h2 class="auth-card__title">Decline request</h2>
+            <p class="muted">This revokes any unused approval and sends a decline notice when SMTP is configured.</p>
+            <form method="post" action="/admin/decline" class="auth-form">
+                <label>
+                    <span class="field-label">Applicant email</span>
+                    <input class="input" type="email" name="email" required maxlength="254" autocomplete="off">
+                </label>
+                <button type="submit" class="btn btn--ghost auth-decline">Decline request</button>
+            </form>
+        </section>
+    </div>
+
+    <p class="help auth-admin-help">After approving an email, send that user this signup link (or open it yourself for a local test account): <a href="{{ signup_url }}">{{ signup_url }}</a></p>
+</div>
+{% endblock %}

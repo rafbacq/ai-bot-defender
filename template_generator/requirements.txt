@@ -1,0 +1,28 @@
+# template_generator dependencies
+#
+# Use a Python 3.10-3.13 environment (PyTorch publishes no wheels for 3.14 yet).
+# Quick, no-admin setup with uv (recommended on Windows):
+#
+#   winget install astral-sh.uv          # or: irm https://astral.sh/uv/install.ps1 | iex
+#   uv venv .venv --python 3.11 --seed
+#   # GPU (NVIDIA): install the CUDA build of torch FIRST, from PyTorch's index --
+#   uv pip install --python .venv torch --index-url https://download.pytorch.org/whl/cu128
+#   uv pip install --python .venv -r requirements.txt
+#   .venv\Scripts\python -m spacy download en_core_web_sm
+#
+# Plain pip works too:  python -m venv .venv && .venv\Scripts\activate && pip install ...
+#
+# torch: the line below pulls the DEFAULT (CPU) wheel. For an NVIDIA GPU, install
+# torch from the matching CUDA index BEFORE this file (see above) so the GPU build
+# is what gets resolved. Pick the index for your driver: cu121 / cu124 / cu126 / cu128.
+torch>=2.3
+transformers>=4.56        # 4.56+ for the `dtype=` from_pretrained kwarg; Qwen3 needs >=4.51
+peft>=0.11
+accelerate>=0.30
+numpy>=1.24
+faker>=24.0               # generate_templates.py mints unique fallback titles with Faker
+
+# spaCy powers the named-entity masking of ../wikipedia_towns_text in prepare_data.py.
+# It is OPTIONAL: prepare_data.py falls back to cleaned_intros only if it is absent.
+# After installing, fetch the English model:  python -m spacy download en_core_web_sm
+spacy>=3.7

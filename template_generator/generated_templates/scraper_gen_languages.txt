@@ -1,0 +1,10 @@
+fake.state()
+fake.word().capitalize()
+fake.word().capitalize()
+fake.first_name() + ' ' + fake.last_name()
+fake.last_name() + ' Academy'
+fake.city()
+fake.last_name()
+fake.last_name()
+fake.last_name() + ' Language Institute'
+fake.word().capitalize() + 'ian'

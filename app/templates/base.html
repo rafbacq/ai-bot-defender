@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script>
+      // Apply the saved (or system) theme to <html> before first paint so the
+      // page never flashes the wrong theme. The toggle handler (bottom of body)
+      // updates this attribute + localStorage on click.
+      (function () {
+        try {
+          var t = localStorage.getItem('theme');
+          if (t !== 'light' && t !== 'dark') {
+            t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          }
+          document.documentElement.setAttribute('data-theme', t);
+        } catch (e) { /* private mode / no storage — fall back to light */ }
+      })();
+    </script>
+    <title>{% block title %}AI Bot Defender{% endblock %}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,400;0,500;0,600;0,700;0,800&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      // Tailwind handles layout utilities; the Duke-branded components live in app.css.
+      // Palette = official Duke Navy/Royal Blue + the extended palette (full strength only).
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              navy: '#012169', royal: '#00539B', prussian: '#005587', shale: '#0577B1',
+              copper: '#C84E00', persimmon: '#E89923', dandelion: '#FFD960',
+              piedmont: '#A1B70D', eno: '#339898', magnolia: '#1D6363', ironweed: '#993399',
+              hatteras: '#E2E6ED', whisper: '#F3F2F1', ginger: '#FCF7E5',
+              dogwood: '#988675', shackleford: '#DAD0C6',
+              iron: '#262626', graphite: '#666666', granite: '#B5B5B5', limestone: '#E5E5E5',
+            },
+            fontFamily: { sans: ['"Source Sans 3"', 'system-ui', 'sans-serif'] },
+          }
+        }
+      }
+    </script>
+    {# ?v=<mtime> busts the browser cache whenever app.css changes on disk. #}
+    <link rel="stylesheet" href="{{ url_for('static', path='css/app.css') }}?v={{ css_version() }}">
+</head>
+<body>
+    {% set nav = [('home', '/', 'Overview'), ('sites', '/sites', 'Sites'), ('generator', '/generator', 'Generator'), ('traffic', '/logs', 'Crawler Analytics'), ('forensics', '/query', 'LLM Forensics'), ('selfplay', '/selfplay', 'Adversarial')] %}
+    {% set labels = {'sites': 'Site Configurator', 'generator': 'Template Generator', 'logs': 'Crawler Analytics', 'query': 'LLM Forensics', 'provenance': 'LLM Forensics', 'selfplay': 'Adversarial Self-Play'} %}
+    {# A sub-view sets active_section (traffic|forensics) so its parent top-nav item
+       highlights; pages that are their own top-nav item just fall back to active_page. #}
+    {% set section = active_section | default(active_page) %}
+
+    <header class="site-header">
+        <div class="wrap site-header__inner">
+            <a href="/" class="brand">
+                <span class="brand__mark">Duke</span>
+                <span class="brand__name">AI Bot&nbsp;Defender</span>
+            </a>
+            <nav class="main-nav">
+                {% if request.session.get('username') %}
+                {% for key, href, label in nav %}
+                <a href="{{ href }}" class="main-nav__link {% if section == key %}is-active{% endif %}">{{ label }}</a>
+                {% endfor %}
+                {% endif %}
+                <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle light / dark theme">
+                    <svg class="theme-toggle__moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+                    <svg class="theme-toggle__sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+                </button>
+                {% if request.session.get('username') %}
+                <span class="main-nav__user" title="Signed-in account">{{ request.session.get('username') }}</span>
+                <form method="post" action="/logout" class="main-nav__form">
+                    <button type="submit" class="main-nav__link main-nav__button">Log out</button>
+                </form>
+                {% elif request.session.get('is_admin') %}
+                <span class="main-nav__user">Access admin</span>
+                <form method="post" action="/logout" class="main-nav__form">
+                    <button type="submit" class="main-nav__link main-nav__button">Lock</button>
+                </form>
+                {% else %}
+                <a href="/login" class="main-nav__link">Log in</a>
+                <a href="/request-access" class="main-nav__link">Request access</a>
+                {% endif %}
+            </nav>
+        </div>
+    </header>
+    <div class="header-accent"></div>
+
+    {% if active_page and active_page != 'home' %}
+    <div class="wrap breadcrumb">
+        <a href="/" class="breadcrumb__back">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+            Overview
+        </a>
+        <span class="breadcrumb__sep">/</span>
+        <span class="breadcrumb__current">{{ labels.get(active_page, '') }}</span>
+    </div>
+    {% endif %}
+
+    <main class="wrap page">
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="site-footer">
+        <div class="wrap">
+            AI Bot Defender — Duke Code+ 2026 · Argus Lab. Local research build. Authorized testing only.
+        </div>
+    </footer>
+    <script>
+      // Flip the theme on click and remember the choice.
+      (function () {
+        var btn = document.getElementById('theme-toggle');
+        if (!btn) return;
+        btn.addEventListener('click', function () {
+          var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+          document.documentElement.setAttribute('data-theme', next);
+          try { localStorage.setItem('theme', next); } catch (e) { /* ignore */ }
+        });
+      })();
+    </script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

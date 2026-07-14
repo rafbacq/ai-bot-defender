@@ -1,0 +1,10 @@
+fake.first_name() + ' ' + fake.last_name()
+fake.first_name() + ' ' + fake.last_name()
+fake.first_name()
+fake.last_name()
+fake.first_name() + ' ' + fake.last_name()
+fake.city()
+fake.word().capitalize()
+fake.last_name()
+fake.company() + ' Pictures'
+fake.first_name() + ' ' + fake.last_name()

@@ -1,0 +1,15 @@
+services:
+  registry-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - REGISTRY_DB_PATH=/data/registry.db
+      - REGISTRY_ADMIN_KEY=${REGISTRY_ADMIN_KEY:-change-me-admin-key}
+      - SIMHASH_THRESHOLD=${SIMHASH_THRESHOLD:-3}
+    volumes:
+      - registry_data:/data
+    restart: unless-stopped
+
+volumes:
+  registry_data:

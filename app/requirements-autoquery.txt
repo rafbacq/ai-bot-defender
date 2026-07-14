@@ -1,0 +1,14 @@
+# auto_query detection engine (vendored from the auto-query-integrate branch).
+# Installed in a late Dockerfile layer (see app/Dockerfile) so changes here
+# never invalidate the heavy torch/ML cache — same pattern as crawler_graph.
+#
+# litellm = provider-agnostic target querying (search-enabled); openai = the
+# internal GPT-4.1 attribute/schema/extraction client; rapidfuzz = the
+# attribution matcher; openpyxl = manual-workflow spreadsheet uploads.
+# (The branch also listed langchain/langchain-openai + pandas + spaCy; none are
+# imported by the vendored code — litellm.completion + the openai SDK do the
+# work, openpyxl replaces pandas, and the parser has a no-spaCy fallback.)
+litellm>=1.72,<2
+openai>=1.40
+rapidfuzz>=3.9
+openpyxl>=3.1

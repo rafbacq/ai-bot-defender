@@ -1,0 +1,11 @@
+# Crawler-graph intelligence (Direction 6a) — core analysis dependencies.
+# The cheap-feature graph + community detection + attribution run on these alone
+# (no GPU, no torch). Baked into the app image so the /intel page works.
+networkx>=3.0
+python-louvain>=0.16      # imported as `community` — Louvain community detection
+ipwhois>=1.2              # ASN enrichment of client IPs (same lib server.py uses)
+
+# Optional, used if present:
+#   matplotlib  -> output/campaigns.png network visualization
+#   leidenalg + python-igraph -> Leiden community detection (better than Louvain)
+matplotlib>=3.6

@@ -1,0 +1,130 @@
+# Self-hosted observability stack for AI Bot Defender — the open-source
+# replacement for the original AWS plan's managed services:
+#   - prometheus    : metrics TSDB (replaces Amazon Managed Prometheus + the
+#                     CloudWatch metric/alarm role)
+#   - node-exporter : host CPU / memory / disk / network metrics
+#   - cadvisor      : per-container CPU / memory / network / IO metrics
+#   - loki          : log aggregation, filesystem-backed on the instance disk
+#                     (replaces the S3-backed Loki plan; same searchable logs)
+#   - promtail      : ships every Docker container's stdout/stderr PLUS the
+#                     reverse proxy's JSON access logs (the honeypot request
+#                     stream + unmatched scanner noise) into loki
+#   - grafana       : dashboards + alerting over both datasources (replaces
+#                     Amazon Managed Grafana)
+#
+# Security posture (load-bearing): every published port here is bound to
+# 127.0.0.1 ONLY — nothing in this stack is reachable from the public network.
+# Reach Grafana through an SSH tunnel:   ssh -L 3000:localhost:3000 <host>
+# The stack is read-only over the honeypot path: it mounts the proxy's
+# nginx_logs volume ro and never joins proxy_net, so it can never sit in the
+# request path or affect crawler traffic.
+#
+# GRAFANA_ADMIN_PASSWORD is read from the git-ignored project-root .env (the
+# same file the app's key manager writes), substituted by compose on `up`.
+#
+# Bring up with:  docker compose -f docker-compose.monitoring.yml up -d
+# (the proxy stack must be up once first so the external nginx_logs volume exists)
+name: monitoring
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: mon-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prom_data:/prometheus
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: mon-node-exporter
+    pid: host
+    command:
+      - --path.rootfs=/host
+    volumes:
+      - /:/host:ro,rslave
+    restart: unless-stopped
+
+  cadvisor:
+    # Needs a recent release for this box's Docker 29 daemon: v0.49's docker
+    # client speaks API 1.41 (daemon minimum is 1.44) so its docker factory
+    # can't even register, and every release through v0.52 hard-requires the
+    # classic image/<driver>/layerdb on-disk layout that Docker 29's containerd
+    # image store no longer has ("failed to identify the read-write layer ID")
+    # -- either way the per-container `name` label is silently lost, blanking
+    # the per-container dashboard panels and container-down alerts. v0.56+
+    # migrated to the modern moby client; distribution also moved from gcr.io
+    # to ghcr.io.
+    image: ghcr.io/google/cadvisor:v0.60.5
+    container_name: mon-cadvisor
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.3.2
+    container_name: mon-loki
+    command: -config.file=/etc/loki/loki-config.yml
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./monitoring/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    container_name: mon-promtail
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./monitoring/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      # Docker service-discovery + each container's json log files.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      # The proxy stack's nginx access logs (JSON siteaccess + unmatched).
+      - nginx_logs:/var/log/nginx-proxy:ro
+      - promtail_positions:/positions
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: mon-grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin-change-me}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - loki
+    restart: unless-stopped
+
+volumes:
+  prom_data:
+  loki_data:
+  grafana_data:
+  promtail_positions:
+  # The proxy stack's nginx log volume (created by docker-compose.proxy.yml,
+  # compose project "proxy"). External so this stack only ever reads it.
+  nginx_logs:
+    external: true
+    name: proxy_nginx_logs

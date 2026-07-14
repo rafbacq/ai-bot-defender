@@ -1,0 +1,10 @@
+fake.city()
+fake.word().capitalize()
+fake.last_name()
+fake.first_name() + ' ' + fake.last_name()
+fake.first_name() + ' ' + fake.last_name()
+fake.last_name()
+'The ' + fake.word().capitalize() + ' ' + fake.word().capitalize()
+fake.last_name() + ' Arts Foundation'
+fake.city()
+fake.last_name()

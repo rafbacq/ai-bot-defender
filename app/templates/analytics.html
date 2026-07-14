@@ -1,0 +1,413 @@
+{% extends "base.html" %}
+{% block title %}Crawler Analytics — AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="page-head">
+    <h1>Crawler Analytics</h1>
+    <p>Every crawler that hits the honeypots — each request joined to the device fingerprint it
+       carries, and the campaigns they cluster into — in one place.</p>
+</div>
+
+{% if error %}
+<div class="notice notice--warn mb-5">
+    <div class="notice__title">Request log unavailable</div>
+    <p class="muted" style="margin:0">{{ error }} Start the proxy with <span class="mono">make proxy</span>, then reload.</p>
+</div>
+{% endif %}
+
+<!-- Essential traffic KPIs. Kept to the four that matter at a glance; the
+     campaign / disguise figures live in their own sections lower on the page. -->
+<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+    {% set metrics = [
+        ('Requests', data.total, 'total logged'),
+        ('Last 24h', data.last_24h, 'in the last day'),
+        ('Live routes', active|length, 'honeypot sites up'),
+        ('Unique devices', fp.unique_devices, 'distinct fingerprints'),
+    ] %}
+    {% for label, value, caption in metrics %}
+    <div class="stat">
+        <div class="stat__value" style="font-size:26px">{{ value if value is not none else '—' }}</div>
+        <div class="stat__label">{{ label }}</div>
+        <div class="muted" style="font-size:11px;margin-top:2px">{{ caption }}</div>
+    </div>
+    {% endfor %}
+</div>
+
+<!-- Filters -->
+<form method="get" action="/logs" class="card card--pad mb-3 grid md:grid-cols-12 gap-3 items-end">
+    <div class="md:col-span-5">
+        <label class="field-label">Search</label>
+        <input class="input" name="search" value="{{ filters.search }}" placeholder="URI, IP, UA, header, fp_id, canvas hash, or WebGL renderer">
+    </div>
+    <div class="md:col-span-3">
+        <label class="field-label">Site</label>
+        <select class="input" name="site">
+            <option {% if filters.site == 'All sites' %}selected{% endif %}>All sites</option>
+            {% for s in options.sites %}
+            <option {% if filters.site == s %}selected{% endif %}>{{ s }}{% if s in active %} (active){% else %} (historical){% endif %}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div class="md:col-span-2">
+        <label class="field-label">Method</label>
+        <select class="input" name="method">
+            <option {% if filters.method == 'All methods' %}selected{% endif %}>All methods</option>
+            {% for mm in options.methods %}<option {% if filters.method == mm %}selected{% endif %}>{{ mm }}</option>{% endfor %}
+        </select>
+    </div>
+    <div class="md:col-span-1">
+        <label class="field-label">Rows</label>
+        <select class="input" name="page_size">
+            {% for ps in [50, 100, 250, 500] %}<option {% if filters.page_size == ps %}selected{% endif %}>{{ ps }}</option>{% endfor %}
+        </select>
+    </div>
+    <div class="md:col-span-1">
+        <button class="btn btn--primary btn--block">Filter</button>
+    </div>
+</form>
+
+<div id="traffic" class="flex items-center justify-between mb-2">
+    <span class="muted" style="font-size:13px">Page {{ filters.page }} of {{ page_count }} · {{ data.rows|length }} rows · row color is the cross-layer verdict:
+        <span class="sev sev--clean">clean</span>
+        <span class="sev sev--suspicious">suspicious — verify</span>
+        <span class="sev sev--malicious">malicious</span>
+        (hover a row for the reason, Detail for the evidence)</span>
+    <a class="btn btn--ghost btn--sm"
+       href="/logs/export.csv?site={{ filters.site|urlencode }}&method={{ filters.method|urlencode }}&search={{ filters.search|urlencode }}&page={{ filters.page }}&page_size={{ filters.page_size }}">
+        Download CSV
+    </a>
+</div>
+
+<!-- Unified traffic table (request log + device fingerprint + cross-layer verdict).
+     The verdict is the ROW COLOR (green/orange/red) — there is no verdict column.
+     Each request's Detail expands into a full-width companion row below it. -->
+<div class="card table-wrap" style="max-height:560px">
+    <table class="tbl">
+        <thead><tr><th>Time</th><th>Site</th><th>Method</th><th>URI</th><th>Client IP</th><th>User Agent</th><th></th></tr></thead>
+        <tbody id="traffic-body">
+        {% include "_traffic_rows.html" %}
+        </tbody>
+    </table>
+</div>
+
+<!-- Pagination. Prev/Next swap only the tbody via GET /logs/fragment (no full reload,
+     no scroll jump); the href is the no-JS fallback (and appends #traffic). -->
+{% if page_count > 1 %}
+<div id="pager" class="flex items-center justify-center gap-3 mt-5"
+     data-page="{{ filters.page }}" data-page-count="{{ page_count }}">
+    {% set prev = filters.page - 1 if filters.page > 1 else 1 %}
+    {% set next = filters.page + 1 if filters.page < page_count else page_count %}
+    <a id="pager-prev" data-page="{{ prev }}" class="btn btn--ghost btn--sm {% if filters.page <= 1 %}is-disabled{% endif %}"
+       href="/logs?site={{ filters.site|urlencode }}&method={{ filters.method|urlencode }}&search={{ filters.search|urlencode }}&page={{ prev }}&page_size={{ filters.page_size }}#traffic">← Prev</a>
+    <span id="pager-indicator" class="muted" style="font-size:13px">{{ filters.page }} / {{ page_count }}</span>
+    <a id="pager-next" data-page="{{ next }}" class="btn btn--ghost btn--sm {% if filters.page >= page_count %}is-disabled{% endif %}"
+       href="/logs?site={{ filters.site|urlencode }}&method={{ filters.method|urlencode }}&search={{ filters.search|urlencode }}&page={{ next }}&page_size={{ filters.page_size }}#traffic">Next →</a>
+</div>
+{% endif %}
+
+<!-- ════════ Disguised devices — one machine wearing many identities ════════ -->
+{% if disguise and disguise.devices %}
+<div class="card card--pad mt-5">
+    <div class="flex items-start justify-between mb-3" style="flex-wrap:wrap;gap:12px">
+        <div style="max-width:72ch">
+            <h2 class="section-title" style="font-size:15px;text-transform:none;letter-spacing:0;color:var(--heading);margin:0 0 .3rem">Disguised devices — one machine, many identities</h2>
+            <p class="muted" style="font-size:13px;margin:0;line-height:1.55">
+                Each row is a <strong>single physical device</strong> (same browser fingerprint) presenting as more than
+                one visitor. <strong>Identities</strong> basis = it claimed several engines/OSes/client kinds (a browser
+                version update or a second same-engine browser does <em>not</em> count) — that is the disguise, and its
+                requests go <span class="badge badge--disguise badge--xs">red</span> in the table above.
+                <strong>Networks</strong> basis = one identity seen from several public networks — proxy/VPN rotation,
+                but equally a phone hopping Wi-Fi/LTE, so its requests only go orange. The honeypot serves one device one
+                canary set (via the device cookie <span class="mono">fp.js</span> sets), so either way the canary
+                trail stays attributable to this one machine.
+            </p>
+        </div>
+        <div class="flex" style="gap:10px">
+            <div class="stat" style="text-align:center;min-width:104px">
+                <div class="stat__value" style="font-size:24px;color:#C84E00">{{ disguise.disguised if disguise.disguised is not none else '—' }}</div>
+                <div class="stat__label">disguised</div>
+            </div>
+            <div class="stat" style="text-align:center;min-width:104px">
+                <div class="stat__value" style="font-size:24px;color:var(--muted)">{{ disguise.roaming if disguise.roaming is not none else '—' }}</div>
+                <div class="stat__label">roaming networks</div>
+            </div>
+        </div>
+    </div>
+    <div class="table-wrap" style="max-height:340px">
+        <table class="tbl">
+            <thead><tr><th>Device (fp_id)</th><th>Identities</th><th>Beacons</th><th>User-Agents seen</th><th>Source IPs</th></tr></thead>
+            <tbody>
+                {% for d in disguise.devices %}
+                <tr class="row--disguise">
+                    <td class="mono nowrap">{{ d.fp_id }}</td>
+                    <td class="nowrap">
+                        <span class="badge badge--disguise">{{ 'identities' if d.basis == 'identities' else 'networks' }}</span>
+                        <span class="muted" style="font-size:11px">{{ d.n_identities if d.n_identities is not none else d.n_ua }}&nbsp;ID · {{ d.n_net }}&nbsp;net</span>
+                    </td>
+                    <td class="mono">{{ d.beacons }}</td>
+                    <td>
+                        {% for ua in (d.uas or [])[:4] %}<div class="truncate" title="{{ ua }}" style="max-width:360px">{{ ua }}</div>{% endfor %}
+                        {% if (d.uas or [])|length > 4 %}<span class="muted" style="font-size:11px">+{{ (d.uas|length) - 4 }} more</span>{% endif %}
+                    </td>
+                    <td class="mono">
+                        {% for ip in (d.ips or [])[:6] %}<div class="nowrap">{{ ip }}</div>{% endfor %}
+                        {% if (d.ips or [])|length > 6 %}<span class="muted" style="font-size:11px">+{{ (d.ips|length) - 6 }} more</span>{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endif %}
+
+<!-- ════════ Campaign Intelligence — grouping the requests above into actors ════════ -->
+<hr class="divider" style="margin:30px 0 22px">
+<div class="mb-4" style="max-width:680px">
+    <h2 class="section-title" style="font-size:16px;text-transform:none;letter-spacing:0;color:var(--heading);margin:0 0 .45rem">Campaign Intelligence</h2>
+    <p class="muted" style="font-size:13.5px;margin:0;line-height:1.55">
+        Each row above is a single request. Campaign Intelligence automatically <strong>groups those requests
+        into campaigns</strong> — clusters of IP addresses that act like one coordinated crawler because they share
+        a device fingerprint, TLS signature, or network — then flags any campaign that's <strong>disguising itself
+        as an ordinary browser</strong>. It's how undeclared scrapers and agentic AI browsers get caught.
+    </p>
+</div>
+
+<!-- Primary action + tucked-away options (one form -> POST /intel/recompute) -->
+<form method="post" action="/intel/recompute" class="mb-4">
+    <div class="flex flex-wrap items-center gap-3">
+        <button class="btn btn--primary">{{ 'Re-analyze traffic' if report else 'Analyze traffic' }}</button>
+        <span class="muted" style="font-size:12.5px">
+            {% if report %}Rebuilds the campaigns from the latest request log (a few seconds).
+            {% else %}Clusters the log into campaigns and flags disguised crawlers — takes a few seconds.{% endif %}
+        </span>
+    </div>
+    <details class="mt-3">
+        <summary style="font-size:12.5px">Analysis options — request cap, time window, AI attribution model</summary>
+        <div class="flex flex-wrap items-end gap-4 mt-3">
+            <div>
+                <label class="field-label">Max requests to scan</label>
+                <input class="input" name="limit" placeholder="50000" style="width:130px">
+                <p class="help">Caps very large logs.</p>
+            </div>
+            <div>
+                <label class="field-label">Only the last … hours</label>
+                <input class="input" name="since_hours" placeholder="all time" style="width:120px">
+                <p class="help">Blank = all recorded traffic.</p>
+            </div>
+            <label style="display:flex;gap:8px;align-items:flex-start;font-size:12.5px;max-width:300px;padding-bottom:2px"
+                   {% if not gnn_available %}title="Needs torch_geometric in the image"{% endif %}>
+                <input type="checkbox" name="use_gnn" value="1" style="margin-top:3px" {% if not gnn_available %}disabled{% endif %}>
+                <span>Also run the <strong>GraphSAGE</strong> AI model
+                    <span class="muted">— attributes each IP to a likely LLM provider (slower; needs ≥2 known crawler types{% if not gnn_available %}; unavailable here{% endif %}).</span>
+                </span>
+            </label>
+        </div>
+    </details>
+</form>
+
+{% if intel_error %}
+<div class="notice notice--err mb-4">
+    <div class="notice__title">Analysis failed</div>
+    <p class="muted" style="margin:0">{{ intel_error }} — is the proxy up and is traffic being logged?</p>
+</div>
+{% elif not available %}
+<div class="notice notice--warn mb-4">
+    <p class="muted" style="margin:0">The <span class="mono">crawler_graph</span> engine isn't importable in this environment, so campaigns can't be built here.</p>
+</div>
+{% endif %}
+
+{% if report %}
+{% set f = report.findings %}
+<!-- Glanceable findings: plain-language tiles -->
+<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mb-4">
+    {% set tiles = [
+        ('Campaigns', f.n_campaigns, 'distinct actor clusters', false),
+        ('Disguised crawlers', f.n_disguised, 'bots posing as real browsers', true),
+        ('Self-contradicting', f.n_contradiction, 'identity vs. network mismatch', true),
+        ('Agentic browsers', f.n_agentic, 'AI browser-agent cohorts', false),
+        ('VM / headless', f.n_vm_cohort, 'virtual / automation infra', false),
+    ] %}
+    {% for label, value, caption, threat in tiles %}
+    <div class="stat">
+        <div class="stat__value" style="font-size:26px{% if threat and value %};color:#C84E00{% endif %}">{{ value if value is not none else '—' }}</div>
+        <div class="stat__label">{{ label }}</div>
+        <div class="muted" style="font-size:11px;margin-top:3px;line-height:1.3">{{ caption }}</div>
+    </div>
+    {% endfor %}
+</div>
+
+<!-- One-line plain verdict -->
+{% set threats = (f.n_disguised or 0) + (f.n_contradiction or 0) %}
+{% if threats %}
+<div class="notice notice--warn mb-4">
+    <div class="notice__title">{{ threats }} campaign{{ 's' if threats != 1 }} flagged as suspicious</div>
+    <p class="muted" style="margin:0;font-size:13px">
+        {% if f.n_disguised %}<strong>{{ f.n_disguised }}</strong> disguising as ordinary browsers{% endif %}{% if f.n_disguised and f.n_contradiction %} · {% endif %}{% if f.n_contradiction %}<strong>{{ f.n_contradiction }}</strong> contradicting their own network layer{% endif %}.
+        Expand below to see exactly which IPs and why.
+    </p>
+</div>
+{% else %}
+<div class="notice notice--ok mb-4">
+    <div class="notice__title">No disguised crawlers in this window</div>
+    <p class="muted" style="margin:0;font-size:13px">
+        The {{ f.n_campaigns or 0 }} campaign{{ 's' if (f.n_campaigns or 0) != 1 }} found all behave as they claim{% if f.n_agentic %} — {{ f.n_agentic }} look like agentic AI browsers, which is expected, not malicious{% endif %}.
+        Expand below for the full list.
+    </p>
+</div>
+{% endif %}
+
+<!-- Deep technical analysis tucked behind one expander -->
+<details>
+    <summary>View detected campaigns, network graph &amp; technical analysis</summary>
+    <div class="mt-3">
+        {% set m = report.meta %}
+        <p class="muted" style="font-size:12px;margin:0 0 .9rem;line-height:1.5">
+            Built from {{ m.n_visits }} requests · {{ m.n_handshakes }} TLS handshakes · {{ m.n_browser_fps or 0 }} browser fingerprints ·
+            {{ m.n_endpoints }} unique IPs · grouped with <span class="mono">{{ m.community_method }}</span> (modularity {{ m.modularity }})
+            {% if m.gnn and m.gnn.used %}· <span class="mono">GraphSAGE</span> applied{% endif %}
+            · {{ m.n_inconsistent_endpoints or 0 }} cross-layer-inconsistent · generated {{ report.generated_at }}
+        </p>
+        {% include "_campaigns.html" %}
+    </div>
+</details>
+{% else %}
+<div class="card" style="padding:24px;text-align:center;border-style:dashed">
+    <p class="muted" style="margin:0 auto;max-width:560px;font-size:13.5px;line-height:1.55">
+        No campaigns built yet. Click <strong>Analyze traffic</strong> above to group the request log into
+        campaigns and reveal who's behind the traffic — including any crawlers disguising themselves as ordinary
+        browsers, a network graph of how their IPs connect, and optional AI provider attribution.
+    </p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    var tbody = document.getElementById('traffic-body');
+
+    // --- Timestamps: rewrite each Time cell to the VIEWER'S local timezone in a short,
+    // readable form (e.g. "Jun 1, 2:30 PM PDT"), keeping the full ISO ts on hover. ------
+    function localizeTimes(root) {
+      var opts = { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+                   timeZoneName: 'short' };
+      (root || document).querySelectorAll('.ts[data-ts]').forEach(function (el) {
+        var iso = el.getAttribute('data-ts');
+        if (!iso || el.dataset.localized) return;
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) return;
+        try { el.textContent = d.toLocaleString(undefined, opts); el.dataset.localized = '1'; } catch (e) {}
+      });
+    }
+    localizeTimes(document);
+
+    // --- Detail rows: expand/collapse the full-width companion row beneath a request.
+    // Delegated on the whole table so it keeps working after the tbody is swapped. -------
+    var table = document.querySelector('.tbl');
+    if (table) {
+      table.addEventListener('click', function (e) {
+        var btn = e.target.closest('[data-detail-toggle]');
+        if (!btn) return;
+        var row = btn.closest('tr');
+        var detail = row && row.nextElementSibling;
+        if (!detail || !detail.classList.contains('detailrow')) return;
+        var opening = detail.hasAttribute('hidden');
+        if (opening) { detail.removeAttribute('hidden'); } else { detail.setAttribute('hidden', ''); }
+        btn.setAttribute('aria-expanded', opening ? 'true' : 'false');
+        btn.textContent = opening ? 'Hide' : 'Detail';
+      });
+    }
+
+    // --- Instant paging: Prev/Next fetch ONLY the tbody for the next page and swap it,
+    // instead of reloading (and re-rendering) the entire page. Scroll position stays put
+    // (no navigation), and the URL is updated so refresh / back keep the page. On top of
+    // that, the NEIGHBOURING pages are prefetched after every render, so a Prev/Next
+    // click almost always swaps straight from the local cache — zero perceived delay. ----
+    var pager = document.getElementById('pager');
+    if (pager && tbody && window.fetch && window.history && history.pushState) {
+      var pageCount = parseInt(pager.getAttribute('data-page-count'), 10) || 1;
+      var busy = false;
+      // querystring -> row HTML (string) or an in-flight Promise of it. Bounded so a
+      // long browse can't hoard memory; filters changing = a full page load = fresh cache.
+      var cache = {};
+      var cacheOrder = [];
+      var CACHE_MAX = 12;
+
+      function urlForPage(p) {
+        var params = new URLSearchParams(location.search);
+        params.set('page', p);
+        return { full: location.pathname + '?' + params.toString(), search: params.toString() };
+      }
+      function fetchFragment(search) {
+        if (Object.prototype.hasOwnProperty.call(cache, search)) return Promise.resolve(cache[search]);
+        var p = fetch('/logs/fragment?' + search, { headers: { 'X-Requested-With': 'fetch' } })
+          .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+          .then(function (html) { cache[search] = html; return html; })
+          .catch(function (err) { delete cache[search]; throw err; });
+        cache[search] = p;
+        cacheOrder.push(search);
+        while (cacheOrder.length > CACHE_MAX) delete cache[cacheOrder.shift()];
+        return p;
+      }
+      function prefetch(page) {
+        if (page < 1 || page > pageCount) return;
+        var s = urlForPage(page).search;
+        if (!Object.prototype.hasOwnProperty.call(cache, s)) fetchFragment(s).catch(function () {});
+      }
+      function setPager(page) {
+        page = Math.max(1, Math.min(page, pageCount));
+        pager.setAttribute('data-page', page);
+        var prev = document.getElementById('pager-prev');
+        var next = document.getElementById('pager-next');
+        var ind = document.getElementById('pager-indicator');
+        var prevP = page > 1 ? page - 1 : 1, nextP = page < pageCount ? page + 1 : pageCount;
+        prev.setAttribute('data-page', prevP); prev.href = urlForPage(prevP).full + '#traffic';
+        prev.classList.toggle('is-disabled', page <= 1);
+        next.setAttribute('data-page', nextP); next.href = urlForPage(nextP).full + '#traffic';
+        next.classList.toggle('is-disabled', page >= pageCount);
+        ind.textContent = page + ' / ' + pageCount;
+      }
+      function loadPage(page, push) {
+        page = Math.max(1, Math.min(page, pageCount));
+        if (busy) return;
+        busy = true;
+        var u = urlForPage(page);
+        // Only dim if the rows aren't ready near-instantly (avoids a flash on cache hits).
+        var dim = setTimeout(function () { tbody.style.opacity = '0.45'; }, 120);
+        fetchFragment(u.search)
+          .then(function (html) {
+            clearTimeout(dim);
+            tbody.innerHTML = html;
+            tbody.style.opacity = '';
+            localizeTimes(tbody);
+            setPager(page);
+            if (push) history.pushState({ page: page }, '', u.full + '#traffic');
+            busy = false;
+            prefetch(page + 1); prefetch(page - 1);
+          })
+          .catch(function () {
+            clearTimeout(dim);
+            busy = false; tbody.style.opacity = ''; location.href = u.full + '#traffic';
+          });
+      }
+
+      pager.addEventListener('click', function (e) {
+        var a = e.target.closest('a[data-page]');
+        if (!a) return;
+        e.preventDefault();
+        if (a.classList.contains('is-disabled')) return;
+        loadPage(parseInt(a.getAttribute('data-page'), 10), true);
+      });
+      // Back/forward: re-sync the table to the page in the (restored) URL, no new history.
+      window.addEventListener('popstate', function () {
+        var p = parseInt(new URLSearchParams(location.search).get('page'), 10) || 1;
+        loadPage(p, false);
+      });
+      // Warm the cache for the neighbours of the initially-rendered page.
+      var initial = parseInt(pager.getAttribute('data-page'), 10) || 1;
+      prefetch(initial + 1); prefetch(initial - 1);
+    }
+  })();
+</script>
+{% endblock %}

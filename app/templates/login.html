@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Log in · AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="auth-shell">
+    <div class="page-head">
+        <span class="eyebrow">Welcome back</span>
+        <h1>Log in</h1>
+        <p>Use your approved AI Bot Defender account.</p>
+    </div>
+
+    <section class="card card--pad auth-card">
+        {% if error %}
+        <div class="notice notice--err auth-notice" role="alert">
+            <div class="notice__title">Unable to log in</div>
+            <div>{{ error }}</div>
+        </div>
+        {% endif %}
+        <form method="post" action="/login" class="auth-form">
+            <input type="hidden" name="next" value="{{ next }}">
+            <label>
+                <span class="field-label">Username</span>
+                <input class="input" type="text" name="username" value="{{ username }}"
+                       required maxlength="50" autocomplete="username" autofocus>
+            </label>
+            <label>
+                <span class="field-label">Password</span>
+                <input class="input" type="password" name="password" required
+                       minlength="8" maxlength="128" autocomplete="current-password">
+            </label>
+            <button type="submit" class="btn btn--primary btn--block">Log in</button>
+        </form>
+        <p class="auth-links">Need an account? <a href="/request-access">Request access</a>.</p>
+    </section>
+</div>
+{% endblock %}

@@ -1,0 +1,25 @@
+# Line-ending policy.
+#
+# This repo is developed on Windows but everything runs inside Linux containers,
+# where CRLF line endings break scripts and configs (e.g. Alpine `sh` cannot run
+# a CRLF shell script — that is what broke proxy/gen-cert.sh / `make up-all`).
+# Force LF in the working tree for the files Linux tooling consumes, so a fresh
+# clone on any OS is correct.
+
+*.sh            text eol=lf
+*.j2            text eol=lf
+*.conf          text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.py            text eol=lf
+Dockerfile      text eol=lf
+*.cfg           text eol=lf
+.env.example    text eol=lf
+
+# Known binary assets — never normalize these.
+*.xlsx          binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.safetensors   binary
+*.bin           binary

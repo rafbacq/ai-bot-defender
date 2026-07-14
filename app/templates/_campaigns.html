@@ -1,0 +1,221 @@
+{# Full campaign breakdown — GraphSAGE panel + disguise/agentic/contradiction/VM
+   callouts + network graph + the all-campaigns table. Included (inside a
+   <details>) by analytics.html when a campaigns report exists. Expects `report`,
+   `gnn_status` and `has_viz` in the surrounding context. #}
+{% set f = report.findings %}
+{% set m = report.meta %}
+{% set g = m.gnn or {} %}
+{% set disguised_camps = report.campaigns | selectattr('disguise_suspected') | list %}
+{% set agentic_camps = report.campaigns | selectattr('agentic_suspected') | list %}
+{% set vm_camps = report.campaigns | selectattr('vm_cohort_suspected') | list %}
+{% set contradiction_camps = report.campaigns | selectattr('contradiction_suspected') | list %}
+
+<!-- GraphSAGE GNN panel -->
+{% if g.used or g.reason or gnn_status %}
+<div class="card card--pad mb-4">
+    <div class="flex items-center gap-2 mb-2">
+        <h2 class="section-title" style="margin:0">GraphSAGE GNN attribution</h2>
+        {% if g.used %}<span class="badge badge--navy">applied to this report</span>
+        {% elif gnn_status %}<span class="badge">model on disk</span>{% endif %}
+    </div>
+    {% if g.used %}
+    <p class="muted" style="font-size:13px;margin:.2rem 0 .6rem">
+        A supervised classifier trained on the IPs whose declared User-Agent gives a high-precision
+        provider label, then used to attribute a provider to <em>every</em> IP via graph message-passing.
+        A confident provider on an IP wearing a browser/automation UA (no bot UA) is a disguise signal
+        the UA alone can't surface.
+    </p>
+    <div class="grid grid-cols-2 lg:grid-cols-6 gap-3">
+        {% set gc = [
+            ('Provider classes', g.n_classes), ('Labeled IPs', g.n_labeled), ('Val. IPs', g.n_val),
+            ('Train acc.', g.train_acc), ('Val acc.', g.val_acc), ('IPs attributed', g.n_attributed),
+        ] %}
+        {% for label, value in gc %}
+        <div class="stat"><div class="stat__value" style="font-size:20px">{{ value if value is not none else '—' }}</div><div class="stat__label">{{ label }}</div></div>
+        {% endfor %}
+    </div>
+    <p class="muted mt-2" style="font-size:12px">
+        classes: {% for c in g.classes %}<span class="mono">{{ c }}</span>{% if not loop.last %}, {% endif %}{% endfor %}
+        · final loss <span class="mono">{{ g.final_loss }}</span> · method <span class="mono">{{ g.method }}</span>
+        {% if g.train_acc is not none and g.val_acc is not none and g.val_acc < g.train_acc - 0.2 %}
+        · <span style="color:#C84E00">val ≪ train — likely overfitting on a small labeled set; treat low-confidence attributions cautiously</span>{% endif %}
+    </p>
+    {% elif g.requested and g.reason %}
+    <p class="muted" style="font-size:13px;margin:0">GNN was requested but <strong>not applied</strong>: {{ g.reason }}.</p>
+    {% elif gnn_status %}
+    <p class="muted" style="font-size:13px;margin:.2rem 0">A GraphSAGE model was trained here previously
+        (val acc <span class="mono">{{ gnn_status.val_acc }}</span>,
+        {{ gnn_status.n_classes }} classes: {% for c in gnn_status.classes %}<span class="mono">{{ c }}</span>{% if not loop.last %}, {% endif %}{% endfor %})
+        but <strong>this report didn't apply it</strong>. Re-run with the <strong>GNN</strong> box ticked to fold it in.</p>
+    {% endif %}
+</div>
+{% endif %}
+
+<!-- Headline findings: disguised + agentic callouts -->
+{% if disguised_camps or agentic_camps %}
+<div class="grid lg:grid-cols-2 gap-5 mb-4">
+    {% if disguised_camps %}
+    <div class="card card--pad" style="border-left:4px solid #C84E00">
+        <h2 class="section-title" style="margin-top:0;color:#C84E00">Disguised infrastructure ({{ disguised_camps|length }})</h2>
+        <p class="muted" style="font-size:12px;margin:.2rem 0 .6rem">Cohorts hiding what they are — undeclared
+           crawler infra, impersonation, device fingerprints reused across proxies, cross-layer contradictions,
+           or GNN-attributed despite a non-bot UA.</p>
+        {% for c in disguised_camps %}
+        <div class="mb-3" style="font-size:13px">
+            <strong>#{{ c.campaign_id }} {{ c.label }}</strong>
+            <span class="muted">· {{ c.n_ips }} IPs · {{ c.n_asns }} ASNs · {{ c.n_requests }} reqs</span>
+            <ul style="margin:.3rem 0 0 1rem;padding:0;list-style:disc">
+                {% for r in c.disguise_reasons %}<li class="muted" style="font-size:12px">{{ r }}</li>{% endfor %}
+            </ul>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+    {% if agentic_camps %}
+    <div class="card card--pad" style="border-left:4px solid #E89923">
+        <h2 class="section-title" style="margin-top:0;color:#b8730a">Agentic browsers ({{ agentic_camps|length }})</h2>
+        <p class="muted" style="font-size:12px;margin:.2rem 0 .6rem">Real browser engines with a coherent shared
+           fingerprint at casual volume — the AI-browser-agent population (only separable by fingerprint, not UA).</p>
+        {% for c in agentic_camps %}
+        <div class="mb-2" style="font-size:13px">
+            <strong>#{{ c.campaign_id }} {{ c.label }}</strong>
+            <span class="muted">· {{ c.n_ips }} IPs · {{ c.mean_req_per_ip }} req/IP · {{ c.ja4|length or c.ja3|length }} fingerprint(s)</span>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+</div>
+{% endif %}
+
+<!-- Cross-layer consistency + VM/container cohort callouts -->
+{% if contradiction_camps or vm_camps %}
+<div class="grid lg:grid-cols-2 gap-5 mb-4">
+    {% if contradiction_camps %}
+    <div class="card card--pad" style="border-left:4px solid #993399">
+        <h2 class="section-title" style="margin-top:0;color:#7a2980">Cross-layer contradictions ({{ contradiction_camps|length }})</h2>
+        <p class="muted" style="font-size:12px;margin:.2rem 0 .6rem">A genuine device is self-consistent across layers.
+           These cohorts contradict themselves: claimed OS/browser vs. the TCP/IP kernel the SYN reveals, the WebGL
+           pipeline, or automation tells.</p>
+        {% for c in contradiction_camps %}
+        <div class="mb-3" style="font-size:13px">
+            <strong>#{{ c.campaign_id }} {{ c.label }}</strong>
+            <span class="muted">· {{ c.contradiction_ips }} contradicting IP(s)
+                {% if c.tcp_os %}· TCP-OS {% for t in c.tcp_os %}<span class="mono">{{ t.os }}</span>({{ t.ips }}) {% endfor %}{% endif %}</span>
+            <ul style="margin:.3rem 0 0 1rem;padding:0;list-style:disc">
+                {% for r in c.inconsistency_reasons %}<li class="muted" style="font-size:12px">{{ r }}</li>{% endfor %}
+            </ul>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+    {% if vm_camps %}
+    <div class="card card--pad" style="border-left:4px solid #0577B1">
+        <h2 class="section-title" style="margin-top:0;color:#005587">VM / container cohorts ({{ vm_camps|length }})</h2>
+        <p class="muted" style="font-size:12px;margin:.2rem 0 .6rem">Canvas/WebGL outputs from virtual display
+           adapters or software rasterizers (SwiftShader, llvmpipe, VMware, cloud GPUs) — automation/headless infra.</p>
+        {% for c in vm_camps %}
+        <div class="mb-2" style="font-size:13px">
+            <strong>#{{ c.campaign_id }} {{ c.label }}</strong>
+            <span class="muted">· {{ c.vm_cohort_ips }} VM IP(s) · {{ c.browser_fingerprinted_ips }} fingerprinted · {{ c.n_ips }} IPs</span>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+</div>
+{% endif %}
+
+{% if has_interactive %}
+<div class="card card--pad mb-4">
+    <iframe src="/intel/graph.html?t={{ report.generated_at }}" title="Interactive campaign graph"
+            style="width:100%;height:600px;border:0;border-radius:8px"></iframe>
+    <p class="muted" style="font-size:11px;margin:.4rem 0 0">Each cluster a distinct colour; <strong>hover a node</strong>
+       for its full rundown (or hover a legend entry to isolate it). Edges are shared JA4/UA/ /24/ASN/device attributes —
+       tight clusters bridging multiple ASNs are the suspicious ones.</p>
+</div>
+{% elif has_viz %}
+<div class="card card--pad mb-4">
+    <img src="/intel/graph.png?t={{ report.generated_at }}" alt="Campaign graph" style="max-width:100%;border-radius:8px">
+    <p class="muted" style="font-size:11px;margin:.4rem 0 0">IP nodes coloured by community; edges are shared
+       JA4/UA/ /24/ASN attributes. Tight clusters bridging multiple ASNs are the suspicious ones.</p>
+</div>
+{% endif %}
+
+<!-- Campaigns table -->
+<h2 class="section-title">All campaigns</h2>
+<div class="card table-wrap" style="max-height:560px">
+    <table class="tbl">
+        <thead><tr>
+            <th>#</th><th>Campaign</th><th>Flags</th><th>IPs</th><th>Requests</th>
+            <th>Req/IP</th><th>ASNs</th><th>Fingerprints</th><th></th>
+        </tr></thead>
+        <tbody>
+        {% for c in report.campaigns %}
+            <tr {% if c.disguise_suspected %}style="background:rgba(200,78,0,0.06)"{% endif %}>
+                <td class="mono">{{ c.campaign_id }}</td>
+                <td><strong>{{ c.label }}</strong> <span class="muted" style="font-size:11px">({{ c.confidence }})</span></td>
+                <td>
+                    {% if c.disguise_suspected %}<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;background:#C84E00;color:#fff">DISGUISE</span>{% endif %}
+                    {% if c.contradiction_suspected %}<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;background:#993399;color:#fff">CONTRADICTION</span>{% endif %}
+                    {% if c.vm_cohort_suspected %}<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;background:#0577B1;color:#fff">VM</span>{% endif %}
+                    {% if c.shared_device_fingerprint %}<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;background:#012169;color:#fff">STITCHED</span>{% endif %}
+                    {% if c.agentic_suspected %}<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;background:#E89923;color:#1a1a1a">AGENTIC</span>{% endif %}
+                    {% if c.systematic and not c.disguise_suspected and not c.agentic_suspected %}<span class="muted" style="font-size:11px">systematic</span>{% endif %}
+                </td>
+                <td class="mono">{{ c.n_ips }}</td>
+                <td class="mono">{{ c.n_requests }}</td>
+                <td class="mono">{{ c.mean_req_per_ip }}</td>
+                <td class="mono">{{ c.n_asns }}</td>
+                <td class="mono">{{ c.ja4|length }} JA4{% if c.ja3 %} · {{ c.ja3|length }} JA3{% endif %}</td>
+                <td>
+                    <details>
+                        <summary>Detail</summary>
+                        <div class="mt-2" style="max-width:560px;font-size:12px">
+                            {% if c.disguise_reasons %}
+                            <p style="color:#C84E00;margin:.2rem 0"><strong>Why flagged:</strong> {{ c.disguise_reasons|join('; ') }}</p>
+                            {% endif %}
+                            {% if c.inconsistency_reasons %}
+                            <p style="color:#7a2980;margin:.2rem 0"><strong>Cross-layer contradictions:</strong></p>
+                            <ul style="margin:.2rem 0 .2rem 1rem;padding:0;list-style:disc">
+                                {% for r in c.inconsistency_reasons %}<li class="muted" style="font-size:12px">{{ r }}</li>{% endfor %}
+                            </ul>
+                            {% endif %}
+                            <div class="grid grid-cols-3 gap-2 my-2">
+                                {% set kv = [
+                                    ('Browser IPs', c.browser_ips), ('Automated IPs', c.automated_ips),
+                                    ('TLS fingerprinted', c.fingerprinted_ips), ('Browser FP IPs', c.browser_fingerprinted_ips),
+                                    ('VM/headless IPs', c.vm_cohort_ips), ('Contradicting IPs', c.contradiction_ips),
+                                    ('Distinct UAs', c.n_user_agents), ('/24 blocks', c.n_netblocks),
+                                    ('Shared TLS FP?', 'yes' if c.shared_fingerprint else 'no'),
+                                    ('Shared device FP?', 'yes' if c.shared_device_fingerprint else 'no'),
+                                ] %}
+                                {% for label, value in kv %}
+                                <div><span class="muted">{{ label }}:</span> <span class="mono">{{ value if value is not none else '—' }}</span></div>
+                                {% endfor %}
+                            </div>
+                            {% if c.tcp_os %}
+                            <p style="margin:.2rem 0"><strong>TCP/IP OS inference:</strong>
+                               {% for t in c.tcp_os %}<span class="mono">{{ t.os }}</span>({{ t.ips }} IPs) {% endfor %}</p>
+                            {% endif %}
+                            {% if c.first_seen %}
+                            <p class="muted" style="margin:.2rem 0">Active <span class="mono">{{ c.first_seen }}</span>
+                               → <span class="mono">{{ c.last_seen }}</span>
+                               {% if c.mean_burstiness is not none %}· burstiness <span class="mono">{{ c.mean_burstiness }}</span>
+                               ({% if c.mean_burstiness > 0.3 %}bursty/human-like{% elif c.mean_burstiness < -0.3 %}metronomic/automated{% else %}Poisson-like{% endif %}){% endif %}</p>
+                            {% endif %}
+                            <p style="margin:.2rem 0"><strong>ASNs:</strong> {% for a in c.asns[:8] %}<span class="mono">{{ a.asn }}</span>({{ a.ips }}) {% endfor %}</p>
+                            <p style="margin:.2rem 0"><strong>Declared:</strong> {{ c.declared_providers|join(', ') or '—' }}
+                               {% if c.gnn_provider %} · <strong>GNN:</strong> {{ c.gnn_provider }}{% endif %}</p>
+                            <p style="margin:.2rem 0"><strong>Sites:</strong> {{ c.sites|join(', ') or '—' }}</p>
+                            {% if c.ja4 %}<p class="mono" style="margin:.2rem 0;word-break:break-all"><strong>JA4:</strong> {{ c.ja4|join(', ') }}</p>{% endif %}
+                            <p style="margin:.2rem 0"><strong>Top UAs:</strong></p>
+                            <pre class="codeblock" style="max-height:160px">{% for ua in c.top_user_agents %}{{ ua }}
+{% endfor %}</pre>
+                            <p class="mono muted" style="margin:.2rem 0;word-break:break-all"><strong>Sample IPs:</strong> {{ c.sample_ips|join(', ') }}</p>
+                        </div>
+                    </details>
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>

@@ -1,0 +1,188 @@
+{% extends "base.html" %}
+{% block title %}Provenance run {{ run_id }} — AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="page-head">
+    <h1>Provenance run</h1>
+    <p class="mono">{{ run_id }}</p>
+</div>
+
+<a class="btn btn--ghost btn--sm mb-5" href="/provenance">← All provenance runs</a>
+
+{% if not report %}
+<div class="notice notice--warn"><div class="notice__title">Run not found</div></div>
+{% else %}
+
+<div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
+    {% set cells = [
+        ('Status', 'interrupted' if live and live.interrupted else report.status),
+        ('Kind', report.kind or ('rag-disambiguation' if report.results else 'provenance')),
+        ('Site', report.site_id or '—'),
+        ('Models', report.models|length),
+    ] %}
+    {% for label, value in cells %}
+    <div class="stat"><div class="stat__value" style="font-size:20px">{{ value }}</div><div class="stat__label">{{ label }}</div></div>
+    {% endfor %}
+</div>
+
+{% if live and live.interrupted %}
+<div class="notice notice--warn mb-5">
+    <div class="notice__title">Probe interrupted</div>
+    <p class="muted" style="margin:0">This probe was still in progress when the app restarted, so it never
+       finished. Start it again from the <a href="/query">investigation launcher</a>.</p>
+</div>
+{% elif report.status == 'running' %}
+<div class="card card--pad mb-5">
+    <div class="flex items-center justify-between">
+        <h2 class="section-title" style="margin:0">{{ 'RAG experiment' if report.kind == 'rag-disambiguation' else 'Provenance probe' }} in progress</h2>
+        <span class="badge badge--warn"><span class="live-dot"></span> running</span>
+    </div>
+    <p class="muted mt-2" style="font-size:13px">Probing {{ report.models|length }} model version{{ 's' if report.models|length != 1 }} —
+       each is queried live, so this can take a while. Results appear here automatically when the probe completes.</p>
+</div>
+{% endif %}
+
+{% if report.error %}
+<div class="notice notice--warn mb-5"><div class="notice__title">Error</div><p class="muted" style="margin:0">{{ report.error }}</p></div>
+{% endif %}
+
+{% if report.subject %}<p class="muted mb-5">Subject scraped: <strong>{{ report.subject }}</strong></p>{% endif %}
+
+{% if report.role_prompt or report.probes %}
+<details class="mb-5">
+    <summary class="muted">Probe used — adversarial role prompt + {{ report.probes|length if report.probes else 0 }} elicitation question(s)</summary>
+    <div class="card card--pad mt-2">
+        {% if report.role_prompt %}
+        <p style="font-size:13px;margin:0 0 .2rem"><strong>Role prompt</strong> (sets up the model to recall the subject):</p>
+        <pre class="codeblock" style="max-height:170px">{{ report.role_prompt }}</pre>
+        {% endif %}
+        {% if report.probes %}
+        <p style="font-size:13px;margin:.6rem 0 .2rem"><strong>Questions</strong> (each model answers these; answers are matched against the canary sets):</p>
+        <ol style="margin:.2rem 0 0 1.2rem;font-size:13px">{% for q in report.probes %}<li>{{ q }}</li>{% endfor %}</ol>
+        {% endif %}
+    </div>
+</details>
+{% endif %}
+
+{% if report.results %}
+<!-- ===== RAG-vs-training report ===== -->
+<h2 class="section-title">Memorization vs. retrieval</h2>
+<p class="muted mb-3" style="font-size:13px">Page removed before probing:
+   <strong>{{ 'yes' if report.page_removed else 'no' }}</strong></p>
+<div class="card table-wrap">
+    <table class="tbl">
+        <thead><tr><th>Model</th><th>Verdict</th><th>Confidence</th><th>Leak (browsing off)</th>
+            <th>Leak (browsing on)</th><th>Live fetch</th></tr></thead>
+        <tbody>
+        {% for r in report.results %}
+        <tr {% if 'memorized' in r.verdict %}style="background:rgba(200,78,0,0.06)"{% endif %}>
+            <td class="mono">{{ r.model }}</td>
+            <td>
+                {% if r.verdict == 'provider error' %}<span class="badge badge--alert">provider error</span>
+                {% else %}<strong>{{ r.verdict }}</strong>{% endif %}
+                {% if r.error %}<div class="muted" style="font-size:11px;max-width:320px;margin-top:2px">{{ r.error }}</div>{% endif %}
+            </td>
+            <td>{{ r.confidence }}</td>
+            <td class="mono">{{ r.best_score_off }}{% if r.leak_browsing_off %} ✓{% endif %}</td>
+            <td class="mono">{{ r.best_score_on }}{% if r.leak_browsing_on %} ✓{% endif %}</td>
+            <td class="mono">{{ r.live_fetch_count }}{% if r.live_fetch_detected %} (live){% endif %}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{% elif report.provenance is defined %}
+<!-- ===== Provenance / latency report ===== -->
+<h2 class="section-title">Which versions leaked each canary set</h2>
+<div class="card table-wrap mb-5" style="max-height:240px">
+    <table class="tbl">
+        <thead><tr><th>Model</th><th>Cutoff</th><th>Canary sets leaked</th><th>Best score</th></tr></thead>
+        <tbody>
+        {% set cutoffs = {} %}
+        {% for t in report.timeline %}{% set _ = cutoffs.update({t.id: t.knowledge_cutoff}) %}{% endfor %}
+        {% for model, info in report.leak_by_model.items() %}
+        <tr>
+            <td class="mono">{{ model }}</td>
+            <td class="mono">{{ cutoffs.get(model, '—') }}</td>
+            <td class="mono">{% if info.error %}<span class="muted">{{ info.error }}</span>{% else %}{{ info.n_leaked }}{% endif %}</td>
+            <td class="mono">{{ info.best_score if info.best_score is defined else '—' }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<h2 class="section-title">Inferred ingestion windows</h2>
+{% if report.provenance %}
+<div class="card table-wrap">
+    <table class="tbl">
+        <thead><tr><th>Canary set (UA · ASN)</th><th>Crawled</th><th>Ingestion window</th>
+            <th>Latency ≤ (days)</th><th>Leaking versions</th></tr></thead>
+        <tbody>
+        {% for w in report.provenance %}
+        <tr>
+            <td class="truncate" title="{{ w.user_agent }}" style="max-width:260px">{{ w.user_agent }}<span class="muted"> · {{ w.asn or '—' }}</span></td>
+            <td class="mono nowrap">{{ w.crawl_first_seen or '—' }}</td>
+            <td class="mono">{{ w.ingestion_window.earliest or '?' }} → {{ w.ingestion_window.latest or '?' }}
+                {% if not w.bounded_by_real_models %}<span class="muted" style="font-size:11px"> (mock only)</span>{% endif %}</td>
+            <td class="mono">{{ w.crawl_to_train_latency_days_upper_bound if w.crawl_to_train_latency_days_upper_bound is not none else '—' }}</td>
+            <td class="mono" style="font-size:11px">{{ w.leaking_models|join(', ') }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<div class="card card--pad"><p class="muted" style="margin:0">No canary set was reproduced by any probed model — no ingestion evidence (or the models refuse to regurgitate; try the membership-inference path).</p></div>
+{% endif %}
+
+{% if report.crawlers %}
+<h2 class="section-title mt-5">Crawlers observed — canary mint times</h2>
+<p class="muted mb-2" style="font-size:13px">Each unique <span class="mono">(User-Agent, ASN)</span> visitor and when it was first/last served its
+   canary set, straight from the site's <span class="mono">new_visits</span> log. The earliest first-seen is the
+   crawl/mint time the ingestion window is anchored to.</p>
+<div class="card table-wrap" style="max-height:320px">
+    <table class="tbl">
+        <thead><tr><th>User-Agent</th><th>ASN</th><th>First seen</th><th>Last seen</th><th>Visits</th></tr></thead>
+        <tbody>
+        {% for cr in report.crawlers %}
+        <tr>
+            <td class="truncate" title="{{ cr.user_agent }}" style="max-width:340px">{{ cr.user_agent or '—' }}</td>
+            <td class="mono">{{ cr.asn or '—' }}</td>
+            <td class="mono nowrap">{{ cr.first_seen or '—' }}</td>
+            <td class="mono nowrap">{{ cr.last_seen or '—' }}</td>
+            <td class="mono">{{ cr.n }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+{% endif %}
+
+<details class="mt-5">
+    <summary class="muted">Raw report JSON</summary>
+    <pre class="codeblock mt-2" style="max-height:420px">{{ report | tojson(indent=2) }}</pre>
+</details>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if report and report.status == 'running' and not (live and live.interrupted) %}
+<script>
+// The probe runs on a background worker; reload the page the moment it's done.
+(function () {
+  async function poll() {
+    try {
+      const res = await fetch('/provenance/runs/{{ run_id }}/status', {headers: {'Accept': 'application/json'}});
+      const s = await res.json();
+      if (s.done) { window.location.reload(); return; }
+    } catch (e) { /* transient; keep polling */ }
+    setTimeout(poll, 1500);
+  }
+  poll();
+})();
+</script>
+{% endif %}
+{% endblock %}

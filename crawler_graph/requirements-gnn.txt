@@ -1,0 +1,8 @@
+# GraphSAGE GNN extra (Direction 6a) — only needed for `gnn-train` / `build --gnn`.
+# Heavy; kept OUT of the app image. Install into the env where you train the GNN.
+#
+# CPU is fine for this graph size. For CUDA, install the matching torch wheel from
+# https://pytorch.org first, then torch_geometric.
+torch>=2.2
+torch_geometric>=2.5
+scikit-learn>=1.3     # optional: KMeans/HDBSCAN over GraphSAGE embeddings

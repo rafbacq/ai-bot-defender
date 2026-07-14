@@ -1,0 +1,12 @@
+# LLM querying pipeline dependencies.
+# The pipeline runs fully offline (mock providers) with just these. spaCy is
+# OPTIONAL — install it for richer named-entity extraction in parser.py; without
+# it the parser falls back to a title/heading heuristic.
+requests>=2.31
+beautifulsoup4>=4.12
+httpx>=0.27
+python-dotenv>=1.0   # optional convenience: load API keys from a .env file
+
+# Optional: richer entity extraction (heavy; needs a compiler + model download).
+#   pip install spacy && python -m spacy download en_core_web_sm
+# spacy>=3.7

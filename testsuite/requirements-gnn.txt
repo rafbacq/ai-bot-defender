@@ -1,0 +1,11 @@
+# Optional dependencies for the GraphSAGE GNN feature (testsuite/test_clustering_gnn.py).
+# Heavy (~hundreds of MB), so kept separate from the core requirements. Without
+# these, the `gnn` feature SKIPS cleanly (clearly reported); install them to
+# exercise the real provider-attribution model, or run the runner with
+# `--gnn require` to make their absence a hard failure.
+#
+# CPU-only install (recommended for CI / laptops):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r testsuite/requirements-gnn.txt
+torch>=2.2
+torch_geometric>=2.5

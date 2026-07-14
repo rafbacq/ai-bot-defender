@@ -1,0 +1,41 @@
+---
+- name: Locate Homebrew #all this file does is essentially check homebrew, docker, and its daemon are properly running
+  ansible.builtin.command: which brew
+  register: brew_check
+  changed_when: false
+  failed_when: false
+
+- name: Require Homebrew
+  ansible.builtin.assert:
+    that: brew_check.rc == 0
+    fail_msg: >-
+      Homebrew is required. Install it from https://brew.sh, then re-run this playbook.
+
+- name: Locate docker CLI
+  ansible.builtin.command: which docker
+  register: docker_check
+  changed_when: false
+  failed_when: false
+
+- name: Install docker CLI via Homebrew
+  ansible.builtin.command: brew install docker
+  when: docker_check.rc != 0
+  changed_when: true
+
+- name: Locate docker compose plugin
+  ansible.builtin.command: docker compose version
+  register: compose_check
+  changed_when: false
+  failed_when: false
+
+- name: Install docker compose plugin via Homebrew
+  ansible.builtin.command: brew install docker-compose
+  when: compose_check.rc != 0
+  changed_when: true
+
+- name: Verify Docker daemon is reachable
+  ansible.builtin.command: docker info
+  register: docker_info
+  changed_when: false
+  failed_when: docker_info.rc != 0
+  # If this fails, start Docker Desktop or `colima start` before re-running.

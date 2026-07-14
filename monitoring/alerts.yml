@@ -1,0 +1,96 @@
+# Prometheus alerting rules for the AI Bot Defender instance.
+#
+# There is no Alertmanager in this stack (nothing to page yet), so firing
+# alerts surface in two places:
+#   - Prometheus UI:  http://localhost:9090/alerts   (via the SSH tunnel)
+#   - Grafana:        Alerting -> Alert rules (the Prometheus datasource
+#                     exposes these), and the dashboard's alert list panel.
+# If/when a notification channel exists (email/Slack), add an alertmanager
+# service to docker-compose.monitoring.yml and point `alerting:` at it in
+# prometheus.yml -- these rules carry over unchanged.
+groups:
+  - name: host
+    rules:
+      - alert: HostRootDiskAlmostFull
+        expr: >
+          (node_filesystem_avail_bytes{mountpoint="/",fstype="ext4"}
+           / node_filesystem_size_bytes{mountpoint="/",fstype="ext4"}) < 0.10
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "Root disk has less than 10% free"
+          description: "Postgres (visit logs, canary sets), Loki chunks, and Docker images all live on /. Free space or grow the volume before writes start failing."
+
+      - alert: HostOutOfMemory
+        expr: >
+          (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.10
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Less than 10% of RAM available for 10m"
+          description: "Sustained memory pressure; the template-generator / GNN workloads are the usual suspects. Swap exists but will be slow."
+
+      - alert: HostHighCpu
+        expr: >
+          1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) > 0.9
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "CPU >90% for 15 minutes"
+          description: "Expected briefly during template generation or GNN training; sustained load otherwise deserves a look at cAdvisor's per-container CPU."
+
+  - name: monitoring
+    rules:
+      - alert: ScrapeTargetDown
+        expr: up == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Prometheus target {{ $labels.job }} is down"
+          description: "{{ $labels.instance }} has failed scrapes for 5 minutes."
+
+  - name: containers
+    # cAdvisor only exports a series while the container exists, so a stopped
+    # or crash-looping-to-dead container shows up as the metric going ABSENT
+    # (after Prometheus's 5m staleness). One rule per request-path-critical
+    # container; `for: 5m` rides out image rebuilds and compose recreates.
+    rules:
+      - alert: ReverseProxyDown
+        expr: absent(container_last_seen{name="proxy-nginx"})
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "proxy-nginx is gone — no honeypot is reachable"
+          description: "The single public entry point is down; every site and all central logging is offline for visitors."
+
+      - alert: CentralLogDbDown
+        expr: absent(container_last_seen{name="proxy-logdb-1"})
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Central log Postgres (logdb) is gone"
+          description: "all_visits / fingerprints / TLS handshakes are not being recorded. The honeypot still serves pages (collector is fire-and-forget) but evidence is being lost."
+
+      - alert: VisitCollectorDown
+        expr: absent(container_last_seen{name="proxy-collector-1"})
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Request-mirror collector is gone"
+          description: "nginx's mirror has no receiver: honeypot pages still serve, but nothing lands in all_visits."
+
+      - alert: HoneypotSiteDown
+        expr: absent(container_last_seen{name="site-001-web-1"})
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "site-001 web container is gone"
+          description: "Visitors get 502 from the proxy; crawlers see a broken site."
+
+      - alert: DashboardAppDown
+        expr: absent(container_last_seen{name="ai-bot-defender-app"})
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Dashboard app container is gone"
+          description: "Honeypot traffic is unaffected; the research UI (and playbook runs from it) are unavailable."

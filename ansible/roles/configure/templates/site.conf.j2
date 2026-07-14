@@ -1,0 +1,64 @@
+{# Rendered by Ansible per-site into {{ proxy.conf_dir }}/{{ site_id }}.conf. #}
+{# Edit ui/configs/sites/{{ site_id }}.yaml (proxy.server_name) then re-run; #}
+{# never hand-maintain these files. nginx is reloaded (not restarted) after. #}
+server {
+    # Same site served over plain HTTP and HTTPS. The TLS cert (a shared
+    # wildcard) is inherited from the http{} scope in nginx.conf; nginx picks it
+    # by SNI, then routes by the Host header below -- name-based virtual hosting
+    # over HTTPS. Serving :80 too keeps crawlers that only speak plain HTTP (or
+    # don't follow redirects) reaching the honeypot. To make this behave like a
+    # redirect-to-HTTPS site instead, drop `listen 80;` here and add a tiny
+    # `server { listen 80; server_name <names>; return 301 https://$host$request_uri; }`.
+    listen 80;
+    listen 443 ssl;
+    # Browsers resolve *.localhost to loopback, so this branded alias gives
+    # operators a usable local URL that still enters nginx and reaches all_visits.
+    # proxy.server_aliases (a list, optional; global in all.yml or per-site) adds
+    # extra names -- e.g. the instance's raw public IP so raw-IP scanners reach
+    # the honeypot instead of the catch-all. Requests arriving via any alias are
+    # still recorded under the canonical $site_name below.
+    server_name {{ proxy.server_name | default(site_id ~ '.' ~ proxy.base_domain) }}{% for alias in proxy.server_aliases | default([]) %} {{ alias }}{% endfor %} {{ site_id }}.{{ proxy.local_base_domain }};
+    set $site_name {{ proxy.server_name | default(site_id ~ '.' ~ proxy.base_domain) }};
+    access_log /var/log/nginx/dukecodeplus.access.log siteaccess;
+
+    # Layer-1 browser-fingerprint beacon (website/static/js/fp.js POSTs here).
+    # Exact-match so it intercepts ONLY this path; everything else still falls to
+    # `location /` below. It does not mirror and never reaches the Flask backend
+    # -- it is a direct write to logdb.browser_fingerprints via the fp-collector.
+    # Tagged with the canonical site + the (X-Real-IP, X-Client-Port) 4-tuple so
+    # the fingerprint joins to all_visits and the TLS/TCP handshakes. XFF is
+    # OVERWRITTEN (not appended), same anti-spoof rule as the rest of this file.
+    # The variable upstream + http{} resolver means a reload never fails when the
+    # collector is momentarily down (resolved at request time, like the mirror).
+    location = /__fpbeacon {
+        set $fp_upstream fp-collector;
+        proxy_set_header Host $host;
+        proxy_set_header X-Site $site_name;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Client-Port $remote_port;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 200ms;
+        proxy_read_timeout 1s;
+        proxy_pass http://$fp_upstream:8000$request_uri;
+    }
+
+    location / {
+        mirror /_mirror;
+        mirror_request_body off;
+
+        # Resolve the backend at request time (Docker DNS + variable) so a
+        # reload never fails just because this site's container is down.
+        set $upstream {{ site_id }}-web;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # Overwrite (not append) XFF: server.py trusts the first XFF entry for
+        # ASN lookup + canary keying, so we must hand it only the real client.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass http://$upstream:8080$request_uri;
+    }
+
+    include /etc/nginx/snippets/mirror.conf;
+}

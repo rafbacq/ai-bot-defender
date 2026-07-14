@@ -1,0 +1,99 @@
+{# The traffic table's <tbody> rows. Rendered both inside analytics.html and, on its
+   own, by GET /logs/fragment so Prev/Next can swap the tbody without a full reload.
+   The whole row is tinted by its 3-tier severity — clean=green (certainly fine),
+   suspicious=orange (needs verification), malicious=red (certainly a bot) — there is
+   no verdict column: the reason lives on row hover and at the top of the Detail panel. #}
+{% if data.rows %}
+    {% for row in data.rows %}
+    {% set v = row.verdict or {} %}
+    {% set sev = row.severity or {'level': 'clean', 'reason': ''} %}
+    <tr class="row--{{ sev.level }}"{% if sev.reason %} title="{{ sev.level|capitalize }} — {{ sev.reason }}"{% endif %}>
+        {# data-ts holds the raw ISO ts; a script rewrites this cell to the viewer's
+           local timezone in a short form, keeping the full timestamp on hover. #}
+        <td class="mono nowrap ts" data-ts="{{ row.ts }}" title="{{ row.ts }}">{{ row.ts }}</td>
+        <td>{{ row.site }}</td>
+        <td><span class="badge badge--navy">{{ row.method }}</span></td>
+        <td class="mono truncate" title="{{ row.uri }}">{{ row.uri }}</td>
+        <td class="mono">{{ row.client_ip }}</td>
+        <td class="truncate" title="{{ row.user_agent }}">{{ row.user_agent }}</td>
+        <td class="nowrap"><button type="button" class="btn btn--ghost btn--sm detail-toggle" data-detail-toggle aria-expanded="false">Detail</button></td>
+    </tr>
+    <tr class="detailrow" hidden>
+        <td colspan="7">
+            <div class="detailpanel">
+                <p style="margin:0 0 .6rem">
+                    <span class="sev sev--{{ sev.level }}">
+                        {%- if sev.level == 'malicious' -%}Malicious{%- elif sev.level == 'suspicious' -%}Suspicious{%- else -%}Clean{%- endif -%}
+                    </span>
+                    {% if sev.reason %}<span class="muted" style="font-size:12px;margin-left:6px">{{ sev.reason }}</span>{% endif %}
+                </p>
+                <div class="grid md:grid-cols-2 gap-5">
+                    <div>
+                        <p style="margin:0 0 .35rem"><strong>Request headers</strong></p>
+                        <pre class="codeblock" style="max-height:240px;margin:0">{{ row.headers | tojson(indent=2) }}</pre>
+                    </div>
+                    <div>
+                        {% if row.fp_present %}
+                        <p style="margin:0 0 .35rem"><strong>Device fingerprint</strong>
+                           {% if row.fp_id %}<span class="mono muted">· {{ row.fp_id }}</span>{% endif %}</p>
+                        {% if row.disguised %}
+                        <p style="margin:.1rem 0 .35rem;color:var(--copper)"><strong>⚠ Disguised device</strong> — this fingerprint has been seen under more than one identity (see the disguise panel below).</p>
+                        {% endif %}
+                        {% if v.contradictions %}
+                        <p style="color:#7a2980;margin:.2rem 0"><strong>Contradictions</strong></p>
+                        <ul style="margin:.2rem 0 .5rem 1.1rem;padding:0;list-style:disc">
+                            {% for r in v.contradictions %}<li class="muted">{{ r }}</li>{% endfor %}
+                        </ul>
+                        {% endif %}
+                        <div class="grid grid-cols-2 gap-x-5 gap-y-1 my-1">
+                            {% set kv = [
+                                ('UA OS', v.claimed_os), ('JS platform', v.js_os),
+                                ('TCP OS', (v.tcp_os ~ ' · local hop') if (v.tcp_os and not v.tcp_os_trusted) else v.tcp_os),
+                                ('WebGL renderer', row.webgl_renderer), ('WebGL vendor', row.webgl_vendor),
+                                ('Canvas', row.canvas_hash), ('Audio', row.audio_hash),
+                                ('Font', row.font_hash), ('JA4T', row.ja4t), ('Phase', row.phase),
+                            ] %}
+                            {% for label, value in kv %}
+                            <div class="truncate" title="{{ value }}"><span class="muted">{{ label }}:</span> <span class="mono">{{ value if value is not none else '—' }}</span></div>
+                            {% endfor %}
+                        </div>
+                        {% if v.tcp_os and not v.tcp_os_trusted %}
+                        <p class="muted" style="font-size:11px;margin:.3rem 0 .3rem">
+                            The TCP/IP OS guess (<span class="mono">{{ v.tcp_os }}</span>) is the <strong>local NAT hop</strong>,
+                            not this visitor's machine — they reached the proxy through Docker's userland proxy, so it is
+                            <strong>not</strong> used to judge OS spoofing. (Real crawlers arrive from public IPs, where it counts.)
+                        </p>
+                        {% endif %}
+                        {% if row.automation %}
+                        <p style="margin:.4rem 0 .1rem"><strong>Automation tells</strong></p>
+                        <pre class="codeblock" style="max-height:120px;margin:0">{{ row.automation | tojson(indent=2) }}</pre>
+                        {% endif %}
+                        {% if row.behavior %}
+                        <p style="margin:.4rem 0 .1rem"><strong>Behavioral biometrics</strong></p>
+                        <pre class="codeblock" style="max-height:160px;margin:0">{{ row.behavior | tojson(indent=2) }}</pre>
+                        {% endif %}
+                        {% else %}
+                        <p style="margin:0 0 .35rem"><strong>Device fingerprint</strong></p>
+                        {% if v.score %}
+                        <p class="muted" style="margin:.1rem 0">This request used a <strong>browser User-Agent but never executed <span class="mono">fp.js</span></strong> — a headless or agentic crawler. That absence is itself a bot signal.</p>
+                        {% if v.contradictions %}
+                        <ul style="margin:.2rem 0 .4rem 1.1rem;padding:0;list-style:disc">
+                            {% for r in v.contradictions %}<li class="muted">{{ r }}</li>{% endfor %}
+                        </ul>
+                        {% endif %}
+                        {% else %}
+                        <p class="muted" style="margin:.1rem 0">No browser fingerprint for this request — the client never ran <span class="mono">fp.js</span> (a non-JS / declared client).</p>
+                        {% endif %}
+                        {% if v.tcp_os %}
+                        <div class="truncate" style="margin-top:.35rem"><span class="muted">TCP OS:</span> <span class="mono">{{ v.tcp_os }}{% if not v.tcp_os_trusted %} · local hop{% endif %}</span></div>
+                        {% endif %}
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        </td>
+    </tr>
+    {% endfor %}
+{% else %}
+    <tr><td colspan="7" class="muted" style="text-align:center;padding:32px">No requests match these filters.</td></tr>
+{% endif %}

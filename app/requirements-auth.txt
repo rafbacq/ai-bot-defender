@@ -1,0 +1,5 @@
+# Local account authentication and signed browser sessions. bcrypt stays on the
+# passlib-compatible release used by the sign-in feature branch.
+passlib[bcrypt]>=1.7,<2
+bcrypt==4.0.1
+itsdangerous>=2.1

@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Create account · AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="auth-shell">
+    <div class="page-head">
+        <span class="eyebrow">Approved access</span>
+        <h1>Create your account</h1>
+        <p>An administrator must approve you first. Use the same email address and institution from that approval.</p>
+    </div>
+
+    <section class="card card--pad auth-card">
+        {% if error %}
+        <div class="notice notice--err auth-notice" role="alert">
+            <div class="notice__title">Unable to create account</div>
+            <div>{{ error }}</div>
+        </div>
+        {% endif %}
+        <form method="post" action="/signup" class="auth-form">
+            <label>
+                <span class="field-label">Approved email</span>
+                <input class="input" type="email" name="email" value="{{ values.get('email', '') }}"
+                       required maxlength="254" autocomplete="email" autofocus>
+            </label>
+            <label>
+                <span class="field-label">Username</span>
+                <input class="input" type="text" name="username" value="{{ values.get('username', '') }}"
+                       required maxlength="50" pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,49}"
+                       autocomplete="username">
+                <span class="help">Letters, numbers, dots, hyphens, and underscores. You will use this username—not your email—to log in.</span>
+            </label>
+            <label>
+                <span class="field-label">Password</span>
+                <input class="input" type="password" name="password" required
+                       minlength="8" maxlength="72" autocomplete="new-password">
+                <span class="help">At least 8 characters.</span>
+            </label>
+            <label>
+                <span class="field-label">Institution</span>
+                <select class="input" name="institution" required>
+                    <option value="" disabled {% if not values.get('institution') %}selected{% endif %}>Select your institution</option>
+                    {% for inst in institutions %}
+                    <option value="{{ inst }}" {% if values.get('institution') == inst %}selected{% endif %}>{{ inst }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <button type="submit" class="btn btn--primary btn--block">Create account</button>
+        </form>
+        <div class="auth-links">
+            <p>Not approved yet? <a href="/request-access">Request access first</a>.</p>
+            <p>Already registered? <a href="/login">Log in with your username</a>.</p>
+        </div>
+    </section>
+</div>
+{% endblock %}

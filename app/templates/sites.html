@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %}Site Configurator — AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="page-head">
+    <h1>Site Configurator</h1>
+    <p>Each site is an independent stack with its own database, reachable through the shared reverse proxy.</p>
+</div>
+
+{% if deployed %}
+<div class="notice {{ 'notice--ok' if ok == '1' else 'notice--err' }} mb-6">
+    <div class="flex items-center gap-2 mb-1">
+        <span class="badge {{ 'badge--clean' if ok == '1' else 'badge--alert' }}">{{ 'Deployed' if ok == '1' else 'Failed' }}</span>
+        <span class="font-semibold">{{ deployed }}</span>
+        {# Link the canonical (publicly resolvable) hostname, not the *.localhost
+           alias — the dashboard is often viewed through an SSH tunnel from a
+           machine where the alias resolves to the wrong loopback. #}
+        {% if ok == '1' %}{% set dhost = (sites | selectattr('site_id', 'equalto', deployed) | map(attribute='hostname') | first) or deployed %}<a class="ml-1" href="http://{{ dhost }}/" target="_blank">Open site ↗</a>{% endif %}
+    </div>
+    {% if deploy_output %}
+    <details class="mt-1">
+        <summary>Playbook output</summary>
+        <pre class="codeblock mt-2" style="max-height:280px">{{ deploy_output }}</pre>
+    </details>
+    {% endif %}
+</div>
+{% endif %}
+
+<div class="grid lg:grid-cols-5 gap-5">
+    <!-- Deploy form -->
+    <div class="lg:col-span-3 card card--pad">
+        <h2 class="text-lg font-bold text-navy mb-4">Deploy a site</h2>
+        <form method="post" action="/sites/deploy" class="grid sm:grid-cols-2 gap-4">
+            <div class="sm:col-span-2">
+                <label class="field-label">Site ID</label>
+                <input class="input" name="site_id" value="site-{{ '%03d' % suggested.next_index }}" required>
+            </div>
+            <div>
+                <label class="field-label">Template (See Preview Below)</label>
+                <select class="input" name="scraper_version" id="scraper_version">
+                    {% for v in versions %}<option value="{{ v }}">scraper{{ v }}.html</option>{% endfor %}
+                </select>
+            </div>
+            <div>
+                <label class="field-label">Canary generation</label>
+                <select class="input" name="genmode">
+                    <option value="true">On — assign canaries</option>
+                    <option value="false">Off — serve “Null”</option>
+                </select>
+            </div>
+            <div>
+                <label class="field-label">Web port <span class="field-hint">· unique</span></label>
+                <input class="input" name="port" type="number" value="{{ suggested.web_port }}" required>
+            </div>
+            <div>
+                <label class="field-label">Database port <span class="field-hint">· unique</span></label>
+                <input class="input" name="db_host_port" type="number" value="{{ suggested.db_host_port }}" required>
+            </div>
+            <div>
+                <label class="field-label">DB user <span class="field-hint">· optional</span></label>
+                <input class="input" name="db_user" placeholder="inherits default">
+            </div>
+            <div>
+                <label class="field-label">DB password <span class="field-hint">· optional</span></label>
+                <input class="input" name="db_password" placeholder="inherits default">
+            </div>
+            <label class="check sm:col-span-2">
+                <input type="checkbox" name="reset_db" value="1">
+                <span>Recreate database volume — needed when changing DB credentials on an existing site.
+                    <strong style="color:var(--copper)">Wipes that site’s stored visits and canaries.</strong></span>
+            </label>
+            <div class="sm:col-span-2">
+                <button type="submit" class="btn btn--primary">Deploy with Ansible</button>
+            </div>
+        </form>
+    </div>
+
+    <!-- Side panel -->
+    <div class="lg:col-span-2 space-y-5">
+        <div class="card card--pad">
+            <h2 class="text-lg font-bold text-navy mb-3">Template preview</h2>
+            <iframe id="tpl-preview" class="preview"></iframe>
+            <details class="mt-3">
+                <summary>View source</summary>
+                <pre id="tpl-source" class="codeblock mt-2" style="max-height:220px"></pre>
+            </details>
+        </div>
+        <div class="card card--pad">
+            <h2 class="text-lg font-bold text-navy mb-3">Global setting</h2>
+            <form method="post" action="/sites/website-dir" class="space-y-3">
+                <div>
+                    <label class="field-label">Website source path <span class="field-hint">· built into each site</span></label>
+                    <input class="input" name="website_dir" value="{{ website_dir }}">
+                </div>
+                <button type="submit" class="btn btn--ghost btn--sm">Save</button>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Configured sites -->
+<section class="mt-8">
+    <h2 class="section-title">Configured sites ({{ sites|length }})</h2>
+    <div class="card">
+        {% if sites %}
+        <div class="table-wrap">
+            <table class="tbl">
+                <thead><tr><th>Site</th><th>Hostname</th><th>Template</th><th>Web</th><th>DB</th><th>Status</th><th></th></tr></thead>
+                <tbody>
+                {% for s in sites %}
+                    <tr>
+                        <td class="font-semibold">{{ s.site_id }}</td>
+                        <td class="mono">{{ s.hostname }}</td>
+                        <td>scraper{{ s.scraper_version }}</td>
+                        <td class="mono">{{ s.website.port }}</td>
+                        <td class="mono">{{ s.database.host_port }}</td>
+                        <td>
+                            {% if s.hostname in active_routes %}<span class="badge badge--clean">Live</span>
+                            {% elif s.deployed %}<span class="badge badge--warn">Deployed</span>
+                            {% else %}<span class="badge badge--neutral">Config only</span>{% endif %}
+                        </td>
+                        <td><a href="http://{{ s.hostname }}/" target="_blank" title="Local alias: http://{{ s.local_hostname }}/">Open ↗</a></td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="card--pad muted">No sites configured yet. Deploy your first site above.</div>
+        {% endif %}
+    </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  const sel = document.getElementById('scraper_version');
+  const frame = document.getElementById('tpl-preview');
+  const source = document.getElementById('tpl-source');
+  async function loadTemplate() {
+    if (!sel) return;
+    const res = await fetch('/sites/template/' + sel.value);
+    const html = await res.text();
+    frame.srcdoc = html;
+    source.textContent = html;
+  }
+  if (sel) { sel.addEventListener('change', loadTemplate); loadTemplate(); }
+</script>
+{% endblock %}

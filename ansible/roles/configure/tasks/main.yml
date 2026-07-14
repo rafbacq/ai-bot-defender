@@ -1,0 +1,57 @@
+---
+- name: Ensure varLists directory exists
+  ansible.builtin.file:
+    path: "{{ website_dir }}/varLists"
+    state: directory
+    mode: "0755"
+
+- name: Render canary token list for scraper{{ scraper_version }}
+  ansible.builtin.template:
+    src: canary_vars.txt.j2
+    dest: "{{ website_dir }}/varLists/scraper{{ scraper_version }}.txt"
+    mode: "0644"
+
+- name: Ensure an HTML template exists for scraper{{ scraper_version }}
+  ansible.builtin.copy:
+    src: "{{ website_dir }}/templates/scraper1.html"
+    dest: "{{ website_dir }}/templates/scraper{{ scraper_version }}.html"
+    mode: "0644"
+    force: false
+  when: scraper_version | int != 1
+
+- name: Ensure per-site directory exists
+  ansible.builtin.file:
+    path: "{{ website_dir }}/sites/{{ site_id }}"
+    state: directory
+    mode: "0755"
+
+- name: Render per-site docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ website_dir }}/sites/{{ site_id }}/docker-compose.yml"
+    mode: "0644"
+
+- name: Ensure server.py reads SCRAPER_VERSION from env
+  ansible.builtin.replace:
+    path: "{{ website_dir }}/server.py"
+    regexp: '^SCRAPER_VERSION = \d+\s*$'
+    replace: 'SCRAPER_VERSION = int(os.environ.get("SCRAPER_VERSION", 1))'
+
+# --- Reverse proxy: render this site's nginx server block ------------------
+# conf_dir is bind-mounted into proxy-nginx at /etc/nginx/conf.d. Writing here
+# and reloading (handler below) routes <server_name> -> this site's container
+# without touching any other site.
+- name: Ensure nginx conf.d directory exists
+  ansible.builtin.file:
+    path: "{{ proxy.conf_dir }}"
+    state: directory
+    mode: "0755"
+  when: proxy.enabled | default(false) | bool
+
+- name: Render per-site nginx server block
+  ansible.builtin.template:
+    src: site.conf.j2
+    dest: "{{ proxy.conf_dir }}/{{ site_id }}.conf"
+    mode: "0644"
+  when: proxy.enabled | default(false) | bool
+  notify: Validate and reload nginx

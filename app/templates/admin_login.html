@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Access administration · AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="auth-shell">
+    <div class="page-head">
+        <span class="eyebrow">Argus Lab only</span>
+        <h1>Access administration</h1>
+        <p>Unlock the approval console with the configured administrator password.</p>
+    </div>
+
+    <section class="card card--pad auth-card">
+        {% if error %}
+        <div class="notice notice--err auth-notice" role="alert">
+            <div class="notice__title">Not authorized</div>
+            <div>{{ error }}</div>
+        </div>
+        {% endif %}
+        <form method="post" action="/admin/login" class="auth-form">
+            <label>
+                <span class="field-label">Administrator password</span>
+                <input class="input" type="password" name="admin_secret" required
+                       autocomplete="current-password" autofocus>
+            </label>
+            <button type="submit" class="btn btn--primary btn--block">Open approval console</button>
+        </form>
+        <p class="auth-links"><a href="/login">Return to account login</a>.</p>
+    </section>
+</div>
+{% endblock %}

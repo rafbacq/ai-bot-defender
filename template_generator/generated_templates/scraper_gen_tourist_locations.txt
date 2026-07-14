@@ -1,0 +1,10 @@
+fake.city()
+fake.last_name()
+fake.last_name()
+fake.first_name() + ' ' + fake.last_name()
+fake.last_name() + ' Visitor Center'
+fake.city()
+fake.word().capitalize()
+fake.last_name() + ' Park'
+fake.company() + ' Conservation Group'
+fake.last_name() + ' Landmark'

@@ -1,0 +1,43 @@
+# Prometheus scrape config for the AI Bot Defender monitoring stack.
+# Targets are compose service names on the monitoring stack's default network.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Alert rules (host disk/memory/CPU, scrape-target down, critical containers
+# gone). No Alertmanager yet: firing alerts are visible in the Prometheus UI
+# (/alerts) and in Grafana's Alerting view via this datasource.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Host-level metrics (CPU, memory, disk, network) — the CloudWatch/EC2-health
+  # replacement.
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # Per-container metrics for every stack on the box (proxy, app, sites, this
+  # stack) — the container-health view.
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+
+  # The log store's own health/ingest metrics.
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+
+  - job_name: grafana
+    static_configs:
+      - targets: ["grafana:3000"]
+
+  # The log shipper's own health (targets watched, lines shipped) — if this
+  # target goes down, container/nginx logs silently stop flowing into Loki.
+  - job_name: promtail
+    static_configs:
+      - targets: ["promtail:9080"]

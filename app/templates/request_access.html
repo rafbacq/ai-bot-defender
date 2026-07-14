@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Request access · AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="auth-shell auth-shell--wide">
+    <div class="page-head">
+        <span class="eyebrow">Research access</span>
+        <h1>Request access</h1>
+        <p>AI Bot Defender is available to approved research institutions. Argus Lab reviews each request before an account can be created.</p>
+    </div>
+
+    <section class="card card--pad auth-card">
+        <ol class="auth-steps">
+            <li>Submit the external access-request form.</li>
+            <li>Wait for Argus Lab to review the request and approve the institutional email. Submitting the form alone does not create an account.</li>
+            <li>After approval, open the signup page and use that exact email and institution to create your account.</li>
+        </ol>
+        <a href="{{ form_url }}" target="_blank" rel="noopener noreferrer" class="btn btn--primary">Open the request form</a>
+        <div class="auth-links">
+            <p>Has an administrator approved you? <a href="/signup">Create your account</a>.</p>
+            <p>Already registered? <a href="/login">Log in with your username</a>.</p>
+        </div>
+    </section>
+</div>
+{% endblock %}

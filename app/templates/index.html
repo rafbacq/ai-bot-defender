@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="page-head">
+    <span class="eyebrow">Duke Code+ 2026 · Argus Lab</span>
+    <h1>AI Bot Defender</h1>
+    <p>Deploy honeypot sites seeded with canary tokens, log every crawler that visits, and test
+       which LLMs reproduced your content.</p>
+</div>
+
+<!-- Statistics -->
+<section class="mb-10">
+    <h2 class="section-title">At a glance</h2>
+    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+        {% set cells = [
+            ('Websites live', 'sites_live'),
+            ('LLM models', 'llm_models'),
+            ('Queries run', 'queries_completed'),
+            ('Leaks detected', 'matches_found'),
+            ('Requests logged', 'requests_logged'),
+            ('Device fingerprints', 'device_fingerprints'),
+            ('Campaigns', 'campaigns'),
+            ('Disguised', 'disguised'),
+            ('Contradictions', 'contradictions'),
+            ('Robust detector AUC', 'robust_auc'),
+        ] %}
+        {% for label, key in cells %}
+        <div class="stat">
+            <div class="stat__value" data-stat="{{ key }}">{% set v = stats[key] %}{{ v if v is not none else '—' }}</div>
+            <div class="stat__label">{{ label }}</div>
+        </div>
+        {% endfor %}
+    </div>
+</section>
+
+<!-- Navigation -->
+<section class="mb-12">
+    <h2 class="section-title">Get started</h2>
+    <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <a href="/query" class="nav-card">
+            <span class="nav-card__icon">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6"/><path d="M10 3v5.5L4.5 18a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 8.5V3"/><path d="M7 14h10"/></svg>
+            </span>
+            <h3>LLM Forensics</h3>
+            <p>Probe target models for canary leaks, then date and prove when they ingested your content.</p>
+            <span class="nav-card__cta">Run forensics →</span>
+        </a>
+        <a href="/sites" class="nav-card">
+            <span class="nav-card__icon">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18"/></svg>
+            </span>
+            <h3>Site Configurator</h3>
+            <p>Deploy and re-apply honeypot sites — each its own stack behind the reverse proxy.</p>
+            <span class="nav-card__cta">Manage sites →</span>
+        </a>
+        <a href="/logs" class="nav-card">
+            <span class="nav-card__icon">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M6.7 7.3 11 16M17.3 7.3 13 16M7 6h10"/></svg>
+            </span>
+            <h3>Crawler Analytics</h3>
+            <p>Inspect every request, device fingerprints, and the crawler campaigns they cluster into.</p>
+            <span class="nav-card__cta">Explore traffic →</span>
+        </a>
+        <a href="/generator" class="nav-card">
+            <span class="nav-card__icon">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.6L18.5 9.5 14 11.4 12 16l-2-4.6L5.5 9.5 10 7.6 12 3z"/><path d="M19 14l.8 2L22 16.8 20 17.6 19 19.6 18.2 17.6 16 16.8 18 16z"/></svg>
+            </span>
+            <h3>Template Generator</h3>
+            <p>Author new honeypot pages with the fine-tuned model and store them for deployment.</p>
+            <span class="nav-card__cta">Generate a template →</span>
+        </a>
+        <a href="/selfplay" class="nav-card">
+            <span class="nav-card__icon">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 15l3-4 3 3 4-6"/><circle cx="7" cy="15" r="1"/><circle cx="17" cy="8" r="1"/></svg>
+            </span>
+            <h3>Adversarial Self-Play</h3>
+            <p>Train a crawler to evade the detector, then harden it — with a measured cost-to-evade curve.</p>
+            <span class="nav-card__cta">Open self-play →</span>
+        </a>
+    </div>
+</section>
+
+<!-- How it works -->
+<section>
+    <h2 class="section-title">How detection works</h2>
+    <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        {% set steps = [
+            ('1', 'Seed', 'Each honeypot serves unique fake facts (canary tokens) per visitor, keyed by User-Agent and ASN.'),
+            ('2', 'Log', 'The reverse proxy mirrors every request into one database, so you see which crawlers visited.'),
+            ('3', 'Probe', 'The console asks target LLMs about a page’s subject using adversarial retrieval prompts.'),
+            ('4', 'Match', 'Answers are compared to the canary tokens — high overlap proves the model ingested the page.'),
+        ] %}
+        {% for n, title, body in steps %}
+        <div class="step">
+            <div class="step__num">{{ n }}</div>
+            <h3>{{ title }}</h3>
+            <p>{{ body }}</p>
+        </div>
+        {% endfor %}
+    </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Keep the headline numbers current without a full reload.
+  async function refreshStats() {
+    try {
+      const res = await fetch('/api/stats', { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      document.querySelectorAll('[data-stat]').forEach(el => {
+        const v = data[el.dataset.stat];
+        el.textContent = (v === null || v === undefined) ? '—' : v;
+      });
+    } catch (_) {}
+  }
+  setInterval(refreshStats, 10000);
+</script>
+{% endblock %}

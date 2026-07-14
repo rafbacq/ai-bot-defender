@@ -1,0 +1,80 @@
+# Global defaults shared by every site. Per-site overrides live in
+# configs/sites/<site_id>.yaml and are merged on top at deploy time.
+# Apply a site with: ansible-playbook site.yml -e site_id=<id>
+
+# Path to the website source (relative to this file's playbook).
+project_root: "{{ playbook_dir }}/.."
+website_dir: "{{ project_root }}/website" #this is using JInja variables
+
+# Default scraper instance. A site can override via scraper_version: in its yaml.
+# Drives:
+#   - varLists/scraper{{ scraper_version }}.txt   (canary token expressions)
+#   - templates/scraper{{ scraper_version }}.html (rendered page)
+#   - the Postgres database name (scraper{{ scraper_version }}-db)
+scraper_version: 1
+
+# Default website / runtime config (per-site files should override port).
+website:
+  port: 8080            # host port mapped to the Flask container
+  genmode: true         # true -> generate html vars for new User Agents; false -> show "Null"
+
+# Default DB config (per-site files should override at least host_port).
+# Optional per-site `host` (e.g. an AWS RDS endpoint): when set, no per-site
+# Postgres container is rendered — the web service connects to that external
+# host instead, and host_port is unused (its collision check is skipped). The
+# scraper{N}-db database must already exist on the external server. Leave unset
+# for the local per-site db container (the default).
+database:
+  user: user
+  password: password
+  host_port: 5432
+
+# Reverse proxy (nginx) + central logging. A single local nginx (:80) is the
+# only exposed entry point and routes to each site by Host header. Ansible
+# renders one server block per site into proxy.conf_dir and reloads (not
+# restarts) nginx. A site may override proxy.server_name in its yaml to use a
+# custom canonical address instead of the "<site_id>.<base_domain>" default.
+# Every site also receives a browser-friendly "<site_id>.<local_base_domain>" alias.
+proxy:
+  enabled: true
+  # EC2 deployment: sslip.io is public wildcard DNS -- any "<name>.<ip>.sslip.io"
+  # resolves to <ip> from every resolver on the internet, so
+  # "site-001.18.206.209.106.sslip.io" reaches this instance in any browser with
+  # no domain purchase and no /etc/hosts edits. If the instance's public IP ever
+  # changes (it will on stop/start until an Elastic IP is attached), update the
+  # IP here, in server_aliases below, and in the certgen env of
+  # docker-compose.proxy.yml, then delete proxy/certs/*, recreate the proxy
+  # stack, and re-run the playbook for each site. When a real domain exists, put
+  # it here instead and swap the self-signed cert for ACME/Let's Encrypt.
+  base_domain: "18.206.209.106.sslip.io"   # server_name = "{{ site_id }}.{{ proxy.base_domain }}"
+  local_base_domain: "dukecodeplus.localhost"  # browser-resolvable local alias
+  # Extra server_name aliases every site answers on. The raw public IP is here
+  # so raw-IP visitors (scanners, curl http://18.206.209.106/) reach a honeypot
+  # instead of the catch-all 444. NOTE: with more than one site deployed, nginx
+  # logs a conflicting-server-name warning and the alphabetically-first site
+  # wins the raw-IP traffic -- move this list into a single site's yaml then.
+  server_aliases: ["18.206.209.106"]
+  container: "proxy-nginx"
+  conf_dir: "{{ project_root }}/proxy/conf.d"
+
+# Canary tokens. Each entry is a Python expression evaluated server-side
+# with `fake` (faker) in scope. The first 10 entries become var1..var10
+# in the HTML template. Extra entries are ignored; fewer than 10 will fail.
+#
+# Useful faker providers loaded by server.py:
+#   fake.first_name_female() / first_name_male() / last_name() / name()
+#   fake.city() / country() / address()
+#   fake.institution_name()              (faker_edu)
+#   fake.dish() / ingredient() / fruit() (faker_food)
+#   fake.date_of_birth(minimum_age=20, maximum_age=85).year
+canary_tokens:
+- "fake.first_name_female() + ' ' + fake.last_name()"
+- "fake.city()"
+- "fake.first_name_female() + ' and ' + fake.first_name_male()"
+- "fake.city()"
+- "fake.institution_name() + ', ' + fake.city() + ' campus'"
+- "fake.city()"
+- "fake.last_name() + '-' + fake.last_name()"
+- "fake.last_name() + '-' + fake.last_name()"
+- "fake.last_name() + '-' + fake.last_name()"
+- "fake.last_name() + '-' + fake.last_name()"

@@ -1,0 +1,6 @@
+{# Rendered from ansible/group_vars/all.yml -> canary_tokens.
+   Each line is a Python expression eval'd by server.py's gen_vars().
+   Do not edit the files in website/varLists by hand; edit canary_tokens in group_vars/all.yml. #}
+{% for expr in canary_tokens[:10] %}
+{{ expr }}
+{% endfor %}

@@ -1,0 +1,10 @@
+fake.company()
+fake.first_name()
+fake.word().capitalize()
+fake.city()
+fake.last_name() + ' Studio'
+fake.word().capitalize()
+fake.last_name()
+fake.first_name() + ' ' + fake.last_name()
+fake.company()
+fake.word().capitalize() + ' Mode'

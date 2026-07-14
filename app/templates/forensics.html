@@ -1,0 +1,475 @@
+{% extends "base.html" %}
+{% block title %}LLM Forensics — AI Bot Defender{% endblock %}
+
+{% block content %}
+{# ---- Provider API-key cards (compact grid) ---- #}
+{% macro keycard(k) %}
+<form method="post" action="/query/keys" class="keycard{% if k.access == 'internal' %} keycard--engine{% endif %}"
+      data-key data-filter="{{ (k.chatbot ~ ' ' ~ k.publisher ~ ' ' ~ k.env_var)|lower }}">
+    <div class="keycard__head">
+        <span class="keycard__name">{{ k.chatbot }}<span class="keycard__pub">{{ k.publisher }}</span></span>
+        <span class="keycard__status {{ 'is-set' if k.configured else 'is-unset' }}"
+              title="{{ k.env_var }}{% if k.configured %} · {{ k.masked }}{% else %} · not set{% endif %}">
+            <span class="keycard__dot"></span>{{ 'configured' if k.configured else 'not set' }}</span>
+    </div>
+    <div class="keycard__form">
+        <input type="hidden" name="env_var" value="{{ k.env_var }}">
+        <input class="input" type="password" name="value" autocomplete="off"
+               placeholder="{{ 'Replace key' if k.configured else 'Paste API key' }}">
+        <button class="btn btn--primary btn--sm" name="action" value="save">Save</button>
+        {% if k.configured %}<button class="btn btn--ghost btn--sm keycard__clear" name="action" value="clear"
+                                      formnovalidate title="Clear key">✕</button>{% endif %}
+    </div>
+    <div class="keycard__foot">
+        <span class="mono">{{ k.env_var }}</span>
+        · <a href="{{ k.console }}" target="_blank" rel="noopener">get key ↗</a>
+    </div>
+</form>
+{% endmacro %}
+{% macro manualcard(k) %}
+<div class="keycard keycard--manual" data-key data-filter="{{ (k.chatbot ~ ' ' ~ k.publisher)|lower }}">
+    <div class="keycard__head">
+        <span class="keycard__name">{{ k.chatbot }}<span class="keycard__pub">{{ k.publisher }}</span></span>
+        <span class="badge badge--neutral badge--xs">manual</span>
+    </div>
+    <div class="keycard__foot">No public API — <a href="#manual">run by hand ↓</a>
+        · <a href="{{ k.console }}" target="_blank" rel="noopener">open ↗</a></div>
+</div>
+{% endmacro %}
+<div class="page-head">
+    <h1>LLM Forensics</h1>
+    <p>Probe target models for your honeypot’s canary tokens — detect leaks, date when each model
+       ingested the page, and prove membership statistically without regurgitation.</p>
+</div>
+
+{% if prov_error %}
+<div class="notice notice--warn mb-5">
+    <div class="notice__title">Run failed</div>
+    <p class="muted" style="margin:0">{{ prov_error }}</p>
+</div>
+{% endif %}
+{% if run_error %}
+<div class="notice notice--err mb-5">
+    <div class="notice__title">Could not start the run</div>
+    <p class="muted" style="margin:0">{{ run_error }}</p>
+</div>
+{% endif %}
+
+<!-- KPIs -->
+<div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
+    {% set metrics = [
+        ('Detection runs', runs_summary.total_runs),
+        ('Leaks detected', runs_summary.matches_found),
+        ('Best score', runs_summary.best_score),
+        ('Models', models_pool|length),
+        ('Anthropic key', 'yes' if prov_providers.anthropic else 'no'),
+        ('Membership', prov_providers.membership_backend),
+    ] %}
+    {% for label, value in metrics %}
+    <div class="stat">
+        <div class="stat__value" style="font-size:24px{% if label == 'Leaks detected' and value %};color:#C84E00{% endif %}">{{ value if value is not none else '—' }}</div>
+        <div class="stat__label">{{ label }}</div>
+    </div>
+    {% endfor %}
+</div>
+
+<!-- Provider API keys (collapsible; controls the auto_query engine's live querying) -->
+{% set keyed_keys = provider_keys | rejectattr('access', 'equalto', 'manual') | list %}
+{% set api_keys = provider_keys | selectattr('access', 'equalto', 'api') | list %}
+{% set manual_keys = provider_keys | selectattr('access', 'equalto', 'manual') | list %}
+<details class="card card--pad mb-5" id="keys" {% if keys_msg or keys_err %}open{% endif %}>
+    <summary class="flex items-center justify-between" style="list-style:none">
+        <span class="section-title" style="margin:0">Provider API keys</span>
+        <span class="badge badge--neutral">{{ keyed_keys|selectattr('configured')|list|length }} of {{ keyed_keys|length }} keys set</span>
+    </summary>
+    <p class="muted mt-3" style="font-size:12.5px">Keys are saved to the project’s git-ignored <span class="mono">.env</span> and applied
+       immediately — no restart. Set a chatbot’s key to query it live; without one it still runs in the
+       <span class="mono">Offline demo</span> and via hand-run <a href="#manual">Manual evaluation</a>.
+       Keys are stored locally and never shown in full.</p>
+
+    {% if keys_msg %}<div class="notice notice--ok mt-3" style="padding:10px 13px"><p style="margin:0">{{ keys_msg }}</p></div>{% endif %}
+    {% if keys_err %}<div class="notice notice--err mt-3" style="padding:10px 13px"><p style="margin:0">{{ keys_err }}</p></div>{% endif %}
+
+    <input type="text" class="input keys-filter" id="keys-filter" placeholder="Filter chatbots…" autocomplete="off" aria-label="Filter providers">
+    <p class="keys-empty" id="keys-empty" hidden>No chatbot matches that filter.</p>
+
+    <div class="keygroup" data-keygroup>
+        <div class="keygroup__title">Detection engine <span class="keygroup__hint">· internal processing, not a target</span></div>
+        <div class="keygrid">
+            {% for k in provider_keys if k.access == 'internal' %}{{ keycard(k) }}{% endfor %}
+        </div>
+    </div>
+
+    <div class="keygroup" data-keygroup>
+        <div class="keygroup__title">Chatbots with a direct API <span class="badge badge--neutral badge--xs">{{ api_keys|length }}</span></div>
+        <div class="keygrid">
+            {% for k in api_keys %}{{ keycard(k) }}{% endfor %}
+        </div>
+    </div>
+
+    {% if manual_keys %}
+    <div class="keygroup" data-keygroup>
+        <div class="keygroup__title">Manual evaluation only <span class="keygroup__hint">· no public API</span> <span class="badge badge--neutral badge--xs">{{ manual_keys|length }}</span></div>
+        <div class="keygrid">
+            {% for k in manual_keys %}{{ manualcard(k) }}{% endfor %}
+        </div>
+    </div>
+    {% endif %}
+</details>
+<script>
+// Live client-side filter over the provider key cards (compact grid).
+(function () {
+    var box = document.getElementById('keys-filter');
+    if (!box) return;
+    var cards = Array.prototype.slice.call(document.querySelectorAll('#keys [data-key]'));
+    var groups = Array.prototype.slice.call(document.querySelectorAll('#keys [data-keygroup]'));
+    var empty = document.getElementById('keys-empty');
+    box.addEventListener('input', function () {
+        var q = box.value.trim().toLowerCase();
+        var anyVisible = false;
+        cards.forEach(function (c) {
+            var hit = !q || (c.getAttribute('data-filter') || '').indexOf(q) !== -1;
+            c.hidden = !hit;
+            if (hit) anyVisible = true;
+        });
+        groups.forEach(function (g) {
+            var vis = g.querySelector('[data-key]:not([hidden])');
+            g.hidden = !vis;
+        });
+        if (empty) empty.hidden = anyVisible;
+    });
+})();
+</script>
+
+<!-- Unified investigation launcher: one form, three actions -->
+<form method="post" action="/query/run" class="card card--pad mb-5" id="launch">
+    <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <h2 class="section-title" style="margin:0">Run an investigation</h2>
+        <div class="flex flex-wrap gap-2">
+            <span class="badge badge--navy">engine: auto_query</span>
+            <span class="badge badge--clean">mock ready</span>
+            {% if providers.providers_ready %}
+                {% for prov, ready in providers.providers_ready.items() if prov != 'mock' %}
+                <span class="badge {{ 'badge--clean' if ready else 'badge--neutral' }}">{{ prov }} {{ 'key' if ready else 'no key' }}</span>
+                {% endfor %}
+            {% endif %}
+            <span class="badge badge--navy">extractor: {{ providers.extractor_provider }}</span>
+        </div>
+    </div>
+
+    <div class="grid lg:grid-cols-2 gap-5">
+        <!-- target + options -->
+        <div>
+            <label class="field-label">Target</label>
+            <div class="segmented mb-3" id="mode-toggle">
+                <button type="button" data-mode="local" class="is-active">Local honeypot</button>
+                <button type="button" data-mode="custom">Custom URL</button>
+            </div>
+            <input type="hidden" name="mode" id="mode" value="local">
+
+            <div id="local-panel">
+                {% if sites %}
+                <select class="input" name="site_id">
+                    {% for s in sites %}<option value="{{ s.site_id }}">{{ s.site_id }} — {{ s.hostname }} (scraper{{ s.scraper_version }})</option>{% endfor %}
+                </select>
+                <p class="help">Scraped through the reverse proxy; ground truth from the site’s canary table.</p>
+                {% else %}
+                <p class="help">No sites configured — <a href="/sites">deploy one</a> or use a custom URL.</p>
+                {% endif %}
+            </div>
+            <div id="custom-panel" style="display:none">
+                <input class="input" name="url" placeholder="https://example.com/profile">
+                <p class="help">Matched against the bundled sample dataset.</p>
+            </div>
+
+            <div class="grid grid-cols-2 gap-4 mt-3">
+                <div>
+                    <label class="field-label">Probe questions per model - provenance/RAG only</label>
+                    <input class="input" name="max_questions" type="number" value="3" min="1" max="10">
+                </div>
+                <div>
+                    <label class="field-label">Seed <span class="field-hint">· optional</span></label>
+                    <input class="input" name="seed" placeholder="reproducible">
+                </div>
+            </div>
+            <label style="display:flex;gap:8px;align-items:center;font-size:13px" class="mt-3">
+                <input type="checkbox" name="page_removed" value="1"> Page has been removed
+                <span class="muted">(RAG only — strengthens the memorization verdict)</span>
+            </label>
+        </div>
+
+        <!-- querying mode + key-aware model picker (shared across all three actions) -->
+        <div>
+            {% set live_models = models_pool | rejectattr('mock') | list %}
+            {% set live_ready = live_models | selectattr('ready') | list | length %}
+            <label class="field-label">Querying mode</label>
+            <div class="segmented mb-3" id="keymode-toggle" data-ready-count="{{ live_ready }}">
+                <button type="button" data-keymode="offline" class="is-active">Offline demo</button>
+                <button type="button" data-keymode="api">Use API keys · {{ live_ready }} model{{ 's' if live_ready != 1 }} ready</button>
+            </div>
+            <input type="hidden" name="key_mode" id="key_mode" value="offline">
+
+            <label class="field-label">Target models</label>
+            <div class="card" style="padding:8px 12px;max-height:236px;overflow:auto" id="model-list">
+                <div class="model-group">
+                    <div class="model-group__title">Offline simulators · no key needed</div>
+                    {% for mm in models_pool if mm.mock %}
+                    <label class="choice" style="border:0;padding:5px 2px">
+                        <input type="checkbox" name="models" value="{{ mm.id }}" data-mock="1" {% if mm.checked %}checked{% endif %}>
+                        <span class="mono">{{ mm.id }}</span>
+                        {% if mm.label %}<span class="muted" style="font-size:11px">· {{ mm.label }}</span>{% endif %}
+                    </label>
+                    {% endfor %}
+                </div>
+                <div class="model-group">
+                    <div class="model-group__title">Live models · queried with your API keys</div>
+                    {% for mm in live_models %}
+                    <label class="choice is-disabled" style="border:0;padding:5px 2px" data-live-choice data-ready="{{ 1 if mm.ready else 0 }}">
+                        <input type="checkbox" name="models" value="{{ mm.id }}" disabled>
+                        <span class="mono">{{ mm.id }}</span>
+                        {% if mm.label %}<span class="muted" style="font-size:11px">· {{ mm.label }}</span>{% endif %}
+                        {% if mm.cutoff %}<span class="muted" style="font-size:11px">· cutoff {{ mm.cutoff }}</span>{% endif %}
+                        <span class="badge {{ 'badge--clean' if mm.ready else 'badge--neutral' }} badge--xs" style="margin-left:auto;flex:none">{{ 'key ready' if mm.ready else 'no key' }}</span>
+                    </label>
+                    {% else %}
+                    <p class="help" style="margin:4px 2px">No live models registered.</p>
+                    {% endfor %}
+                </div>
+            </div>
+            <p class="help" id="keymode-note">Runs fully offline on the mock simulators — no API keys are used or required.</p>
+        </div>
+    </div>
+
+    <!-- the three actions share the form above; formaction routes each one -->
+    <div class="flex flex-wrap items-center gap-3 mt-4">
+        <button type="submit" class="btn btn--cta" formaction="/query/run">Run detection</button>
+        <button type="submit" class="btn btn--primary" name="kind" value="provenance" formaction="/provenance/run">Provenance probe</button>
+        <button type="submit" class="btn btn--primary" name="kind" value="rag" formaction="/provenance/run">RAG experiment</button>
+        <span class="muted" style="font-size:12px">Detection = did it leak · Provenance = <em>when</em> it ingested · RAG = memorization vs. live retrieval</span>
+    </div>
+</form>
+
+<!-- Manual-query workflow: prompt out, chatbot answers back in -->
+<div class="card card--pad mb-5" id="manual">
+    <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+        <h2 class="section-title" style="margin:0">Manual evaluation</h2>
+        <span class="badge badge--neutral">for models without a search API</span>
+    </div>
+    <p class="muted" style="font-size:12.5px;margin-top:0">For providers without a suitable API (ERNIE, Kimi, Meta AI…):
+       generate the retrieval prompt, run it in each chatbot yourself, then upload a
+       <span class="mono">Model / Responses</span> spreadsheet (or paste answers below). Responses are evaluated with
+       exactly the same attribution methodology as automated runs.</p>
+
+    {% if manual and manual.error %}
+    <div class="notice notice--warn mb-3">
+        <div class="notice__title">Manual workflow error</div>
+        <p class="muted" style="margin:0">{{ manual.error }}</p>
+    </div>
+    {% endif %}
+
+    <div class="grid lg:grid-cols-2 gap-5">
+        <!-- Step 1: generate the prompt -->
+        <form method="post" action="/query/prompt">
+            <input type="hidden" name="mode" value="local">
+            <label class="field-label">1 · Generate the prompt</label>
+            {% if sites %}
+            <select class="input mb-2" name="site_id">
+                {% for s in sites %}<option value="{{ s.site_id }}" {% if manual and manual.site_id == s.site_id %}selected{% endif %}>{{ s.site_id }} — {{ s.hostname }} (scraper{{ s.scraper_version }})</option>{% endfor %}
+            </select>
+            {% else %}
+            <p class="help">No sites configured — <a href="/sites">deploy one</a> first.</p>
+            {% endif %}
+            <button class="btn btn--primary" {% if not sites %}disabled{% endif %}>Generate prompt</button>
+            {% if manual and manual.prompt %}
+            <div class="mt-3">
+                <div class="flex items-center justify-between">
+                    <span class="field-label" style="margin:0">Prompt{% if manual.subject %} · subject <strong>{{ manual.subject }}</strong>{% endif %}</span>
+                    <a class="btn btn--ghost btn--sm" href="/query/prompt.txt">Download .txt</a>
+                </div>
+                <textarea class="input mono" rows="8" readonly onclick="this.select()" style="font-size:12px">{{ manual.prompt }}</textarea>
+                <p class="help">Paste this into each chatbot and record one response per model.</p>
+            </div>
+            {% endif %}
+        </form>
+
+        <!-- Step 2: bring the responses back -->
+        <form method="post" action="/query/manual" enctype="multipart/form-data">
+            <label class="field-label">2 · Evaluate the responses</label>
+            {% if sites %}
+            <select class="input mb-2" name="site_id">
+                {% for s in sites %}<option value="{{ s.site_id }}" {% if manual and manual.site_id == s.site_id %}selected{% endif %}>{{ s.site_id }} — {{ s.hostname }} (scraper{{ s.scraper_version }})</option>{% endfor %}
+            </select>
+            {% endif %}
+            <input class="input mb-2" type="file" name="responses_file" accept=".xlsx,.xlsm,.csv">
+            <p class="help" style="margin-top:0">Spreadsheet with <span class="mono">Model</span> and <span class="mono">Responses</span> columns — or paste inline:</p>
+            {% for i in range(3) %}
+            <div class="grid gap-2 mb-2" style="grid-template-columns: 160px 1fr">
+                <input class="input" name="manual_model" placeholder="Model{% if i == 0 %} (e.g. ERNIE){% endif %}">
+                <textarea class="input" name="manual_response" rows="2" placeholder="Its response to the prompt"></textarea>
+            </div>
+            {% endfor %}
+            <button class="btn btn--cta" {% if not sites %}disabled{% endif %}>Evaluate responses</button>
+        </form>
+    </div>
+</div>
+
+<!-- Membership inference + model timeline -->
+<div class="grid lg:grid-cols-2 gap-5 mb-6">
+    <form method="post" action="/provenance/membership-demo" class="card card--pad">
+        <h2 class="section-title" style="margin-top:0">Membership inference</h2>
+        <p class="muted" style="font-size:12.5px">Score served vs. never-served watermark docs with Min-K%/Min-K%++
+           and test the gap — statistical proof of training membership without any regurgitation. The offline demo
+           (mock backend) shows served docs test as <em>member</em> and controls do not.</p>
+        <div class="flex items-end gap-3">
+            <div><label class="field-label">Watermark docs</label><input class="input" name="n" value="24" style="width:110px"></div>
+            <div><label class="field-label">Seed</label><input class="input" name="seed" placeholder="optional" style="width:100px"></div>
+            <button class="btn btn--ghost">Run demo</button>
+        </div>
+        {% if membership %}
+        <div class="grid grid-cols-2 lg:grid-cols-5 gap-3 mt-4">
+            {% set mc = [
+                ('Served mean', membership.served_mean),
+                ('Control mean', membership.control_mean),
+                ('AUC', membership.auc),
+                ('p-value', '%.2e' % membership.p_value if membership.p_value is not none else '—'),
+                ('Member?', 'YES' if membership.is_member else 'no'),
+            ] %}
+            {% for label, value in mc %}
+            <div class="stat">
+                <div class="stat__value" style="font-size:20px{% if label == 'Member?' and membership.is_member %};color:#C84E00{% endif %}">{{ value }}</div>
+                <div class="stat__label">{{ label }}</div>
+            </div>
+            {% endfor %}
+        </div>
+        <p class="muted mt-2" style="font-size:12px">backend <span class="mono">{{ membership.backend }}</span> ·
+           statistic <span class="mono">{{ membership.statistic }}</span> · k = <span class="mono">{{ membership.k }}</span> ·
+           {{ membership.n_served }} served vs {{ membership.n_control }} control · α = {{ membership.alpha }}</p>
+        {% if membership.served_scores and membership.control_scores %}
+        {% set allscores = membership.served_scores + membership.control_scores %}
+        {% set lo = allscores|min %}{% set hi = allscores|max %}{% set rng = (hi - lo) or 1 %}
+        <div class="mt-2" style="font-size:12px">
+            <div class="muted" style="font-size:11px">Served (in honeypot pages)</div>
+            <div style="position:relative;height:14px;background:rgba(127,127,127,0.12);border-radius:4px;margin-bottom:.4rem">
+                {% for s in membership.served_scores %}
+                <span title="{{ s }}" style="position:absolute;top:3px;width:8px;height:8px;border-radius:50%;background:#C84E00;opacity:.8;left:calc({{ ((s - lo) / rng * 100)|round(1) }}% - 4px)"></span>
+                {% endfor %}
+            </div>
+            <div class="muted" style="font-size:11px">Control (generated, never served)</div>
+            <div style="position:relative;height:14px;background:rgba(127,127,127,0.12);border-radius:4px">
+                {% for s in membership.control_scores %}
+                <span title="{{ s }}" style="position:absolute;top:3px;width:8px;height:8px;border-radius:50%;background:#666;opacity:.8;left:calc({{ ((s - lo) / rng * 100)|round(1) }}% - 4px)"></span>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+        {% endif %}
+    </form>
+
+    <div class="card card--pad">
+        <h2 class="section-title" style="margin-top:0">Model-version timeline</h2>
+        <p class="muted" style="font-size:12.5px">Successive model versions + knowledge cutoffs the provenance probe
+           walks to bound the ingestion window. Edit <span class="mono">configs/model_timeline.yaml</span> to override.</p>
+        <details>
+            <summary>{{ timeline|length }} models on the timeline</summary>
+            <div class="table-wrap mt-2" style="max-height:240px">
+                <table class="tbl">
+                    <thead><tr><th>Model</th><th>Provider</th><th>Cutoff</th><th>Probeable</th></tr></thead>
+                    <tbody>
+                    {% for mm in timeline %}
+                    <tr><td class="mono">{{ mm.id }}</td><td>{{ mm.provider }}</td><td class="mono">{{ mm.knowledge_cutoff }}</td>
+                        <td>{% if mm.available %}<span class="badge badge--navy">yes</span>{% else %}<span class="muted">key needed</span>{% endif %}</td></tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </details>
+    </div>
+</div>
+
+<!-- Recent investigations (detection runs + provenance/RAG reports, merged) -->
+<h2 class="section-title">Recent investigations</h2>
+<div class="card table-wrap" style="max-height:360px">
+    <table class="tbl">
+        <thead><tr><th>Type</th><th>Subject / Site</th><th>Status</th><th>Started</th><th></th></tr></thead>
+        <tbody>
+        {% if recent %}
+            {% for r in recent %}
+            <tr>
+                <td><span class="badge {{ r.kind_class }}">{{ r.kind }}</span></td>
+                <td class="truncate" title="{{ r.label }}">{{ r.label }}</td>
+                <td>
+                    {% if r.status == 'completed' %}
+                        {% if r.leaked %}<span class="badge badge--alert">leak</span>
+                        {% elif r.leaked is none %}<span class="badge badge--clean">done</span>
+                        {% else %}<span class="badge badge--clean">clean</span>{% endif %}
+                    {% else %}<span class="badge badge--warn">{{ r.status }}</span>{% endif %}
+                </td>
+                <td class="mono nowrap">{{ r.when }}</td>
+                <td><a class="btn btn--ghost btn--sm" href="{{ r.href }}">View</a></td>
+            </tr>
+            {% endfor %}
+        {% else %}
+            <tr><td colspan="5" class="muted" style="text-align:center;padding:24px">No investigations yet — run a detection or provenance probe above.</td></tr>
+        {% endif %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Local / custom target toggle (shared by all three launcher actions).
+  const modeInput = document.getElementById('mode');
+  const localPanel = document.getElementById('local-panel');
+  const customPanel = document.getElementById('custom-panel');
+  document.querySelectorAll('#mode-toggle button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const mode = btn.dataset.mode;
+      modeInput.value = mode;
+      document.querySelectorAll('#mode-toggle button').forEach(b => b.classList.toggle('is-active', b === btn));
+      localPanel.style.display = (mode === 'local') ? '' : 'none';
+      customPanel.style.display = (mode === 'custom') ? '' : 'none';
+    });
+  });
+
+  // Querying-mode toggle: offline demo (mock simulators, no keys) vs live APIs.
+  // Locked = disabled checkbox, which the browser never submits; the server
+  // re-applies the same rule (resolve_model_choice), so this is UX, not the gate.
+  const keyModeInput = document.getElementById('key_mode');
+  const keymodeNote = document.getElementById('keymode-note');
+  const readyCount = parseInt(document.getElementById('keymode-toggle').dataset.readyCount, 10) || 0;
+  const KEYMODE_NOTES = {
+    offline: 'Runs fully offline on the mock simulators — no API keys are used or required.',
+    api: 'Queries the checked live models with your configured provider keys; models without a key stay locked.',
+    api_none: 'No provider keys configured yet — add one under Provider API keys above to unlock live models.',
+  };
+  function applyKeyMode(mode) {
+    keyModeInput.value = mode;
+    document.querySelectorAll('#keymode-toggle button').forEach(b =>
+      b.classList.toggle('is-active', b.dataset.keymode === mode));
+    const offline = mode === 'offline';
+    document.querySelectorAll('#model-list [data-live-choice]').forEach(el => {
+      const input = el.querySelector('input');
+      const locked = offline || el.dataset.ready !== '1';
+      input.disabled = locked;
+      el.classList.toggle('is-disabled', locked);
+      if (offline) input.checked = false;
+    });
+    // Picking a mode resets the selection to that mode's sensible default:
+    // offline -> the two simulators, api -> every key-ready live model (the
+    // mocks stay available to re-check as a positive control).
+    const mocks = [...document.querySelectorAll('#model-list input[data-mock]')];
+    if (offline) {
+      mocks.forEach(i => { i.checked = true; });
+    } else {
+      mocks.forEach(i => { i.checked = false; });
+      const unlocked = [...document.querySelectorAll('#model-list [data-live-choice] input')].filter(i => !i.disabled);
+      unlocked.forEach(i => { i.checked = true; });
+    }
+    keymodeNote.textContent = offline ? KEYMODE_NOTES.offline
+      : (readyCount ? KEYMODE_NOTES.api : KEYMODE_NOTES.api_none);
+  }
+  document.querySelectorAll('#keymode-toggle button').forEach(btn =>
+    btn.addEventListener('click', () => applyKeyMode(btn.dataset.keymode)));
+</script>
+{% endblock %}

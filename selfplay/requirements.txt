@@ -1,0 +1,26 @@
+# Adversarial self-play (Direction 2) dependencies.
+#
+# ALL of these are ALREADY baked into the app/trainer image (app/Dockerfile), so
+# there is nothing extra to install to run `make selfplay-*` or the /selfplay page:
+#
+#   torch            (installed from the cu128 index for the template generator)
+#   torch_geometric  (installed for the /intel GraphSAGE GNN; not required here but
+#                     present — self-play uses a plain torch MLP for the robust
+#                     detector, since the evader breaks graph edges by design)
+#   numpy            (app/requirements-ml.txt)
+#   networkx, python-louvain, matplotlib   (crawler_graph/requirements.txt — reused
+#                     via the crawler_graph detector oracle + curve rendering)
+#
+# The package is intentionally dependency-light (torch + numpy + networkx + stdlib
+# only): no gymnasium / scipy / scikit-learn / RLlib / PettingZoo. The env is a
+# small duck-typed reset/step interface, KS + AUC are hand-rolled in numpy, and the
+# PPO-Lagrangian + PSRO loops are self-contained — matching how crawler_graph
+# deliberately avoids heavy ML deps.
+#
+# Listed for documentation / running outside the image:
+torch
+torch_geometric>=2.5
+numpy>=1.24
+networkx>=3
+python-louvain
+matplotlib

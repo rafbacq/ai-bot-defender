@@ -1,0 +1,10 @@
+fake.first_name() + ' ' + fake.last_name()
+fake.last_name()
+fake.last_name() + ' Research Center'
+fake.first_name() + ' ' + fake.last_name()
+fake.word().capitalize() + ' College'
+fake.first_name() + ' ' + fake.last_name()
+fake.last_name()
+fake.city()
+fake.word().capitalize()
+fake.last_name() + ' Institute'

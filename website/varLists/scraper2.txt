@@ -1,0 +1,10 @@
+fake.first_name_female() + ' ' + fake.last_name()
+fake.city()
+fake.first_name_female() + ' and ' + fake.first_name_male()
+fake.city()
+fake.institution_name() + ', ' + fake.city() + ' campus'
+fake.city()
+fake.last_name() + '-' + fake.last_name()
+fake.last_name() + '-' + fake.last_name()
+fake.last_name() + '-' + fake.last_name()
+fake.last_name() + '-' + fake.last_name()

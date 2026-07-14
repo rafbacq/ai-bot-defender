@@ -1,0 +1,10 @@
+fake.word().capitalize()
+fake.state()
+fake.first_name() + ' ' + fake.last_name()
+fake.color_name()
+fake.last_name() + ' Guild'
+fake.city() + ' Market'
+fake.last_name()
+fake.word().capitalize()
+fake.last_name() + ' Textile House'
+fake.last_name() + ' Workshop'

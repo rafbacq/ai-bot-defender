@@ -1,0 +1,10 @@
+fake.word()
+fake.state()
+fake.city() + ' Market'
+fake.first_name() + ' ' + fake.last_name()
+fake.last_name() + ' Restaurant'
+fake.word()
+fake.word().capitalize()
+fake.city()
+fake.last_name()
+fake.company() + ' Foods'

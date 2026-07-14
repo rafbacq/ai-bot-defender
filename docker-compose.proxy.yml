@@ -1,0 +1,185 @@
+# Reverse proxy + central logging stack for AI Bot Defender (local only).
+#
+# This is its own Docker Compose stack (like docker-compose.app.yml). It is the
+# ONLY locally exposed entry point (:80 plain HTTP and :443 HTTPS) and routes to
+# each per-site stack by Host header (and TLS SNI) over the shared external
+# network `proxy_net`. All traffic is logged two ways:
+#   - nginx access_log (JSON) -> nginx_logs volume
+#   - nginx mirror -> collector -> logdb Postgres table `all_visits`
+#
+# Bring up with:  make proxy   (which first ensures the proxy_net network)
+name: proxy
+
+services:
+  # One-shot init container: writes a self-signed wildcard TLS cert into
+  # proxy/certs/ (shared with nginx) if one isn't there yet, so the proxy can
+  # terminate HTTPS. Idempotent -- a present cert is left in place across
+  # restarts. Domains MUST match proxy.base_domain / proxy.local_base_domain in
+  # ansible/group_vars/all.yml so the wildcard covers every site's hostname.
+  certgen:
+    image: alpine:3.20
+    container_name: proxy-certgen
+    environment:
+      # MUST match proxy.base_domain / proxy.local_base_domain in
+      # ansible/group_vars/all.yml (sslip.io = public wildcard DNS for the
+      # instance's public IP; see the comment there). EXTRA_SAN adds the raw
+      # public IP so https://<ip>/ presents a name-matching cert too.
+      # Values come from the git-ignored project-root .env (compose substitutes
+      # them on `up`); the defaults below only apply when .env lacks the vars.
+      # DO NOT edit the IP by hand in multiple places — run
+      #   make set-public-host          (auto-detects the instance public IP)
+      # which syncs .env + all.yml, regenerates the cert, and re-renders sites.
+      BASE_DOMAIN: ${PROXY_BASE_DOMAIN:-18.206.209.106.sslip.io}
+      LOCAL_BASE_DOMAIN: ${PROXY_LOCAL_BASE_DOMAIN:-dukecodeplus.localhost}
+      EXTRA_SAN: ${PROXY_EXTRA_SAN:-IP:18.206.209.106}
+    volumes:
+      - ./proxy/certs:/certs
+      - ./proxy/gen-cert.sh:/usr/local/bin/gen-cert.sh:ro
+    command: ["sh", "/usr/local/bin/gen-cert.sh"]
+
+  nginx:
+    image: nginx:1.27
+    container_name: proxy-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./proxy/conf.d:/etc/nginx/conf.d:ro
+      - ./proxy/snippets:/etc/nginx/snippets:ro
+      # Self-signed wildcard cert produced by the certgen init container above.
+      - ./proxy/certs:/etc/nginx/certs:ro
+      - nginx_logs:/var/log/nginx
+    networks: [default, proxy_net]
+    depends_on:
+      certgen:
+        condition: service_completed_successfully
+      collector:
+        condition: service_started
+      fp-collector:
+        condition: service_started
+
+  collector:
+    build: ./proxy/collector
+    restart: unless-stopped
+    environment:
+      DB_HOST: logdb
+      DB_USER: logger
+      DB_PASS: logger
+      DB_NAME: site_logs
+    networks: [default]
+    depends_on:
+      logdb:
+        condition: service_healthy
+
+  # --- Layer-1 browser-fingerprint collector (device fingerprinting) -------
+  # Receives the JS fingerprint beacon (website/static/js/fp.js) that nginx
+  # routes from each per-site `location = /__fpbeacon` block, and writes one row
+  # per beacon into logdb.browser_fingerprints. Same fire-and-forget contract as
+  # `collector` above: it can never stall a honeypot response (the beacon is
+  # async), and nginx reaches it by service name on the default network.
+  fp-collector:
+    build: ./proxy/fp-collector
+    container_name: proxy-fp-collector
+    restart: unless-stopped
+    environment:
+      DB_HOST: logdb
+      DB_USER: logger
+      DB_PASS: logger
+      DB_NAME: site_logs
+    networks: [default]
+    depends_on:
+      logdb:
+        condition: service_healthy
+
+  # --- Passive TLS fingerprinting (Direction 6a) ---------------------------
+  # Zeek sniffs the raw TLS ClientHello in nginx's network namespace (so it sees
+  # the true client fingerprint BEFORE nginx terminates TLS — no nginx rebuild)
+  # and writes JSON ssl.log to the shared zeek_logs volume. This is opt-in
+  # infrastructure for the "is a visitor disguising itself?" investigation; the
+  # crawler-graph campaign analysis works without it on UA/ASN alone.
+  tls-capture:
+    build: ./proxy/tls-capture
+    container_name: proxy-tls-capture
+    # Share nginx's netns: its interfaces (and thus the inbound :443 traffic) are
+    # what Zeek sniffs. A container in this mode cannot also declare `networks:`.
+    network_mode: "service:nginx"
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    environment:
+      # Override to pin a single interface if auto-detection picks the wrong one.
+      CAPTURE_IFACE: ${CAPTURE_IFACE:-}
+    volumes:
+      - zeek_logs:/zeek/logs
+    depends_on:
+      nginx:
+        condition: service_started
+    restart: unless-stopped
+
+  # Streams Zeek's JSON ssl.log into logdb.tls_handshakes (keyed by 4-tuple) so
+  # crawler_graph can join each handshake's JA3/JA4 to the requests it carried.
+  tls-shipper:
+    build: ./proxy/tls-shipper
+    container_name: proxy-tls-shipper
+    environment:
+      DB_HOST: logdb
+      DB_USER: logger
+      DB_PASS: logger
+      DB_NAME: site_logs
+      SSL_LOG: /zeek/logs/ssl.log
+    volumes:
+      - zeek_logs:/zeek/logs:ro
+    networks: [default]
+    depends_on:
+      logdb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Rotates the nginx access logs inside the nginx_logs volume (see
+  # proxy/logrotate.conf for the policy + why copytruncate). Runs hourly;
+  # rotation actually triggers daily or at 100MB, whichever comes first.
+  logrotate:
+    image: alpine:3.20
+    container_name: proxy-logrotate
+    volumes:
+      - nginx_logs:/var/log/nginx
+      - ./proxy/logrotate.conf:/etc/logrotate-nginx.conf:ro
+    # The config is copied to a root-owned 0644 path each cycle: logrotate
+    # refuses group/other-writable configs, and the bind mount inherits
+    # whatever mode the checkout happens to have.
+    command:
+      - sh
+      - -c
+      - "apk add --no-cache logrotate >/dev/null && while true; do cp /etc/logrotate-nginx.conf /tmp/logrotate-nginx.conf && chmod 644 /tmp/logrotate-nginx.conf && logrotate -s /var/log/nginx/.logrotate.state /tmp/logrotate-nginx.conf; sleep 3600; done"
+    restart: unless-stopped
+
+  logdb:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: logger
+      POSTGRES_PASSWORD: logger
+      POSTGRES_DB: site_logs
+    volumes:
+      - logdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U logger -d site_logs"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    # Also on proxy_net so the app container can reach it DIRECTLY as `logdb:5432`
+    # (services/logdb.py + crawler_graph use a psycopg2 connection when LOGDB_HOST
+    # is set). The collector/fp-collector/tls-shipper still reach it on `default`.
+    # On AWS this service goes away entirely — everything points at the RDS endpoint.
+    networks: [default, proxy_net]
+
+volumes:
+  nginx_logs:
+  logdata:
+  zeek_logs:
+
+networks:
+  proxy_net:
+    external: true

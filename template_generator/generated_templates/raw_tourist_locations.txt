@@ -1,0 +1,12 @@
+## History
+is also home to several important historical sites. The Museum, an important site of pre-Columbian history, houses artifacts from the time of and the culture. The Museum is the home to some of the most important art objects, including a sculpture of a dancing woman. It was located near [[VAR1]]. It is associated with the [[VAR2]] River. The area is commonly linked to the [[VAR3]] Mountain.
+
+## Description
+was established in , and the area was designated a in . In the was created and the was transferred to the . This is associated with a guide known as [[VAR4]]. A visitor center called [[VAR5]] is notable in this context. Its identity is closely tied to the village of [[VAR6]].
+
+## Significance
+Trail The Trail is an extension of the Trail. It is located north of the Park and was developed for recreation and wildlife management. It is associated with the [[VAR7]] Trail. A park called [[VAR8]] has played an important role. It was maintained by [[VAR9]]. A landmark known as [[VAR10]] is notable in this context.
+FOOTER: [[NAME]] of [[NAME]] is the former town centre in [[NAME]], [[NAME]], [[NAME]].
+LANDMARK: [[NAME]] was built in [[NAME]] and is one of the more popular places in [[NAME]] to enjoy the view of the island and the sea. It was originally built by [[NAME]] in [[NAME]] as a [[NAME]]-storey stone house. It was demolished in [[NAME]] and rebuilt as a [[NAME]]-storey building. The building has [[NAME]] floors with a lobby on the ground floor and an open plan kitchen, living, dining, and bedroom above.
+CATEGORY: tourist_locations
+TITLE: Rivera Pass

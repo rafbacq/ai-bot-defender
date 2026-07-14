@@ -1,0 +1,70 @@
+{# Rendered by Ansible per-site. Edit ui/configs/{{ site_id }}.yaml, then re-run. #}
+{# Project name = site_id, so containers/volumes/networks are auto-namespaced. #}
+{# When database.host is set (e.g. an AWS RDS endpoint) the per-site Postgres  #}
+{# container, its volume, and the web->db dependency are omitted and the web    #}
+{# service points at the external host instead. The scraper{N}-db database must #}
+{# already exist there (a container's POSTGRES_DB auto-create doesn't apply).  #}
+{# Leave database.host unset for the local per-site container (the default).   #}
+name: {{ site_id }}
+services:
+{% if database.host is not defined %}
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: {{ database.user }}
+      POSTGRES_PASSWORD: {{ database.password }}
+      POSTGRES_DB: scraper{{ scraper_version }}-db
+    # Host port bound to loopback only, like the web port below: the site's
+    # Postgres is for local debugging (`psql -h 127.0.0.1 -p <host_port>`) and
+    # must never be reachable from the public network.
+    ports:
+      - "127.0.0.1:{{ database.host_port }}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "PGPASSWORD={{ database.password }} psql -U {{ database.user }} -d scraper{{ scraper_version }}-db -c 'select 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+{% endif %}
+  web:
+    build:
+      context: ../..
+    # Host port bound to loopback only. The nginx reverse proxy is the public
+    # entry point; this mapping is for local debugging and is never exposed
+    # beyond this machine.
+    ports:
+      - "127.0.0.1:{{ website.port }}:8080"
+    restart: unless-stopped
+    environment:
+      DB_USER: {{ database.user }}
+      DB_PASS: {{ database.password }}
+      DB_HOST: {{ database.host | default('db') }}
+      SCRAPER_VERSION: "{{ scraper_version }}"
+{% if not website.genmode %}
+    command: ["python", "server.py", "nogen"]
+{% endif %}
+    networks:
+      # Per-stack default network (talks to this site's db as `db`).
+      default: {}
+      # Shared proxy network: nginx reaches this site at http://{{ site_id }}-web:8080
+      # via the alias below (the bare `web` service name is ambiguous across stacks).
+      proxy_net:
+        aliases:
+          - "{{ site_id }}-web"
+{% if database.host is not defined %}
+    depends_on:
+      db:
+        condition: service_healthy
+{% endif %}
+
+{% if database.host is not defined %}
+volumes:
+  pgdata:
+
+{% endif %}
+networks:
+  proxy_net:
+    external: true

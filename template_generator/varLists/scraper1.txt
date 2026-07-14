@@ -1,0 +1,10 @@
+fake.city()
+fake.last_name() + ' County'
+fake.state()
+fake.city()
+fake.first_name() + ' ' + fake.last_name()
+fake.last_name() + ' University'
+fake.last_name() + ' River'
+fake.first_name() + ' ' + fake.last_name()
+fake.city() + ' Township'
+fake.last_name() + ' Creek'

@@ -1,0 +1,16 @@
+# Template Generator ML stack — baked into the app image so the /generator page
+# can run template_generator/generate_templates.py (Qwen3-1.7B + LoRA) as an
+# in-container subprocess.
+#
+# torch is NOT listed here: it is installed separately in app/Dockerfile from
+# PyTorch's CUDA 12.8 index (cu128), because the target GPU is Blackwell
+# (RTX 50-series, sm_120) which the default/CPU and older-CUDA wheels don't
+# support. Keep these in sync with template_generator/requirements.txt.
+#
+# spaCy is intentionally omitted: it is only used by prepare_data.py (offline
+# data prep), never by generate_templates.py, so the generation path doesn't need it.
+transformers>=4.56        # 4.56+ for the dtype= from_pretrained kwarg; Qwen3 needs >=4.51
+peft>=0.11
+accelerate>=0.30
+numpy>=1.24
+faker>=24.0               # generate_templates.py mints unique fallback titles with Faker
