@@ -80,3 +80,10 @@ node_modules
 # Machine-local build stamps: track when `make app`/`make proxy` last built an
 # image so they only rebuild when a build input changed (not on every `up`).
 .make/
+
+package.json
+package-lock.json
+botdefenderjunethirty.txt
+SIGNIN_README.md
+AI-Bot-Defender-Research-Roadmap.tex
+AI-Bot-Defender-Research-Roadmap.pdf
