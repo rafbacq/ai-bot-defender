@@ -135,3 +135,49 @@ def test_deploy_reports_missing_ansible_cleanly(isolated_app_config, monkeypatch
     monkeypatch.setattr(sites.subprocess, "run", raise_fnf)
     ok, output = sites.deploy_site("site-001")
     assert ok is False and "ansible-playbook not found" in output
+
+
+def test_background_deploy_registers_a_cancellable_process_group(
+    isolated_app_config, monkeypatch,
+):
+    """The web deployment path attaches/detaches its own-session child."""
+    from app.services import sites
+
+    calls = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        def communicate(self, timeout):
+            calls["timeout"] = timeout
+            return "deployed", None
+
+    fake = FakeProcess()
+
+    def fake_popen(cmd, **kwargs):
+        calls["cmd"] = cmd
+        calls["kwargs"] = kwargs
+        return fake
+
+    class Task:
+        cancelled = False
+
+        def check_cancelled(self):
+            assert not self.cancelled
+
+        def attach_process(self, proc):
+            calls["attached"] = proc
+
+        def detach_process(self, proc):
+            calls["detached"] = proc
+
+        def update(self, **fields):
+            calls["label"] = fields["label"]
+
+    monkeypatch.setattr(sites.subprocess, "Popen", fake_popen)
+    ok, output = sites.deploy_site("site-001", reset_db=True, timeout=9, task=Task())
+
+    assert ok is True and output == "deployed"
+    assert calls["kwargs"]["start_new_session"] is True
+    assert calls["attached"] is fake and calls["detached"] is fake
+    assert calls["cmd"][-2:] == ["-e", "reset_db=true"]

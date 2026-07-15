@@ -1,0 +1,18 @@
+{
+  "9": {
+    "canary_tokens": [
+      "fake.word().capitalize()",
+      "fake.last_name() + ' Laboratory'",
+      "fake.last_name() + ' University'",
+      "fake.first_name() + ' ' + fake.last_name()",
+      "fake.last_name() + ' Institute'",
+      "fake.word().capitalize()",
+      "fake.last_name() + ' Workshop'",
+      "fake.city()",
+      "fake.last_name()",
+      "fake.last_name() + ' Research Center'"
+    ],
+    "category": "scientists_inventors",
+    "installed_at": "2026-07-15T14:36:44+00:00"
+  }
+}

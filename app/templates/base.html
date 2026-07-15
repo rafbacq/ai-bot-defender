@@ -53,6 +53,11 @@
                 {% for key, href, label in nav %}
                 <a href="{{ href }}" class="main-nav__link {% if section == key %}is-active{% endif %}">{{ label }}</a>
                 {% endfor %}
+                <a href="/" class="main-nav__jobs" id="active-jobs-link" hidden
+                   aria-live="polite" title="Background work continues on the server">
+                    <span class="live-dot"></span>
+                    <span id="active-jobs-count">0 running</span>
+                </a>
                 {% endif %}
                 <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle light / dark theme">
                     <svg class="theme-toggle__moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
@@ -111,6 +116,147 @@
           try { localStorage.setItem('theme', next); } catch (e) { /* ignore */ }
         });
       })();
+    </script>
+    <script>
+      // App-wide activity indicator. Jobs execute on the server; this poller
+      // only discovers them and links back to their progress page. Closing or
+      // backgrounding this browser therefore cannot stop the work.
+      (function () {
+        var link = document.getElementById('active-jobs-link');
+        if (!link) return;
+        var count = document.getElementById('active-jobs-count');
+        var timer = null;
+        var inFlight = false;
+
+        function schedule(delay) {
+          clearTimeout(timer);
+          timer = setTimeout(refresh, delay);
+        }
+
+        async function refresh() {
+          if (inFlight) return;
+          inFlight = true;
+          var active = 0;
+          try {
+            var response = await fetch('/jobs/active', {
+              cache: 'no-store', headers: {'Accept': 'application/json'}
+            });
+            if (!response.ok) throw new Error('Activity request failed.');
+            var data = await response.json();
+            var jobs = Array.isArray(data.jobs) ? data.jobs : [];
+            active = jobs.length;
+            link.hidden = active === 0;
+            if (active) {
+              count.textContent = active + (active === 1 ? ' running' : ' running');
+              link.href = jobs[0].href || '/';
+              link.title = jobs.map(function (job) {
+                return (job.title || 'Background job') + ': ' + (job.label || job.status || 'running');
+              }).join('\n');
+            }
+          } catch (error) {
+            // A transient disconnect changes only this indicator, never a job.
+          } finally {
+            inFlight = false;
+            schedule(active ? 2000 : 8000);
+          }
+        }
+
+        document.addEventListener('visibilitychange', function () {
+          if (!document.hidden) refresh();
+        });
+        window.addEventListener('focus', refresh);
+        refresh();
+      })();
+    </script>
+    <script>
+      // Shared controller for page-level background operations (deploy,
+      // campaign analysis, prompt generation, and membership inference).
+      document.querySelectorAll('[data-background-job]').forEach(function (panel) {
+        var statusUrl = panel.dataset.statusUrl;
+        var cancelUrl = panel.dataset.cancelUrl;
+        var button = panel.querySelector('[data-job-cancel]');
+        var label = panel.querySelector('[data-job-label]');
+        var status = panel.querySelector('[data-job-status]');
+        var error = panel.querySelector('[data-job-error]');
+        var dot = panel.querySelector('[data-job-dot]');
+        var stopped = false;
+        var polling = false;
+        var pollTimer = null;
+
+        function render(job) {
+          if (job.label && label) label.textContent = job.label;
+          if (job.status && status) status.textContent = job.status;
+          if (error) {
+            error.textContent = job.error || '';
+            error.hidden = !job.error;
+          }
+          if (button) {
+            button.hidden = !!job.done;
+            button.disabled = job.status === 'cancelling';
+            button.textContent = job.status === 'cancelling' ? 'Stopping…' : 'Cancel job';
+          }
+          if (dot) dot.style.display = job.done ? 'none' : '';
+        }
+
+        function finish(job) {
+          stopped = true;
+          render(job);
+          var next = job.status === 'cancelled'
+            ? panel.dataset.cancelledUrl : (job.redirect || panel.dataset.doneUrl);
+          setTimeout(function () { window.location = next; }, 650);
+        }
+
+        async function poll() {
+          if (stopped || polling) return;
+          polling = true;
+          try {
+            var response = await fetch(statusUrl, {
+              cache: 'no-store', headers: {'Accept': 'application/json'}
+            });
+            var job = await response.json();
+            if (!response.ok && response.status !== 404) throw new Error(job.detail || 'Status request failed.');
+            render(job);
+            if (job.done) { finish(job); return; }
+          } catch (e) {
+            // A transient proxy/network failure must not make a live job look done.
+          } finally {
+            polling = false;
+          }
+          pollTimer = setTimeout(poll, 1000);
+        }
+
+        if (button) button.addEventListener('click', async function () {
+          if (!window.confirm('Cancel this running job?')) return;
+          button.disabled = true;
+          button.textContent = 'Stopping…';
+          try {
+            var response = await fetch(cancelUrl, {
+              method: 'POST', headers: {'Accept': 'application/json'}
+            });
+            var job = await response.json();
+            if (!response.ok) throw new Error(job.detail || 'Cancellation failed.');
+            render(job);
+          } catch (e) {
+            button.disabled = false;
+            button.textContent = 'Cancel job';
+            if (error) { error.textContent = e.message; error.hidden = false; }
+          }
+        });
+
+        document.addEventListener('visibilitychange', function () {
+          if (!document.hidden && !stopped) {
+            clearTimeout(pollTimer);
+            poll();
+          }
+        });
+        window.addEventListener('focus', function () {
+          if (!stopped) {
+            clearTimeout(pollTimer);
+            poll();
+          }
+        });
+        poll();
+      });
     </script>
     {% block scripts %}{% endblock %}
 </body>

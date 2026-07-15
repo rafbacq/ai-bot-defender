@@ -9,6 +9,7 @@ the claimed identity (UA / navigator.platform) contradicts the lower layers.
 """
 
 import ipaddress
+import re
 import time
 
 from . import logdb
@@ -179,16 +180,108 @@ def _verdict_for(row):
 verdict_for = _verdict_for
 
 
+# --- Malicious-intent detection from the request TARGET (not just the client) -----
+# The cross-layer engine above judges a visitor by whether its *identity* is
+# self-consistent. That misses a scanner that tells the truth about itself while
+# reaching for something it has no business touching: a request for `/.env` or
+# `/wp-login.php` is hostile no matter how honest the User-Agent is (an honest bot
+# UA, or a real-looking Googlebot string, would otherwise slip through as "clean").
+# The honeypot's Flask app serves exactly one real route (`GET /`) plus a few static
+# assets, so any request for a secrets file, a VCS/IDE dir, a framework admin panel,
+# or a language/CMS the stack doesn't run is by definition probing, not browsing.
+#
+# Patterns are drawn from this deployment's own observed scan traffic plus the
+# standard scanner dictionaries (Androxgh0st `.env` sweeps, l9scan, zgrab). They
+# match against the URI PATH only (query stripped, case-folded). Legit honeypot
+# paths are allowlisted first so a real visit can never be tinted red.
+_SAFE_EXACT_PATHS = frozenset({
+    "/", "/favicon.ico", "/robots.txt", "/js/fp.js", "/__fpbeacon", "/sitemap.xml",
+})
+_SAFE_PREFIXES = ("/css/", "/static/", "/.well-known/acme-challenge/")
+_SAFE_EXACT_WELL_KNOWN = frozenset({"/.well-known/security.txt"})
+
+_PROBE_PATTERNS = [
+    # --- Secrets / config / source-control / backup exfiltration ---
+    (r"\.env(\.|$|/|rc\b)", "probing for a secrets file (.env)"),
+    (r"\.git(/|$)|\.git/config|\.gitignore", "probing for an exposed .git repository"),
+    (r"\.svn(/|$)|\.hg(/|$)|\.bzr(/|$)", "probing for an exposed source-control directory"),
+    (r"\.(aws|ssh)(/|$)|id_rsa|id_dsa|id_ecdsa|id_ed25519|authorized_keys",
+     "probing for cloud/SSH credentials"),
+    (r"\.vscode/|\.idea/|sftp\.json", "probing for exposed IDE/deploy config"),
+    (r"\.ds_store", "probing for a leaked .DS_Store directory listing"),
+    (r"wp-config\.php|configuration\.php|/config\.(json|xml|php|ya?ml)\b|/settings\.py",
+     "probing for an application config/credentials file"),
+    (r"credentials|secrets?\.(json|ya?ml|txt)|/dump\.sql|storage/logs|laravel\.log",
+     "probing for credentials/log files"),
+    (r"phpinfo|/server-status\b|/server-info\b|/_profiler\b|/actuator(/|$|\b)",
+     "probing a debug/status endpoint that leaks internals"),
+    (r"\.(bak|old|save|swp|orig|sql|dump|pem|key|p12|pfx)($|\?)",
+     "probing for a backup/dump/key file"),
+    (r"/backup|/backups?\b|\.(zip|tar|tgz|tar\.gz|rar|7z)($|\?)",
+     "probing for a downloadable backup archive"),
+    # --- Exploit / admin-panel / CMS / device recon ---
+    (r"wp-admin|wp-login|wp-includes|wlwmanifest|xmlrpc\.php|/wp-json",
+     "WordPress attack-surface probe (this stack runs no WordPress)"),
+    (r"login\.action|struts|/geoserver|/druid/|/solr/|jenkins|phpmyadmin|/pma\b|/adminer",
+     "known-CVE application/admin-panel probe"),
+    (r"/ecp/|/owa/|autodiscover|/mapi/|activesync",
+     "Exchange/mail attack-surface probe"),
+    (r"cpanel|/whm\b|___proxy_subdomain|/console/|/manager/html|jmx-console|/v2/_catalog",
+     "hosting-panel/registry/console probe"),
+    (r"/boaform|/cgi-bin/|/hnap1|/goform|/setup\.cgi|/currentsetting\.htm",
+     "router/IoT device-exploit probe"),
+    # Matched on the PATH only (probe_reason strips the query first), so this stays
+    # to the dedicated resolver paths scanners hit and never trips a legit `/query`.
+    (r"/dns-query\b|/resolve\b", "open-DNS-resolver abuse probe"),
+    (r"\.(php|phtml|php5|asp|aspx|jsp|jspx|cgi|action)($|\?)",
+     "requesting a server-side script this static stack does not run"),
+    (r"/\.well-known/.*(\.\.|/\.env|password)",
+     "malformed/traversal probe under /.well-known"),
+]
+_PROBE_PATTERNS = [(re.compile(p, re.IGNORECASE), r) for p, r in _PROBE_PATTERNS]
+
+
+def probe_reason(uri):
+    """Return a short reason if ``uri`` is a hostile scan target, else ``None``.
+
+    Judges the request TARGET, independent of the client's claimed identity, so a
+    truthful-looking bot reaching for a secrets file / exploit path is still caught.
+    Legit honeypot paths (the served route, static assets, ACME) are allowlisted.
+    Path traversal (``..``) is never allowlisted — it falls through to the patterns.
+    """
+    if not uri:
+        return None
+    path = str(uri).split("?", 1)[0].split("#", 1)[0].strip().lower()
+    if not path:
+        return None
+    has_traversal = ".." in path
+    if not has_traversal:
+        if path in _SAFE_EXACT_PATHS or path in _SAFE_EXACT_WELL_KNOWN:
+            return None
+        if any(path.startswith(prefix) for prefix in _SAFE_PREFIXES):
+            return None
+    for pattern, reason in _PROBE_PATTERNS:
+        if pattern.search(path):
+            return reason
+    if has_traversal:
+        return "path-traversal attempt in the request URI"
+    return None
+
+
 def severity_of(row):
     """Collapse a request's verdict into a 3-tier row severity for the /logs table.
 
     Returns ``{"level": "clean"|"suspicious"|"malicious", "reason": <short text>}``,
-    driven entirely by the existing cross-layer engine (so it stays consistent with
-    the campaign analysis) plus the identity-rotation flags:
+    driven by the cross-layer engine (so it stays consistent with the campaign
+    analysis), the identity-rotation flags, AND the request TARGET:
       * **malicious** (red) — a device wearing multiple claimed identities
         (``disguised``, engine/OS/client-kind changes — never version or brand
-        churn) or a cross-layer contradiction at/above the inconsistency
-        threshold. Certainly a bot.
+        churn), a cross-layer contradiction at/above the inconsistency threshold,
+        OR a request whose URI is a hostile scan target (a secrets file, a VCS/IDE
+        dir, an exploit/admin path, a script this static stack never runs — see
+        ``probe_reason``). The last one is judged from the target alone, so an
+        honest-looking bot reaching for ``/.env`` is caught even when its identity
+        is self-consistent. Certainly a bot.
       * **suspicious** (orange) — a device roaming public networks under one
         identity (``net_roaming`` — proxy/VPN rotation, but equally a phone on
         Wi-Fi/LTE, so never red on its own) or a lesser contradiction
@@ -199,6 +292,9 @@ def severity_of(row):
     v = row.get("verdict") or {}
     if row.get("disguised"):
         return {"level": "malicious", "reason": "one device wearing multiple identities"}
+    probe = probe_reason(row.get("uri"))
+    if probe:
+        return {"level": "malicious", "reason": probe}
     if v.get("inconsistent"):
         return {"level": "malicious", "reason": "cross-layer contradiction (spoofed identity)"}
     if row.get("net_roaming"):

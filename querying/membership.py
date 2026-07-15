@@ -25,6 +25,7 @@ are imported lazily inside the HF backend.
 import math
 import random
 import string
+from concurrent.futures import CancelledError
 
 from . import config
 
@@ -262,7 +263,8 @@ def get_scorer(backend=None, **kwargs):
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-def run_membership(served_texts, control_texts, scorer=None, k=None):
+def run_membership(served_texts, control_texts, scorer=None, k=None,
+                   cancel_check=None):
     """Score served vs. control texts and run the membership hypothesis test."""
     scorer = scorer or get_scorer()
     k = k if k is not None else config.MEMBERSHIP_K
@@ -271,11 +273,17 @@ def run_membership(served_texts, control_texts, scorer=None, k=None):
     def score_all(texts):
         out = []
         for text in texts:
+            if cancel_check:
+                cancel_check()
             try:
                 stats = scorer.token_stats(text)
+                if cancel_check:
+                    cancel_check()
                 val, method = score_from_stats(stats, k=k)
                 methods.add(method)
                 out.append(val)
+            except CancelledError:
+                raise
             except Exception as exc:  # pragma: no cover - keep going
                 print(f"membership: scoring failed: {exc}")
                 out.append(None)

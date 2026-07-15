@@ -16,6 +16,8 @@ forever.
 """
 
 import threading
+import time
+from concurrent.futures import CancelledError
 from datetime import datetime, timezone
 
 from querying import config as q_config
@@ -29,6 +31,10 @@ from .sites import merged_site_config
 # In-process registry of live probe workers, keyed by run_id. Guarded by _LOCK.
 _ACTIVE = {}
 _LOCK = threading.Lock()
+
+
+class ProbeForbidden(RuntimeError):
+    pass
 
 
 def timeline():
@@ -74,7 +80,7 @@ def _site_kwargs(mode, site_id, url):
     return {"target_url": url or "http://127.0.0.1/"}
 
 
-def _spawn(run_id, kind, fn, kwargs):
+def _spawn(run_id, kind, fn, kwargs, owner=None):
     """Persist a ``running`` placeholder for ``run_id`` and run ``fn`` on a
     daemon thread. The worker function persists the final report itself (it
     traps its own errors into a ``failed`` record); the belt-and-braces except
@@ -90,9 +96,19 @@ def _spawn(run_id, kind, fn, kwargs):
         "error": None,
     })
 
+    cancel_event = threading.Event()
+
+    def cancel_check():
+        if cancel_event.is_set():
+            raise CancelledError("Cancelled by user.")
+
     def worker():
         try:
-            fn(run_id=run_id, **kwargs)
+            fn(run_id=run_id, cancel_check=cancel_check, **kwargs)
+        except CancelledError:
+            report = provenance.load_report(run_id) or {"run_id": run_id}
+            report.update(status="cancelled", error=None)
+            provenance.save_report(report)
         except Exception as exc:
             report = provenance.load_report(run_id) or {"run_id": run_id}
             report.update(status="failed", error=f"{type(exc).__name__}: {exc}")
@@ -103,25 +119,79 @@ def _spawn(run_id, kind, fn, kwargs):
 
     thread = threading.Thread(target=worker, name=f"prov-{run_id}", daemon=True)
     with _LOCK:
-        _ACTIVE[run_id] = thread
+        _ACTIVE[run_id] = {
+            "thread": thread,
+            "cancel_event": cancel_event,
+            "owner": owner,
+            "kind": kind,
+            "started": time.time(),
+        }
     thread.start()
     return {"run_id": run_id, "status": "running"}
 
 
-def start_provenance(mode, site_id, url, models, max_questions=3, seed=None):
+def start_provenance(mode, site_id, url, models, max_questions=3, seed=None,
+                     owner=None):
     """Kick off a provenance probe in the background; returns ``{run_id, ...}``."""
     kwargs = dict(_site_kwargs(mode, site_id, url), models=models,
                   max_questions=max_questions, seed=seed)
     return _spawn(provenance.new_run_id(), "provenance",
-                  provenance.run_provenance, kwargs)
+                  provenance.run_provenance, kwargs, owner=owner)
 
 
-def start_rag(mode, site_id, url, models, page_removed=False, max_questions=3, seed=None):
+def start_rag(mode, site_id, url, models, page_removed=False, max_questions=3,
+              seed=None, owner=None):
     """Kick off a RAG-vs-training experiment in the background."""
     kwargs = dict(_site_kwargs(mode, site_id, url), models=models,
                   page_removed=page_removed, max_questions=max_questions, seed=seed)
     return _spawn(provenance.new_run_id(), "rag-disambiguation",
-                  rag_disambiguation.run_rag_experiment, kwargs)
+                  rag_disambiguation.run_rag_experiment, kwargs, owner=owner)
+
+
+def cancel(run_id, *, requester=None, is_admin=False):
+    """Request cooperative cancellation of a live provenance/RAG probe."""
+    with _LOCK:
+        active = _ACTIVE.get(run_id)
+        if active is not None:
+            owner = active.get("owner")
+            if not (is_admin or owner is None or (requester and requester == owner)):
+                raise ProbeForbidden("This probe belongs to a different account.")
+            active["cancel_event"].set()
+    current = status(run_id)
+    if not current.get("done"):
+        current["status"] = "cancelling"
+    return current
+
+
+def active_probes(*, requester=None, is_admin=False):
+    """Return account-visible live probes for the app-wide job center."""
+    with _LOCK:
+        items = list(_ACTIVE.items())
+    visible = []
+    for run_id, active in items:
+        owner = active.get("owner")
+        if not (is_admin or owner is None or (requester and requester == owner)):
+            continue
+        if not active["thread"].is_alive():
+            continue
+        report = load_report(run_id) or {}
+        cancelling = active["cancel_event"].is_set()
+        kind = active.get("kind") or report.get("kind") or "provenance"
+        visible.append({
+            "id": run_id,
+            "kind": kind,
+            "status": "cancelling" if cancelling else "running",
+            "label": (
+                "Stopping provenance probe…" if cancelling else
+                "RAG experiment running…" if "rag" in kind else
+                "Provenance probe running…"
+            ),
+            "started": active.get("started"),
+            "updated": active.get("started"),
+            "href": f"/provenance/runs/{run_id}",
+        })
+    visible.sort(key=lambda item: item.get("started") or 0, reverse=True)
+    return visible
 
 
 def status(run_id):
@@ -131,7 +201,9 @@ def status(run_id):
     worker exists in this process (an app restart killed it mid-probe)."""
     report = load_report(run_id)
     with _LOCK:
-        alive = run_id in _ACTIVE and _ACTIVE[run_id].is_alive()
+        active = _ACTIVE.get(run_id)
+        alive = bool(active and active["thread"].is_alive())
+        cancelling = bool(active and active["cancel_event"].is_set())
     if report is None:
         return {"run_id": run_id, "present": False, "status": "missing",
                 "done": not alive, "interrupted": False}
@@ -140,13 +212,14 @@ def status(run_id):
     return {
         "run_id": run_id,
         "present": True,
-        "status": "failed" if interrupted else report.get("status"),
+        "status": ("cancelling" if cancelling and running else
+                   "failed" if interrupted else report.get("status")),
         "done": (not running) or interrupted,
         "interrupted": interrupted,
     }
 
 
-def membership_demo(n=24, seed=None):
+def membership_demo(n=24, seed=None, cancel_check=None):
     """Offline demonstration of the membership-inference method (mock backend).
 
     Generates served + control watermark docs, simulates a model that memorized
@@ -154,11 +227,16 @@ def membership_demo(n=24, seed=None):
     tests as 'member' (low p) and the control set does not. Real use sets
     QUERY_MEMBERSHIP_BACKEND=hf|openai and scores actually-served watermarks.
     """
+    if cancel_check:
+        cancel_check()
     wm = mem.generate_watermarks(n=n, seed=seed)
     scorer = mem.get_scorer()  # honors QUERY_MEMBERSHIP_BACKEND
     if isinstance(scorer, mem.MockScorer):
         scorer = mem.MockScorer(memorized=wm["served"], seed=seed or 0)
-    result = mem.run_membership(wm["served"], wm["control"], scorer=scorer)
+    result = mem.run_membership(
+        wm["served"], wm["control"], scorer=scorer,
+        cancel_check=cancel_check,
+    )
     result["backend"] = q_config.MEMBERSHIP_BACKEND
     result["n_docs"] = n
     return result

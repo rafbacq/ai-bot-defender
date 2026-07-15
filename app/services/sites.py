@@ -7,8 +7,11 @@ the old Streamlit ``Site_Config`` page + ``build.py`` performed, ported here.
 """
 
 import json
+import os
 import re
+import signal
 import subprocess
+from concurrent.futures import CancelledError
 from datetime import datetime, timezone
 
 from ruamel.yaml import YAML
@@ -208,11 +211,19 @@ def write_site_config(site_id, *, scraper_version, port, genmode, db_user, db_pa
     return cfg
 
 
-def deploy_site(site_id, reset_db=False, timeout=900):
-    """Run the Ansible playbook for ``site_id``; return (ok, combined_output)."""
+def deploy_site(site_id, reset_db=False, timeout=900, task=None):
+    """Run the Ansible playbook for ``site_id``; return (ok, combined_output).
+
+    The ordinary synchronous path is retained for CLI callers and unit tests.
+    The web path supplies a ``TaskContext``: Ansible then runs in its own
+    process group, is registered with the task, and can be stopped (including
+    children it spawned) from the Site Configurator's Cancel button.
+    """
     cmd = ["ansible-playbook", "site.yml", "-e", f"site_id={site_id}"]
     if reset_db:
         cmd += ["-e", "reset_db=true"]
+    if task is not None:
+        return _deploy_site_cancellable(site_id, reset_db, timeout, cmd, task)
     try:
         result = subprocess.run(
             cmd, cwd=str(config.ANSIBLE_DIR),
@@ -232,12 +243,56 @@ def deploy_site(site_id, reset_db=False, timeout=900):
     return ok, output
 
 
-def _append_history(site_id, reset_db, ok):
+def _deploy_site_cancellable(site_id, reset_db, timeout, cmd, task):
+    task.check_cancelled()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(config.ANSIBLE_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        output = (
+            "ansible-playbook not found. Run the app in its container "
+            "(make app) or install ansible-core to deploy from the host."
+        )
+        _append_history(site_id, reset_db, False)
+        return False, output
+
+    task.attach_process(proc)
+    task.update(label=f"Deploying {site_id} with Ansible…")
+    try:
+        try:
+            output, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                proc.kill()
+            output, _ = proc.communicate()
+            output = (output or "") + f"\nDeploy timed out after {timeout}s."
+            _append_history(site_id, reset_db, False)
+            return False, output
+        task.check_cancelled()
+        ok = proc.returncode == 0
+        _append_history(site_id, reset_db, ok)
+        return ok, output or ""
+    except CancelledError:
+        _append_history(site_id, reset_db, False, status="cancelled")
+        raise
+    finally:
+        task.detach_process(proc)
+
+
+def _append_history(site_id, reset_db, ok, status=None):
     config.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     with open(config.HISTORY_DIR / "applies.jsonl", "a") as handle:
         handle.write(json.dumps({
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "site_id": site_id,
             "reset_db": reset_db,
-            "status": "ok" if ok else "failed",
+            "status": status or ("ok" if ok else "failed"),
         }) + "\n")

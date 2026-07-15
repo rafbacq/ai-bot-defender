@@ -74,6 +74,13 @@ pytest testsuite/tests/test_fingerprinting.py -v
 | `webapp` | Every FastAPI route/page/export/redirect after the analytics/forensics consolidation | `test_web_app.py` |
 | `contracts` | Cross-component static contracts (honeypot/fp wiring, nginx/Ansible logging, app templates exist) | `test_static_contracts.py` |
 
+Background execution has additional cross-feature coverage in
+`test_job_cancellation.py`: owner isolation, process-group cancellation,
+navigation/client-close persistence, active-job rediscovery, durable terminal
+results, and safe cancellation for deployment, campaign rendering, template
+generation, detection/manual runs, provenance/RAG, membership inference,
+self-play, and robust scoring.
+
 ### The clustering / fingerprinting example
 
 `test_clustering.py` simulates a large, diverse bot population hitting the

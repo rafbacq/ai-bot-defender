@@ -9,6 +9,12 @@
        <span class="mono">scraper&lt;N&gt;.html</span> flavor — ready to pick when you deploy a site.</p>
 </div>
 
+{% if cancelled %}
+<div class="notice notice--warn mb-6"><div class="notice__title">Generation cancelled</div>
+    <p class="muted" style="margin:0">The model process was stopped and no partially generated template was installed.</p>
+</div>
+{% endif %}
+
 {% if job %}
 <!-- Live progress for a running background generation job. The poller in the
      scripts block drives the bar/steps and, when the job finishes, reloads into
@@ -22,7 +28,11 @@
             </div>
             <h2 class="genprog__title" id="genprog-label">Preparing the generator…</h2>
         </div>
-        <div class="genprog__pct"><span id="genprog-pct">0</span><span class="genprog__pct-sign">%</span></div>
+        <div class="flex items-center gap-3">
+            <button type="button" class="btn btn--danger btn--sm" id="cancel-generation"
+                    data-cancel-url="/generator/cancel/{{ job }}">Cancel job</button>
+            <div class="genprog__pct"><span id="genprog-pct">0</span><span class="genprog__pct-sign">%</span></div>
+        </div>
     </div>
 
     <div class="genprog__bar" id="genprog-barwrap" role="progressbar"
@@ -42,8 +52,8 @@
         <pre class="codeblock genprog__log" id="genprog-log">Waiting for the generator to start…</pre>
     </details>
 
-    <p class="genprog__hint muted">Generation runs on the server — keep this tab open and the
-       result will appear here automatically when it's done.</p>
+    <p class="genprog__hint muted">Generation runs on the server. You may switch pages, close this tab,
+       or reopen the app; the running job and its result will reappear here.</p>
 </div>
 {% endif %}
 
@@ -352,12 +362,32 @@
     const STAGE_ORDER = ['loading', 'generating', 'finalizing', 'done'];
     const STAGE_NAMES = {
       queued: 'Queued', loading: 'Loading model', generating: 'Generating',
-      finalizing: 'Finalizing', done: 'Done', error: 'Failed', missing: 'Not found',
+      finalizing: 'Finalizing', done: 'Done', cancelling: 'Stopping',
+      cancelled: 'Cancelled', error: 'Failed', missing: 'Not found',
     };
 
     // Prevent double-submit: disable the Generate button while a job runs.
     const genBtn = document.querySelector('form[action="/generator/run"] button[type="submit"]');
     if (genBtn) { genBtn.disabled = true; genBtn.classList.add('is-disabled'); }
+    const cancelBtn = document.getElementById('cancel-generation');
+    if (cancelBtn) cancelBtn.addEventListener('click', async () => {
+      if (!window.confirm('Cancel template generation?')) return;
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = 'Stopping…';
+      try {
+        const res = await fetch(cancelBtn.dataset.cancelUrl, {
+          method: 'POST', headers: {'Accept': 'application/json'}
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Cancellation failed.');
+        stageEl.textContent = 'Stopping';
+        labelEl.textContent = data.label || 'Stopping the generator…';
+      } catch (err) {
+        cancelBtn.disabled = false;
+        cancelBtn.textContent = 'Cancel job';
+        labelEl.textContent = err.message;
+      }
+    });
 
     // Count-up tween so the percentage animates smoothly toward each target.
     let shown = 0, target = 0, raf = null;
@@ -394,20 +424,29 @@
     }
 
     let stopped = false;
+    let polling = false;
+    let pollTimer = null;
     async function poll() {
-      if (stopped) return;
+      if (stopped || polling) return;
+      polling = true;
       let data;
       try {
         const res = await fetch(statusUrl, { cache: 'no-store' });
         data = await res.json();
       } catch (e) {
-        setTimeout(poll, 1500);  // transient network error — keep trying
+        polling = false;
+        pollTimer = setTimeout(poll, 1500);  // transient network error — keep trying
         return;
       }
+      polling = false;
 
       if (typeof data.percent === 'number') setPct(data.percent);
       if (data.label) labelEl.textContent = data.label;
       if (data.stage) stageEl.textContent = STAGE_NAMES[data.stage] || data.stage;
+      if (cancelBtn && data.status === 'cancelling') {
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = 'Stopping…';
+      }
       if (typeof data.log === 'string' && logEl && data.log) {
         const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8;
         logEl.textContent = data.log;
@@ -417,6 +456,7 @@
 
       if (data.done) {
         stopped = true;
+        if (cancelBtn) cancelBtn.hidden = true;
         if (data.status === 'missing') {
           el.classList.add('is-err');
           labelEl.textContent = data.label || 'This generation job was not found.';
@@ -424,11 +464,23 @@
           setTimeout(() => { window.location = '/generator'; }, 2500);
           return;
         }
+        if (data.status === 'cancelled') {
+          el.classList.add('is-err');
+          if (liveDot) liveDot.style.display = 'none';
+          setTimeout(() => { window.location = '/generator?cancelled=1'; }, 650);
+          return;
+        }
         finish(!!data.ok);
         return;
       }
-      setTimeout(poll, 1000);
+      pollTimer = setTimeout(poll, 1000);
     }
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && !stopped) { clearTimeout(pollTimer); poll(); }
+    });
+    window.addEventListener('focus', () => {
+      if (!stopped) { clearTimeout(pollTimer); poll(); }
+    });
     poll();
   })();
 </script>

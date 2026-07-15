@@ -99,3 +99,4 @@
 {"institution_id": "local", "category": "towns", "title": "Kirkton", "content_hash": "f55fd4e078230b61569e60af9459b5699bdc42bb4e9982d9d66242f32df6174a", "registered_at": "2026-07-09T03:23:03Z"}
 {"institution_id": "local", "category": "folklore", "title": "the Curtis Wanderer", "content_hash": "70a03bf48a35000c077886d47129cbfba4d3d255af71b7466031d15795bd037a", "registered_at": "2026-07-09T03:24:34Z"}
 {"institution_id": "local", "category": "movies", "title": "The Holmes Road", "content_hash": "0dbf10e59eaaa44d463cfbee70b8f6d74413bbbf2447409addccbb3438c8eb7c", "registered_at": "2026-07-09T03:39:37Z"}
+{"institution_id": "local", "category": "scientists_inventors", "title": "Stacey Daniels", "content_hash": "1a3f1825513341634ea28a398ebf2c904fd042de390163c8b82157879ec4f178", "registered_at": "2026-07-15T14:36:31Z"}

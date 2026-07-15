@@ -21,6 +21,7 @@ rather than training — which rag_disambiguation.py separates.
 
 import json
 import secrets
+from concurrent.futures import CancelledError
 from datetime import date, datetime, timezone
 
 from . import config, ground_truth, model_timeline
@@ -88,12 +89,20 @@ def _row_key(row):
     return (row.get("user_agent"), row.get("asn"))
 
 
-def probe_models(role_prompt, questions, rows, models, context, threshold):
+def probe_models(role_prompt, questions, rows, models, context, threshold,
+                 cancel_check=None):
     """For each model, return which canary-set keys it leaked (+ best scores)."""
     leak_by_model = {}
     for model in models:
+        if cancel_check:
+            cancel_check()
         try:
-            answers = llm_responses([model], (role_prompt, questions), context=context)
+            answers = llm_responses(
+                [model], (role_prompt, questions), context=context,
+                cancel_check=cancel_check,
+            )
+        except CancelledError:
+            raise
         except Exception as exc:
             leak_by_model[model] = {"error": f"{type(exc).__name__}: {exc}"}
             continue
@@ -231,7 +240,8 @@ def load_report(run_id):
 
 def run_provenance(*, target_url, host_header=None, verify_tls=True, site_id=None,
                    db_name=None, db_user=None, project_root=None, models=None,
-                   max_questions=None, seed=None, persist=True, run_id=None):
+                   max_questions=None, seed=None, persist=True, run_id=None,
+                   cancel_check=None):
     """Run the provenance probe across a model timeline and return the report.
 
     ``run_id`` lets a background caller pre-assign the id it redirects to
@@ -251,11 +261,15 @@ def run_provenance(*, target_url, host_header=None, verify_tls=True, site_id=Non
         "error": None,
     }
     try:
+        if cancel_check:
+            cancel_check()
         record = parser(target_url, host_header=host_header, verify=verify_tls)
         if not record or not record.get("main_idea"):
             raise RuntimeError("Could not scrape a subject from the target page.")
         subject = record["main_idea"]
         role_prompt, questions = generate_probes(record, max_questions or config.MAX_PROBES, seed=seed)
+        if cancel_check:
+            cancel_check()
 
         if site_id and db_name and db_user:
             rows = ground_truth.load_site_rows(project_root, site_id, db_name, db_user)
@@ -268,8 +282,11 @@ def run_provenance(*, target_url, host_header=None, verify_tls=True, site_id=Non
         context = {"subject": subject, "leak_candidates": leak}
 
         leak_by_model = probe_models(
-            role_prompt, questions, rows, models, context, config.HIGH_RISK_THRESHOLD
+            role_prompt, questions, rows, models, context, config.HIGH_RISK_THRESHOLD,
+            cancel_check=cancel_check,
         )
+        if cancel_check:
+            cancel_check()
         windows = infer_windows(leak_by_model, crawl, models)
 
         run.update(
@@ -299,6 +316,9 @@ def run_provenance(*, target_url, host_header=None, verify_tls=True, site_id=Non
             },
             status="completed",
         )
+    except CancelledError:
+        run["status"] = "cancelled"
+        run["error"] = None
     except Exception as exc:
         run["status"] = "failed"
         run["error"] = f"{type(exc).__name__}: {exc}"

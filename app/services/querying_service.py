@@ -118,9 +118,11 @@ def start_custom_run(url, models, csv_path=None, max_questions=3, seed=None):
     return auto_query_adapter.run_detection(url=url, models=models, csv_path=csv_path)
 
 
-def generate_prompt(site_id=None, url=None):
+def generate_prompt(site_id=None, url=None, cancel_check=None):
     """Build the retrieval prompt for the manual (copy/paste) workflow."""
-    return auto_query_adapter.generate_prompt(site_id=site_id or None, url=url or None)
+    return auto_query_adapter.generate_prompt(
+        site_id=site_id or None, url=url or None, cancel_check=cancel_check
+    )
 
 
 def start_manual_run(records, site_id=None, url=None):

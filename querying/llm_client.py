@@ -25,6 +25,7 @@ The two mock simulators make the whole pipeline demonstrable without API keys:
 
 import random
 import time
+from concurrent.futures import CancelledError
 
 import httpx
 
@@ -223,7 +224,8 @@ def _answer_one(model, role_prompt, question, context, timeout, options=None):
     return _mock_answer(model, role_prompt, question, context)
 
 
-def llm_responses(test_suite, prompt_package, context=None, timeout=60, options=None):
+def llm_responses(test_suite, prompt_package, context=None, timeout=60, options=None,
+                  cancel_check=None):
     """Query each model with each question; return answers grouped by model.
 
     Unlike the original, a single failed question no longer aborts the rest of a
@@ -237,10 +239,16 @@ def llm_responses(test_suite, prompt_package, context=None, timeout=60, options=
     for model in test_suite:
         results = []
         for question in questions:
+            if cancel_check is not None:
+                cancel_check()
             try:
                 answer = _answer_one(model, role_prompt, question, context, timeout,
                                      options=options)
+                if cancel_check is not None:
+                    cancel_check()
                 results.append({"question": question, "answer": answer})
+            except CancelledError:
+                raise
             except Exception as exc:
                 results.append({"question": question, "error": f"{type(exc).__name__}: {exc}"})
         all_responses[model] = results

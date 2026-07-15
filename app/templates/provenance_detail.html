@@ -35,10 +35,18 @@
 <div class="card card--pad mb-5">
     <div class="flex items-center justify-between">
         <h2 class="section-title" style="margin:0">{{ 'RAG experiment' if report.kind == 'rag-disambiguation' else 'Provenance probe' }} in progress</h2>
-        <span class="badge badge--warn"><span class="live-dot"></span> running</span>
+        <div class="flex items-center gap-2">
+            <span class="badge badge--warn"><span class="live-dot"></span> <span id="probe-state">{{ live.status or 'running' }}</span></span>
+            <button type="button" class="btn btn--danger btn--sm" id="cancel-probe">Cancel job</button>
+        </div>
     </div>
     <p class="muted mt-2" style="font-size:13px">Probing {{ report.models|length }} model version{{ 's' if report.models|length != 1 }} —
-       each is queried live, so this can take a while. Results appear here automatically when the probe completes.</p>
+       each is queried live, so this can take a while. It continues on the server if you switch pages or close the browser.</p>
+</div>
+{% elif report.status == 'cancelled' %}
+<div class="notice notice--warn mb-5">
+    <div class="notice__title">Probe cancelled</div>
+    <p class="muted" style="margin:0">The probe stopped before an incomplete provenance verdict could be published.</p>
 </div>
 {% endif %}
 
@@ -173,14 +181,46 @@
 <script>
 // The probe runs on a background worker; reload the page the moment it's done.
 (function () {
-  async function poll() {
+  const cancelButton = document.getElementById('cancel-probe');
+  const probeState = document.getElementById('probe-state');
+  if (cancelButton) cancelButton.addEventListener('click', async () => {
+    if (!window.confirm('Cancel this provenance job?')) return;
+    cancelButton.disabled = true;
+    cancelButton.textContent = 'Stopping…';
     try {
-      const res = await fetch('/provenance/runs/{{ run_id }}/status', {headers: {'Accept': 'application/json'}});
+      const res = await fetch('/provenance/runs/{{ run_id }}/cancel', {
+        method: 'POST', headers: {'Accept': 'application/json'}
+      });
       const s = await res.json();
+      if (!res.ok) throw new Error(s.detail || 'Cancellation failed.');
+      if (probeState) probeState.textContent = s.status || 'cancelling';
+    } catch (err) {
+      cancelButton.disabled = false;
+      cancelButton.textContent = 'Cancel job';
+    }
+  });
+  let polling = false;
+  let pollTimer = null;
+  async function poll() {
+    if (polling) return;
+    polling = true;
+    try {
+      const res = await fetch('/provenance/runs/{{ run_id }}/status', {cache: 'no-store', headers: {'Accept': 'application/json'}});
+      const s = await res.json();
+      if (probeState) probeState.textContent = s.status || 'running';
+      if (cancelButton && s.status === 'cancelling') {
+        cancelButton.disabled = true;
+        cancelButton.textContent = 'Stopping…';
+      }
       if (s.done) { window.location.reload(); return; }
     } catch (e) { /* transient; keep polling */ }
-    setTimeout(poll, 1500);
+    finally { polling = false; }
+    pollTimer = setTimeout(poll, 1500);
   }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { clearTimeout(pollTimer); poll(); }
+  });
+  window.addEventListener('focus', () => { clearTimeout(pollTimer); poll(); });
   poll();
 })();
 </script>

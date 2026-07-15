@@ -7,6 +7,15 @@
     <p>Each site is an independent stack with its own database, reachable through the shared reverse proxy.</p>
 </div>
 
+{% if cancelled %}
+<div class="notice notice--warn mb-5"><div class="notice__title">Deployment cancelled</div>
+    <p class="muted" style="margin:0">The Ansible process was stopped. A cancelled deployment is not rolled back; re-run it when you are ready to apply the full configuration.</p>
+</div>
+{% endif %}
+{% set job_done_url = '/sites' %}
+{% set job_cancelled_url = '/sites?cancelled=1' %}
+{% include '_background_job.html' %}
+
 {% if deployed %}
 <div class="notice {{ 'notice--ok' if ok == '1' else 'notice--err' }} mb-6">
     <div class="flex items-center gap-2 mb-1">
@@ -70,7 +79,8 @@
                     <strong style="color:var(--copper)">Wipes that site’s stored visits and canaries.</strong></span>
             </label>
             <div class="sm:col-span-2">
-                <button type="submit" class="btn btn--primary">Deploy with Ansible</button>
+                <button type="submit" class="btn btn--primary"
+                        {% if background_job and not background_job.done %}disabled{% endif %}>Deploy with Ansible</button>
             </div>
         </form>
     </div>

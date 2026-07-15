@@ -34,12 +34,14 @@ import ast
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import CancelledError
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -432,20 +434,123 @@ def _ml_stack_hint(output):
 #                            milestone lines the generator prints, installs on
 #                            success, and finalizes the job
 #   generation_status()   -> polled by the browser until the job is done
-# State lives in memory (runs are infrequent and short-lived); a bounded
-# registry evicts the oldest finished jobs.
+# Live process handles stay in memory, while public progress/result state is
+# atomically checkpointed under configs/history/jobs.  The browser can leave or
+# close and later rediscover the same job; its poller never owns execution.
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
 _MAX_JOBS = 50
 _MAX_LOG_LINES = 400  # live log tail cap (bounds the status payload + memory)
+_ACCESS_UNSET = object()
 
 
-def _new_job(type_id):
+class GenerationForbidden(RuntimeError):
+    pass
+
+
+class GenerationBusy(RuntimeError):
+    def __init__(self, message, job_id=None):
+        super().__init__(message)
+        self.job_id = job_id
+
+
+def _generation_jobs_dir():
+    path = config.HISTORY_DIR / "jobs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _generation_job_path(job_id):
+    safe_id = "".join(ch for ch in str(job_id) if ch.isalnum() or ch in "_-")
+    if safe_id != str(job_id) or not safe_id:
+        return None
+    return _generation_jobs_dir() / f"generation-{safe_id}.json"
+
+
+def _generation_record(job):
+    return {key: value for key, value in job.items() if not key.startswith("_")}
+
+
+def _write_generation_record(record):
+    path = _generation_job_path(record.get("id", ""))
+    if path is None:
+        return
+    tmp = path.with_name(f".{path.name}.{threading.get_ident()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, indent=2, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _read_generation_record(job_id):
+    path = _generation_job_path(job_id)
+    if path is None or not path.exists():
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) and record.get("id") == job_id else None
+
+
+def _persist_generation_locked(job):
+    _write_generation_record(_generation_record(job))
+
+
+def _same_generation_owner(job, requester, is_admin=False):
+    owner = job.get("owner")
+    return bool(is_admin or owner is None or (requester and requester == owner))
+
+
+def _interrupted_generation(record):
+    if record.get("done") or record.get("status") not in {"running", "cancelling"}:
+        return record
+    record = dict(record)
+    record.update(
+        done=True,
+        status="interrupted",
+        stage="error",
+        label="Generation was interrupted when the application service restarted.",
+        output=(record.get("output") or "")
+        + "\n\n[interrupted] The application service restarted before generation finished.",
+        updated=time.time(),
+    )
+    _write_generation_record(record)
+    return record
+
+
+def _persisted_generations():
+    records = []
+    try:
+        paths = list(_generation_jobs_dir().glob("generation-*.json"))
+    except OSError:
+        return records
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                record = json.load(handle)
+            if isinstance(record, dict) and record.get("id"):
+                records.append(record)
+        except (OSError, ValueError):
+            continue
+    return records
+
+
+def _new_job(type_id, owner=None):
+    cancel_event = threading.Event()
     job_id = uuid.uuid4().hex[:12]
     job = {
         "id": job_id,
         "type": type_id,
-        "status": "running",   # running | ok | failed
+        "status": "running",   # running | cancelling | cancelled | ok | failed
         "done": False,
         "percent": 0.0,
         "stage": "queued",     # queued | loading | generating | finalizing | done | error
@@ -455,8 +560,19 @@ def _new_job(type_id):
         "installed": [],
         "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "updated": time.time(),
+        "owner": owner,
+        "_cancel_event": cancel_event,
+        "_process": None,
+        "_committed": False,
     }
     with _JOBS_LOCK:
+        active = next((j for j in _JOBS.values() if not j.get("done")), None)
+        if active is not None:
+            # Re-submitting after navigating back must attach to the existing
+            # GPU job rather than starting a duplicate model process.
+            if _same_generation_owner(active, owner):
+                raise GenerationBusy("Template generation is already running.", active["id"])
+            raise GenerationBusy("Another template generation is already running.")
         _JOBS[job_id] = job
         if len(_JOBS) > _MAX_JOBS:
             finished = sorted(
@@ -465,6 +581,7 @@ def _new_job(type_id):
             )
             for jid in finished[: len(_JOBS) - _MAX_JOBS]:
                 _JOBS.pop(jid, None)
+        _persist_generation_locked(job)
     return job
 
 
@@ -473,19 +590,129 @@ def _update_job(job_id, **fields):
         job = _JOBS.get(job_id)
         if job is None:
             return
+        if job.get("status") == "cancelling" and not fields.get("done"):
+            for key in ("status", "stage", "label", "percent", "category"):
+                fields.pop(key, None)
         # Progress only ever moves forward: clamp percent monotonic so a
         # per-category retry (which re-walks the same band) never rewinds the bar.
         if "percent" in fields:
             fields["percent"] = max(job["percent"], float(fields["percent"]))
         job.update(fields)
         job["updated"] = time.time()
+        _persist_generation_locked(job)
 
 
-def generation_status(job_id):
-    """A copy of the job's live state for the page poller, or None if unknown."""
+def generation_status(job_id, *, requester=_ACCESS_UNSET, is_admin=False):
+    """A copy of live/persisted state for the page poller, or None if unknown."""
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
-        return dict(job) if job else None
+        if job:
+            if requester is not _ACCESS_UNSET and not _same_generation_owner(
+                job, requester, is_admin
+            ):
+                raise GenerationForbidden("This generation belongs to a different account.")
+            return {
+                key: value for key, value in job.items()
+                if not key.startswith("_") and key != "owner"
+            }
+    record = _read_generation_record(job_id)
+    if record is None:
+        return None
+    record = _interrupted_generation(record)
+    if requester is not _ACCESS_UNSET and not _same_generation_owner(
+        record, requester, is_admin
+    ):
+        raise GenerationForbidden("This generation belongs to a different account.")
+    return {key: value for key, value in record.items() if key != "owner"}
+
+
+def list_generations(*, requester=None, is_admin=False, active_only=False,
+                     max_age=None):
+    """Visible generation jobs newest-first, for page/job-center recovery."""
+    with _JOBS_LOCK:
+        live = {job_id: _generation_record(job) for job_id, job in _JOBS.items()}
+    merged = {
+        record["id"]: record
+        for record in _persisted_generations()
+        if record.get("id")
+    }
+    with _JOBS_LOCK:
+        live.update({
+            job_id: _generation_record(job)
+            for job_id, job in _JOBS.items()
+        })
+    merged.update(live)
+    now = time.time()
+    visible = []
+    for job_id, record in merged.items():
+        if job_id not in live:
+            record = _interrupted_generation(record)
+        if not _same_generation_owner(record, requester, is_admin):
+            continue
+        if active_only and record.get("done"):
+            continue
+        if max_age is not None and now - float(record.get("updated") or 0) > max_age:
+            continue
+        visible.append({key: value for key, value in record.items() if key != "owner"})
+    visible.sort(key=lambda item: item.get("updated", 0), reverse=True)
+    return visible
+
+
+def latest_generation(*, requester=None, is_admin=False, active_only=False,
+                      max_age=None):
+    jobs = list_generations(
+        requester=requester,
+        is_admin=is_admin,
+        active_only=active_only,
+        max_age=max_age,
+    )
+    return jobs[0] if jobs else None
+
+
+def _terminate_generation(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        try:
+            proc.terminate()
+        except (ProcessLookupError, OSError):
+            pass
+
+    def escalate():
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                try:
+                    proc.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+
+    timer = threading.Timer(4.0, escalate)
+    timer.daemon = True
+    timer.start()
+
+
+def cancel_generation(job_id, *, requester=None, is_admin=False):
+    """Stop one live generation process; safe to call more than once."""
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            return None
+        owner = job.get("owner")
+        if not (is_admin or owner is None or (requester and requester == owner)):
+            raise GenerationForbidden("This generation belongs to a different account.")
+        if not job.get("done") and not job.get("_committed"):
+            job["_cancel_event"].set()
+            job.update(status="cancelling", label="Stopping the generator…", updated=time.time())
+            _persist_generation_locked(job)
+            proc = job.get("_process")
+        else:
+            proc = None
+    _terminate_generation(proc)
+    return generation_status(job_id)
 
 
 def _parse_progress_line(line):
@@ -508,7 +735,7 @@ def _parse_progress_line(line):
     return fields
 
 
-def _finish_job(job_id, ok, output, installed):
+def _finish_job(job_id, ok, output, installed, cancelled=False):
     """Mark a job terminal (success or failure) and record it in history."""
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
@@ -516,28 +743,29 @@ def _finish_job(job_id, ok, output, installed):
     n = len(installed)
     fields = {
         "done": True,
-        "status": "ok" if ok else "failed",
-        "stage": "done" if ok else "error",
+        "status": "cancelled" if cancelled else "ok" if ok else "failed",
+        "stage": "cancelled" if cancelled else "done" if ok else "error",
         "output": output,
         "installed": installed,
-        "label": (f"Installed {n} template{'' if n == 1 else 's'}." if ok
-                  else "Generation did not complete."),
+        "label": ("Cancelled — no generated template was installed." if cancelled else
+                  f"Installed {n} template{'' if n == 1 else 's'}." if ok else
+                  "Generation did not complete."),
     }
     if ok:
         fields["percent"] = 100
     _update_job(job_id, **fields)
     if type_id is not None:
-        _append_history(type_id, ok, n)
+        _append_history(type_id, ok, n, status="cancelled" if cancelled else None)
 
 
-def start_generation(type_id):
+def start_generation(type_id, owner=None):
     """Start a generation run in the background; return its job id immediately.
 
     Validation failures (unknown category, missing generator script) produce a
     job that is already ``done``/``failed`` with the reason, so the page's poller
     surfaces them the same way as a runtime failure.
     """
-    job_id = _new_job(type_id)["id"]
+    job_id = _new_job(type_id, owner=owner)["id"]
 
     if get_type(type_id) is None:
         _finish_job(job_id, False, f"Unknown template type: {type_id!r}.", [])
@@ -583,7 +811,7 @@ def _stream_generation_job(job_id, type_id, gen_dir, timeout):
         proc = subprocess.Popen(
             cmd, cwd=str(gen_dir), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, bufsize=1, start_new_session=True,
         )
     except FileNotFoundError:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -595,6 +823,16 @@ def _stream_generation_job(job_id, type_id, gen_dir, timeout):
         ), [])
         return
 
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job is not None:
+            job["_process"] = proc
+            cancel_now = job["_cancel_event"].is_set()
+        else:
+            cancel_now = True
+    if cancel_now:
+        _terminate_generation(proc)
+
     # The readline loop below blocks, so a child that hangs without printing
     # would never be reaped — a watchdog timer enforces the hard timeout.
     timed_out = {"hit": False}
@@ -602,9 +840,12 @@ def _stream_generation_job(job_id, type_id, gen_dir, timeout):
     def _kill():
         timed_out["hit"] = True
         try:
-            proc.kill()
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except Exception:
-            pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     watchdog = threading.Timer(timeout, _kill)
     watchdog.start()
@@ -634,6 +875,17 @@ def _stream_generation_job(job_id, type_id, gen_dir, timeout):
 
     output = "\n".join(lines)
     ok = proc.returncode == 0 and not timed_out["hit"]
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        cancelled = bool(job and job["_cancel_event"].is_set())
+        if job is not None:
+            job["_process"] = None
+
+    if cancelled:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        _finish_job(job_id, False, output + "\n\n[cancelled] Stopped by user.", [],
+                    cancelled=True)
+        return
 
     if timed_out["hit"]:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -643,7 +895,35 @@ def _stream_generation_job(job_id, type_id, gen_dir, timeout):
 
     installed = []
     if ok:
-        installed = _install_generated(out_dir)
+        prior_manifest = load_manifest()
+        manifest_existed = _manifest_path().exists()
+
+        def cancel_check():
+            with _JOBS_LOCK:
+                current = _JOBS.get(job_id)
+                if current and current["_cancel_event"].is_set():
+                    raise CancelledError()
+
+        try:
+            installed = _install_generated(out_dir, cancel_check=cancel_check)
+            # Linearization point: either cancellation won the lock (rollback),
+            # or the fully installed artifact set commits and a later click is
+            # simply racing a job that has already completed.
+            with _JOBS_LOCK:
+                current = _JOBS.get(job_id)
+                rollback = bool(current and current["_cancel_event"].is_set())
+                if current and not rollback:
+                    current["_committed"] = True
+            if rollback:
+                _rollback_installed(installed, prior_manifest, manifest_existed)
+                raise CancelledError()
+        except CancelledError:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            _finish_job(
+                job_id, False, output + "\n\n[cancelled] Stopped by user.", [],
+                cancelled=True,
+            )
+            return
         if not installed:
             ok = False
             output += "\n\n[install] No scraper_gen_*.html was produced — nothing installed."
@@ -705,7 +985,27 @@ def _read_varlist(path):
     return lines if len(lines) >= 10 else None
 
 
-def _install_generated(out_dir):
+def _rollback_installed(installed, prior_manifest, manifest_existed):
+    for item in installed:
+        version = item["version"]
+        for path in (
+            config.TEMPLATES_DIR / f"scraper{version}.html",
+            config.WEBSITE_DIR / "varLists" / f"scraper{version}.txt",
+        ):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+    if manifest_existed:
+        _save_manifest(prior_manifest)
+    else:
+        try:
+            _manifest_path().unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _install_generated(out_dir, cancel_check=None):
     """Install each scraper_gen_<category>.html from ``out_dir`` into
     website/templates/ as the next free scraper<N>.html (never overwriting an
     existing flavor), carrying its varList into website/varLists/ + the manifest."""
@@ -714,33 +1014,45 @@ def _install_generated(out_dir):
     installed = []
     taken = set(existing_versions())
     manifest = load_manifest()
-    for src in generated:
-        category = src.stem[len("scraper_gen_"):]
-        version = _next_version(taken)
-        taken.add(version)
-        dest = config.TEMPLATES_DIR / f"scraper{version}.html"
-        dest.write_text(
-            _with_fingerprint_beacon(src.read_text(encoding="utf-8")),
-            encoding="utf-8")
+    prior_manifest = dict(manifest)
+    manifest_existed = _manifest_path().exists()
+    try:
+        for src in generated:
+            if cancel_check:
+                cancel_check()
+            category = src.stem[len("scraper_gen_"):]
+            version = _next_version(taken)
+            taken.add(version)
+            dest = config.TEMPLATES_DIR / f"scraper{version}.html"
+            dest.write_text(
+                _with_fingerprint_beacon(src.read_text(encoding="utf-8")),
+                encoding="utf-8")
 
-        varlist = _read_varlist(src.with_suffix(".txt"))
-        if varlist:
-            varlists_dir = config.WEBSITE_DIR / "varLists"
-            varlists_dir.mkdir(parents=True, exist_ok=True)
-            (varlists_dir / f"scraper{version}.txt").write_text(
-                "\n".join(varlist) + "\n", encoding="utf-8")
-            manifest[str(version)] = {
-                "category": category,
-                "canary_tokens": varlist,
-                "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            }
-        installed.append({"version": version, "filename": dest.name, "category": category})
-    if installed:
-        _save_manifest(manifest)
-    return installed
+            varlist = _read_varlist(src.with_suffix(".txt"))
+            if varlist:
+                varlists_dir = config.WEBSITE_DIR / "varLists"
+                varlists_dir.mkdir(parents=True, exist_ok=True)
+                (varlists_dir / f"scraper{version}.txt").write_text(
+                    "\n".join(varlist) + "\n", encoding="utf-8")
+                manifest[str(version)] = {
+                    "category": category,
+                    "canary_tokens": varlist,
+                    "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                }
+            installed.append({"version": version, "filename": dest.name, "category": category})
+            if cancel_check:
+                cancel_check()
+        if installed:
+            _save_manifest(manifest)
+        if cancel_check:
+            cancel_check()
+        return installed
+    except CancelledError:
+        _rollback_installed(installed, prior_manifest, manifest_existed)
+        raise
 
 
-def _append_history(type_id, ok, installed_count):
+def _append_history(type_id, ok, installed_count, status=None):
     try:
         config.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
         with open(config.HISTORY_DIR / "generations.jsonl", "a") as handle:
@@ -748,7 +1060,7 @@ def _append_history(type_id, ok, installed_count):
                 "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "type": type_id,
                 "installed": installed_count,
-                "status": "ok" if ok else "failed",
+                "status": status or ("ok" if ok else "failed"),
             }) + "\n")
     except Exception:
         # History is best-effort; never let logging break a generation run.

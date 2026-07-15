@@ -56,6 +56,28 @@ commands, registration steps, troubleshooting, and deployment settings.
 
 Other useful targets: `make up-all` (proxy + app + every configured site), `make playbook site_id=site-001` (deploy one site), `make down-all`. See `CLAUDE.md` for the full command reference and architecture.
 
+## Background work and browser navigation
+
+Long-running control-center actions execute on the server after their form has
+been accepted. It is safe to switch tabs, visit another control-center page, or
+close and reopen the browser while site deployment, campaign/GNN analysis,
+template generation, detection/manual evaluation, prompt generation,
+provenance/RAG, membership inference, self-play training/ingest, or robust live
+scoring is running. A signed-in user sees an app-wide running-job indicator in
+the header that links back to each dedicated progress view. Task-style feature
+pages also rediscover that user's active job automatically, and completed task
+results are restored from checkpoints where applicable.
+
+Cancellation is an explicit server request from the progress UI. Merely hiding
+or leaving a page never sends one. Once a launch has returned its progress page,
+the browser is only a status viewer—not the owner of the computation.
+
+This browser-lifetime guarantee is distinct from an application/container
+restart. The current deployment uses in-process workers, so restarting the app
+interrupts work that is still running. Persisted run/checkpoint records make the
+interruption terminal and visible instead of leaving a progress page spinning;
+already completed results and generated artifacts remain available.
+
 To run the querying pipeline from the command line (offline demo, no API keys):
 
 ```bash

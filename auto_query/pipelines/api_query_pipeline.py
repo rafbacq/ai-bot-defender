@@ -2,7 +2,7 @@ from auto_query.src.llm_client_litellm import query_model
 
 
 def api_query_pipeline(prompt_artifacts, models, context=None,
-                       on_query=None, on_result=None):
+                       on_query=None, on_result=None, cancel_check=None):
     """
     Queries every configured LLM using the generated prompts.
 
@@ -47,6 +47,8 @@ def api_query_pipeline(prompt_artifacts, models, context=None,
 
     raw_responses = []
     for model_name, model in models.items():
+        if cancel_check is not None:
+            cancel_check()
 
         print()
         print(f"[QUERYING] {model_name}")
@@ -58,6 +60,8 @@ def api_query_pipeline(prompt_artifacts, models, context=None,
                 pass
 
         result = query_model(model, role_prompt, prompt, context=context)
+        if cancel_check is not None:
+            cancel_check()
 
         item = {
             "Model":

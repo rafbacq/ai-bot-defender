@@ -40,7 +40,7 @@
                     <option value="cvar">CVaR (tail-robust)</option>
                 </select></label>
             <button class="mt-3 w-full rounded bg-teal-600 hover:bg-teal-500 text-white text-sm py-2"
-                    {% if not status.torch or status.job.status == 'running' %}disabled{% endif %}>Launch training</button>
+                    {% if not status.torch or status.job.status in ('running','cancelling') %}disabled{% endif %}>Launch training</button>
         </form>
 
         <form method="post" action="/selfplay/run" class="rounded-xl border border-slate-300/20 p-4">
@@ -48,7 +48,7 @@
             <p class="text-sm opacity-70 mb-3">Two-player population self-play; tracks exploitability as the detector becomes robust to learned evasion.</p>
             <input type="hidden" name="kind" value="coevolve">
             <button class="mt-3 w-full rounded bg-indigo-600 hover:bg-indigo-500 text-white text-sm py-2"
-                    {% if not status.torch or status.job.status == 'running' %}disabled{% endif %}>Launch co-evolution</button>
+                    {% if not status.torch or status.job.status in ('running','cancelling') %}disabled{% endif %}>Launch co-evolution</button>
         </form>
 
         <form method="post" action="/selfplay/run" class="rounded-xl border border-slate-300/20 p-4">
@@ -56,16 +56,22 @@
             <p class="text-sm opacity-70 mb-3">Closed-loop: a Thompson-sampling bandit optimizes canary designs by <em>provable ingestion</em> (Min-K% membership).</p>
             <input type="hidden" name="kind" value="ingest">
             <button class="mt-3 w-full rounded bg-amber-600 hover:bg-amber-500 text-white text-sm py-2"
-                    {% if status.job.status == 'running' %}disabled{% endif %}>Run ingestion loop</button>
+                    {% if status.job.status in ('running','cancelling') %}disabled{% endif %}>Run ingestion loop</button>
         </form>
     </div>
     {% if not status.torch %}
     <p class="text-xs opacity-60 mt-2">Training needs torch + torch_geometric (present in the app/trainer image). The ingestion loop runs anywhere.</p>
     {% endif %}
 
-    <div id="job-box" class="mt-4 {% if status.job.status not in ('running','done','error') %}hidden{% endif %}">
-        <div class="text-sm mb-1">Job: <span id="job-kind">{{ status.job.kind }}</span> —
-            <span id="job-status" class="font-semibold">{{ status.job.status }}</span></div>
+    <div id="job-box" class="mt-4 {% if status.job.status not in ('running','cancelling','cancelled','done','error') %}hidden{% endif %}">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-1">
+            <div class="text-sm">Job: <span id="job-kind">{{ status.job.kind }}</span> —
+                <span id="job-status" class="font-semibold">{{ status.job.status }}</span></div>
+            <button type="button" id="cancel-selfplay" class="btn btn--danger btn--sm"
+                    {% if status.job.status not in ('running','cancelling') %}hidden{% endif %}
+                    {% if status.job.status == 'cancelling' %}disabled{% endif %}>{{ 'Stopping…' if status.job.status == 'cancelling' else 'Cancel job' }}</button>
+        </div>
+        <p class="text-xs opacity-70 mb-2">This runs on the server; switching pages or closing the browser does not stop it.</p>
         <pre id="job-log" class="text-xs rounded bg-black/40 p-3 max-h-56 overflow-auto whitespace-pre-wrap"></pre>
     </div>
 </section>
@@ -120,7 +126,7 @@
     <h2 class="section-title">Robust detector — live second opinion</h2>
     <form method="post" action="/selfplay/score-live" class="inline">
         <button class="rounded bg-slate-600 hover:bg-slate-500 text-white text-sm px-3 py-1.5"
-                {% if not status.robust_detector_trained %}disabled{% endif %}>Score current traffic</button>
+                {% if not status.robust_detector_trained or status.job.status in ('running','cancelling') %}disabled{% endif %}>Score current traffic</button>
     </form>
     {% if robust %}
     <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
@@ -159,19 +165,59 @@
 <script>
 (function () {
   const box = document.getElementById('job-box');
-  const running = {{ 'true' if status.job.status == 'running' else 'false' }};
-  function poll() {
-    fetch('/selfplay/status').then(r => r.json()).then(st => {
+  const running = {{ 'true' if status.job.status in ('running','cancelling') else 'false' }};
+  const cancelButton = document.getElementById('cancel-selfplay');
+  if (cancelButton) cancelButton.addEventListener('click', async () => {
+    if (!window.confirm('Cancel this adversarial job?')) return;
+    cancelButton.disabled = true;
+    cancelButton.textContent = 'Stopping…';
+    try {
+      const res = await fetch('/selfplay/cancel', {
+        method: 'POST', headers: {'Accept': 'application/json'}
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Cancellation failed.');
+      document.getElementById('job-status').textContent = (data.job || {}).status || 'cancelling';
+    } catch (err) {
+      cancelButton.disabled = false;
+      cancelButton.textContent = 'Cancel job';
+    }
+  });
+  let pollTimer = null;
+  let polling = false;
+  async function poll() {
+    if (polling) return;
+    polling = true;
+    try {
+      const response = await fetch('/selfplay/status', {cache: 'no-store'});
+      if (!response.ok) throw new Error('Status request failed.');
+      const st = await response.json();
       const job = st.job || {};
       document.getElementById('job-status').textContent = job.status || 'idle';
       document.getElementById('job-kind').textContent = job.kind || '';
+      if (cancelButton) {
+        cancelButton.hidden = !['running', 'cancelling'].includes(job.status);
+        cancelButton.disabled = job.status === 'cancelling';
+        cancelButton.textContent = job.status === 'cancelling' ? 'Stopping…' : 'Cancel job';
+      }
       const log = document.getElementById('job-log');
       if (st.log_tail) log.textContent = st.log_tail;
       if (box) box.classList.remove('hidden');
-      if (job.status === 'running') setTimeout(poll, 3000);
+      if (job.status === 'running' || job.status === 'cancelling') pollTimer = setTimeout(poll, 1000);
       else if (job.status === 'done') setTimeout(() => location.reload(), 1200);
-    }).catch(() => {});
+      else if (job.status === 'cancelled') setTimeout(() => location.reload(), 700);
+    } catch (error) {
+      pollTimer = setTimeout(poll, 1500);
+    } finally {
+      polling = false;
+    }
   }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && running) { clearTimeout(pollTimer); poll(); }
+  });
+  window.addEventListener('focus', () => {
+    if (running) { clearTimeout(pollTimer); poll(); }
+  });
   if (running) poll();
 })();
 </script>

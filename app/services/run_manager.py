@@ -25,6 +25,7 @@ Design notes:
 
 import threading
 import time
+from concurrent.futures import CancelledError
 
 from querying.store import load_run
 
@@ -47,7 +48,13 @@ def _prune_locked():
         _RUNS.pop(rid, None)
 
 
-def _init_state(run_id, kind, models):
+class RunForbidden(RuntimeError):
+    pass
+
+
+def _init_state(run_id, kind, models, owner=None):
+    cancel_event = threading.Event()
+    now = time.time()
     state = {
         "run_id": run_id,
         "kind": kind,
@@ -62,7 +69,10 @@ def _init_state(run_id, kind, models):
         "done": False,
         "status": "running",
         "error": None,
-        "updated": time.time(),
+        "owner": owner,
+        "_cancel_event": cancel_event,
+        "started": now,
+        "updated": now,
     }
     with _LOCK:
         _RUNS[run_id] = state
@@ -98,9 +108,12 @@ def _progress(run_id):
                 }
             elif event == "finished":
                 state["stage"] = "finished"
-                state["stage_label"] = "Done"
+                final_status = data.get("status", "completed")
+                state["stage_label"] = (
+                    "Cancelled." if final_status == "cancelled" else "Done"
+                )
                 state["done"] = True
-                state["status"] = data.get("status", "completed")
+                state["status"] = final_status
                 state["error"] = data.get("error")
 
     return callback
@@ -109,6 +122,13 @@ def _progress(run_id):
 def _run_worker(fn, run_id, kwargs):
     try:
         fn(run_id=run_id, progress=_progress(run_id), **kwargs)
+    except CancelledError:
+        with _LOCK:
+            state = _RUNS.get(run_id)
+            if state is not None:
+                state.update(done=True, status="cancelled", error=None,
+                             stage="finished", stage_label="Cancelled.",
+                             updated=time.time())
     except Exception as exc:  # the adapter already traps its own errors; belt & braces
         with _LOCK:
             state = _RUNS.get(run_id)
@@ -118,9 +138,15 @@ def _run_worker(fn, run_id, kwargs):
                              stage="finished", stage_label="Failed", updated=time.time())
 
 
-def _start(fn, kind, models, kwargs):
+def _start(fn, kind, models, kwargs, owner=None):
     run_id = auto_query_adapter._new_run_id()
-    _init_state(run_id, kind, models)
+    state = _init_state(run_id, kind, models, owner=owner)
+    kwargs = dict(kwargs)
+    def cancel_check():
+        if state["_cancel_event"].is_set():
+            raise CancelledError("Cancelled by user.")
+
+    kwargs["cancel_check"] = cancel_check
     thread = threading.Thread(
         target=_run_worker, args=(fn, run_id, kwargs),
         name=f"aq-run-{run_id}", daemon=True,
@@ -129,27 +155,75 @@ def _start(fn, kind, models, kwargs):
     return run_id
 
 
-def start_detection(*, site_id=None, url=None, models, csv_path=None):
+def start_detection(*, site_id=None, url=None, models, csv_path=None, owner=None):
     """Kick off a detection run in the background; return its run_id at once."""
     return _start(
         auto_query_adapter.run_detection, "detection", models,
         {"site_id": site_id, "url": url, "models": models, "csv_path": csv_path},
+        owner=owner,
     )
 
 
-def start_manual(*, records, site_id=None, url=None, csv_path=None):
+def start_manual(*, records, site_id=None, url=None, csv_path=None, owner=None):
     """Kick off a manual evaluation in the background; return its run_id."""
     models = [r["Model"] for r in records]
     return _start(
         auto_query_adapter.run_manual_evaluation, "manual", models,
         {"records": records, "site_id": site_id, "url": url, "csv_path": csv_path},
+        owner=owner,
     )
 
 
 def _live_snapshot(run_id):
     with _LOCK:
         state = _RUNS.get(run_id)
-        return dict(state, model_status=dict(state["model_status"])) if state else None
+        if state is None:
+            return None
+        return {
+            key: (dict(value) if key == "model_status" else value)
+            for key, value in state.items()
+            if not key.startswith("_") and key != "owner"
+        }
+
+
+def active_runs(*, requester=None, is_admin=False):
+    """Return live runs visible to one account for the global job center."""
+    with _LOCK:
+        states = list(_RUNS.values())
+        visible = []
+        for state in states:
+            owner = state.get("owner")
+            if not (is_admin or owner is None or (requester and requester == owner)):
+                continue
+            if state.get("done"):
+                continue
+            visible.append({
+                "id": state["run_id"],
+                "kind": state.get("kind") or "detection",
+                "status": state.get("status") or "running",
+                "label": state.get("stage_label") or "Investigation running…",
+                "started": state.get("started"),
+                "updated": state.get("updated"),
+                "href": f"/query/runs/{state['run_id']}",
+            })
+    visible.sort(key=lambda item: item.get("updated") or 0, reverse=True)
+    return visible
+
+
+def cancel(run_id, *, requester=None, is_admin=False):
+    """Request cooperative cancellation of a live detection/manual run."""
+    with _LOCK:
+        state = _RUNS.get(run_id)
+        if state is None:
+            return None
+        owner = state.get("owner")
+        if not (is_admin or owner is None or (requester and requester == owner)):
+            raise RunForbidden("This run belongs to a different account.")
+        if not state.get("done"):
+            state["_cancel_event"].set()
+            state.update(status="cancelling", stage_label="Stopping after the current request…",
+                         updated=time.time())
+    return status(run_id)
 
 
 def status(run_id):
@@ -191,7 +265,7 @@ def status(run_id):
     # "running" with no worker means the process was restarted mid-run.
     status_val = record.get("status")
     interrupted = status_val == "running"
-    done = status_val in ("completed", "failed") or interrupted
+    done = status_val in ("completed", "failed", "cancelled") or interrupted
     return {
         "run_id": run_id,
         "present": True,

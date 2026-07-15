@@ -1,0 +1,19 @@
+{% if background_job %}
+<div class="job-control mb-5" data-background-job
+     data-status-url="{{ background_job.status_url }}"
+     data-cancel-url="{{ background_job.cancel_url }}"
+     data-done-url="{{ job_done_url|default(request.url.path) }}"
+     data-cancelled-url="{{ job_cancelled_url|default(request.url.path ~ '?cancelled=1') }}">
+    <div class="job-control__body">
+        <div class="job-control__eyebrow">
+            <span class="live-dot" data-job-dot></span>
+            <span data-job-status>{{ background_job.status }}</span>
+        </div>
+        <div class="job-control__label" data-job-label>{{ background_job.label }}</div>
+        {% if not background_job.done %}<div class="muted" style="font-size:12px;margin-top:3px">Runs on the server. You may switch pages, close this tab, or reopen the app later.</div>{% endif %}
+        <div class="job-control__error" data-job-error {% if not background_job.error %}hidden{% endif %}>{{ background_job.error or '' }}</div>
+    </div>
+    <button type="button" class="btn btn--danger btn--sm" data-job-cancel
+            {% if background_job.done %}hidden{% endif %}>Cancel job</button>
+</div>
+{% endif %}

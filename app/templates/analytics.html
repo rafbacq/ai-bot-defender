@@ -173,10 +173,19 @@
     </p>
 </div>
 
+{% if cancelled %}
+<div class="notice notice--warn mb-4"><div class="notice__title">Campaign analysis cancelled</div>
+    <p class="muted" style="margin:0">The running analysis stopped and the last completed campaign report remains unchanged.</p>
+</div>
+{% endif %}
+{% set job_done_url = '/logs' %}
+{% set job_cancelled_url = '/logs?cancelled=1' %}
+{% include '_background_job.html' %}
+
 <!-- Primary action + tucked-away options (one form -> POST /intel/recompute) -->
 <form method="post" action="/intel/recompute" class="mb-4">
     <div class="flex flex-wrap items-center gap-3">
-        <button class="btn btn--primary">{{ 'Re-analyze traffic' if report else 'Analyze traffic' }}</button>
+        <button class="btn btn--primary" {% if background_job and not background_job.done %}disabled{% endif %}>{{ 'Re-analyze traffic' if report else 'Analyze traffic' }}</button>
         <span class="muted" style="font-size:12.5px">
             {% if report %}Rebuilds the campaigns from the latest request log (a few seconds).
             {% else %}Clusters the log into campaigns and flags disguised crawlers — takes a few seconds.{% endif %}

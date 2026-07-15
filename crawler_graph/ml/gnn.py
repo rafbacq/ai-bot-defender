@@ -105,7 +105,8 @@ def _split_labeled(y_list, train_mask_list, val_frac=0.3, seed=42):
     return tr, va
 
 
-def train_classifier(arrays, hidden=32, epochs=200, lr=0.01, weight_decay=5e-4, verbose=False):
+def train_classifier(arrays, hidden=32, epochs=200, lr=0.01, weight_decay=5e-4,
+                     verbose=False, cancel_check=None):
     """Train the supervised GraphSAGE classifier; return predictions per IP.
 
     Returns ``{ip: {"provider": str, "confidence": float}}`` plus training meta.
@@ -146,6 +147,8 @@ def train_classifier(arrays, hidden=32, epochs=200, lr=0.01, weight_decay=5e-4, 
 
     best_val, best_state, last_loss = -1.0, None, None
     for epoch in range(epochs):
+        if cancel_check is not None:
+            cancel_check()
         model.train()
         opt.zero_grad()
         out = model(x, edge_index)

@@ -157,6 +157,56 @@ def test_campaign_graph_allows_only_same_origin_framing(repo_root):
     assert "add_header X-Frame-Options DENY" not in admin_conf
 
 
+def test_every_processing_page_exposes_a_cancel_control(repo_root):
+    """Every long-running button workflow has both UI and POST cancellation."""
+    main = (repo_root / "app" / "main.py").read_text(encoding="utf-8")
+    templates = repo_root / "app" / "templates"
+
+    for route in (
+        '/jobs/{job_id}/cancel',
+        '/generator/cancel/{job_id}',
+        '/query/runs/{run_id}/cancel',
+        '/provenance/runs/{run_id}/cancel',
+        '/selfplay/cancel',
+    ):
+        assert f'@app.post("{route}")' in main
+
+    controls = {
+        "_background_job.html": "data-job-cancel",
+        "generator.html": "cancel-generation",
+        "run_detail.html": "cancel-run",
+        "provenance_detail.html": "cancel-probe",
+        "selfplay.html": "cancel-selfplay",
+    }
+    for filename, marker in controls.items():
+        text = (templates / filename).read_text(encoding="utf-8")
+        assert marker in text, f"{filename} is missing its running-job cancel control"
+
+
+def test_background_work_is_globally_discoverable_and_not_browser_owned(repo_root):
+    """Navigation/visibility only affects rendering, never server execution."""
+    main = (repo_root / "app" / "main.py").read_text(encoding="utf-8")
+    base = (repo_root / "app" / "templates" / "base.html").read_text(encoding="utf-8")
+    generator = (repo_root / "app" / "templates" / "generator.html").read_text(
+        encoding="utf-8"
+    )
+    shared = (repo_root / "app" / "templates" / "_background_job.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert '@app.get("/jobs/active")' in main
+    assert 'id="active-jobs-link"' in base and "fetch('/jobs/active'" in base
+    assert "visibilitychange" in base and "window.addEventListener('focus'" in base
+    assert "close this tab" in generator.lower()
+    assert "close this tab" in shared.lower()
+    combined = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (repo_root / "app" / "templates").glob("*.html")
+    )
+    assert "beforeunload" not in combined
+    assert "sendBeacon(" not in combined
+
+
 def test_public_nav_exposes_every_account_access_destination(repo_root):
     """Logged-out visitors can reach login, access, signup, and administration."""
     base = (repo_root / "app" / "templates" / "base.html").read_text(encoding="utf-8")
@@ -204,3 +254,38 @@ def test_frontend_styles_are_same_origin_precompiled_and_mobile_safe(repo_root):
     assert "overflow-x: auto; justify-content: flex-start" in app_css, (
         "overflowing mobile nav links must remain reachable from the left edge"
     )
+
+
+def test_manual_forensics_flow_has_one_target_and_progressive_responses(repo_root):
+    """Manual querying stays bound to one site and reveals only needed inputs."""
+    template = (repo_root / "app" / "templates" / "forensics.html").read_text(
+        encoding="utf-8"
+    )
+    manual = template.split("<!-- Manual-query workflow", 1)[1].split(
+        "<!-- Membership inference", 1
+    )[0]
+    initial_markup = manual.split('<template id="manual-response-template">', 1)[0]
+    css = (repo_root / "app" / "static" / "css" / "app.css").read_text(
+        encoding="utf-8"
+    )
+
+    # One visible selector generates the prompt. Evaluation inherits that exact
+    # site in a hidden field instead of asking the user to choose twice.
+    assert manual.count("<select") == 1
+    assert 'id="manual-site"' in manual
+    assert "data-prompt-site=" in manual
+    assert 'type="hidden" name="site_id" value="{{ manual.site_id }}"' in manual
+
+    # No spreadsheet chooser and only one live row at first; extra rows come from
+    # an inert template when the user asks for them.
+    assert 'type="file"' not in manual
+    assert initial_markup.count('name="manual_response"') == 1
+    assert 'id="add-manual-response"' in manual
+    assert 'id="manual-response-template"' in manual
+
+    # Long answers have a roomy editor while the inline cards remain compact.
+    assert '<dialog class="manual-dialog"' in manual
+    assert 'id="manual-response-editor"' in manual
+    assert ".manual-dialog__editor" in css
+    assert ".manual-response-row__fields" in css
+    assert "@media (max-width: 760px)" in css

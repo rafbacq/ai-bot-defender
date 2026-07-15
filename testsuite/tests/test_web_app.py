@@ -14,6 +14,8 @@ app's public surface after the analytics/forensics page consolidation.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 
@@ -139,6 +141,9 @@ def app_main(monkeypatch):
     monkeypatch.setattr(main.template_gen, "list_website_templates",
                         lambda: [{"version": 1, "filename": "scraper1.html", "category": "towns"}])
     monkeypatch.setattr(main.template_gen, "current_interpreter", lambda: "python3")
+    monkeypatch.setattr(main.template_gen, "latest_generation", lambda **kwargs: None)
+    monkeypatch.setattr(main.task_service, "latest", lambda **kwargs: None)
+    monkeypatch.setattr(main.task_service, "list_jobs", lambda **kwargs: [])
 
     return main, rendered
 
@@ -160,6 +165,49 @@ def test_all_pages_render_with_the_current_template_set(app_main):
         "index.html", "sites.html", "analytics.html", "forensics.html",
         "run_detail.html", "provenance_detail.html", "generator.html",
     }, f"unexpected template set: {names}"
+
+
+def test_processing_pages_rediscover_live_jobs_without_the_original_query_url(
+    app_main, monkeypatch,
+):
+    """Returning through normal navigation reattaches to owner-scoped work.
+
+    The browser does not need to preserve the POST redirect's ``?job=`` URL.
+    """
+    main, rendered = app_main
+
+    def latest_task(**kwargs):
+        kind = next(iter(kwargs.get("kinds") or ["unknown"]))
+        return {
+            "id": f"job-{kind}", "kind": kind, "status": "running",
+            "done": False, "ok": None, "label": f"{kind} is running",
+            "error": None, "redirect": None, "started": 1, "updated": 2,
+            "ended": None, "result": None,
+        }
+
+    monkeypatch.setattr(main.task_service, "latest", latest_task)
+    main.sites_page(object())
+    assert rendered[-1][1]["background_job"]["kind"] == "site-deploy"
+    main.logs_page(object())
+    assert rendered[-1][1]["background_job"]["kind"] == "campaign-intelligence"
+    main.query_page(object())
+    assert rendered[-1][1]["background_job"]["kind"] in {
+        "manual-prompt", "membership-inference",
+    }
+
+    generation = {
+        "id": "gen-live", "type": "towns", "status": "running",
+        "done": False, "percent": 31, "stage": "generating",
+        "label": "Generating…", "category": "towns", "output": "",
+        "installed": [], "started_at": "2026-07-15T00:00:00+00:00",
+        "updated": 2,
+    }
+    monkeypatch.setattr(
+        main.template_gen, "latest_generation",
+        lambda **kwargs: generation if kwargs.get("active_only") else generation,
+    )
+    main.generator_page(object())
+    assert rendered[-1][1]["job"] == "gen-live"
 
 
 def test_logs_page_wires_in_traffic_fingerprints_and_campaigns(app_main):
@@ -313,6 +361,36 @@ def test_query_run_key_mode_gates_live_models(app_main, monkeypatch):
                           key_mode="api", max_questions=3, seed="")
     assert resp.headers["location"] == "/query/runs/bg-2"
     assert calls[-1]["models"] == ["mock/scraper-sim"]
+
+
+def test_manual_query_accepts_the_progressive_response_rows(app_main, monkeypatch):
+    """The dynamic UI's repeated model/response fields retain the existing route
+    contract and discard a completely blank row."""
+    main, _ = app_main
+    calls = []
+    monkeypatch.setattr(
+        main.run_manager, "start_manual",
+        lambda **kwargs: calls.append(kwargs) or "manual-9",
+    )
+
+    response = asyncio.run(main.query_manual(
+        site_id="site-001",
+        responses_file=None,
+        manual_model=[" ERNIE 4.5 ", "", "Kimi K2"],
+        manual_response=[" first complete answer ", "", "second answer"],
+        request=None,
+    ))
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/query/runs/manual-9"
+    assert calls == [{
+        "records": [
+            {"Model": "ERNIE 4.5", "Responses": "first complete answer"},
+            {"Model": "Kimi K2", "Responses": "second answer"},
+        ],
+        "site_id": "site-001",
+        "owner": None,
+    }]
 
 
 def test_provenance_run_starts_background_probe_and_redirects(app_main, monkeypatch):

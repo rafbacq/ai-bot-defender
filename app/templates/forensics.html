@@ -54,6 +54,14 @@
     <p class="muted" style="margin:0">{{ run_error }}</p>
 </div>
 {% endif %}
+{% if cancelled %}
+<div class="notice notice--warn mb-5"><div class="notice__title">Job cancelled</div>
+    <p class="muted" style="margin:0">Processing stopped and no incomplete result was published.</p>
+</div>
+{% endif %}
+{% set job_done_url = '/query' %}
+{% set job_cancelled_url = '/query?cancelled=1' %}
+{% include '_background_job.html' %}
 
 <!-- KPIs -->
 <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
@@ -249,73 +257,227 @@
     </div>
 </form>
 
-<!-- Manual-query workflow: prompt out, chatbot answers back in -->
-<div class="card card--pad mb-5" id="manual">
-    <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
-        <h2 class="section-title" style="margin:0">Manual evaluation</h2>
-        <span class="badge badge--neutral">for models without a search API</span>
+<!-- Manual-query workflow: one target, prompt out, chatbot answers back in. -->
+{% set manual_prompt_ready = manual and manual.prompt and manual.site_id %}
+{% set manual_prompt_running = background_job and background_job.kind == 'manual-prompt' and not background_job.done %}
+{% set manual_site_id = manual.site_id if manual and manual.site_id else (sites[0].site_id if sites else '') %}
+<section class="card card--pad manual-workflow mb-5" id="manual"
+         data-prompt-site="{{ manual.site_id if manual_prompt_ready else '' }}">
+    <div class="manual-workflow__head">
+        <div>
+            <h2 class="section-title">Manual evaluation</h2>
+            <p>Evaluate chatbots that cannot be queried through an API. Generate one retrieval prompt,
+               run it in each chatbot, then paste the answers here for the same forensic analysis.</p>
+        </div>
+        <span class="badge badge--neutral">No API required</span>
     </div>
-    <p class="muted" style="font-size:12.5px;margin-top:0">For providers without a suitable API (ERNIE, Kimi, Meta AI…):
-       generate the retrieval prompt, run it in each chatbot yourself, then upload a
-       <span class="mono">Model / Responses</span> spreadsheet (or paste answers below). Responses are evaluated with
-       exactly the same attribution methodology as automated runs.</p>
 
     {% if manual and manual.error %}
-    <div class="notice notice--warn mb-3">
+    <div class="notice notice--warn manual-workflow__notice" role="alert">
         <div class="notice__title">Manual workflow error</div>
-        <p class="muted" style="margin:0">{{ manual.error }}</p>
+        <p class="muted">{{ manual.error }}</p>
     </div>
     {% endif %}
 
-    <div class="grid lg:grid-cols-2 gap-5">
-        <!-- Step 1: generate the prompt -->
-        <form method="post" action="/query/prompt">
+    <ol class="manual-progress" aria-label="Manual evaluation progress">
+        <li class="{{ 'is-complete' if manual_prompt_ready else 'is-current' }}">
+            <span class="manual-progress__num">1</span>
+            <span><strong>Select site</strong><small>Choose the evaluation target</small></span>
+        </li>
+        <li class="{{ 'is-complete' if manual_prompt_ready else '' }}">
+            <span class="manual-progress__num">2</span>
+            <span><strong>Query chatbots</strong><small>Use the generated prompt</small></span>
+        </li>
+        <li class="{{ 'is-current' if manual_prompt_ready else '' }}">
+            <span class="manual-progress__num">3</span>
+            <span><strong>Evaluate answers</strong><small>Add one response or more</small></span>
+        </li>
+    </ol>
+
+    <!-- This is deliberately the workflow's only site selector. The evaluation
+         form below carries the generated prompt's site as an immutable hidden value. -->
+    <div class="manual-target">
+        <div class="manual-target__copy">
+            <span class="manual-target__eyebrow">Evaluation target</span>
+            <strong>Use one honeypot for scraping and analysis</strong>
+            <span>The prompt and every pasted answer stay tied to this selection.</span>
+        </div>
+        <form method="post" action="/query/prompt" class="manual-target__form" id="manual-prompt-form">
             <input type="hidden" name="mode" value="local">
-            <label class="field-label">1 · Generate the prompt</label>
             {% if sites %}
-            <select class="input mb-2" name="site_id">
-                {% for s in sites %}<option value="{{ s.site_id }}" {% if manual and manual.site_id == s.site_id %}selected{% endif %}>{{ s.site_id }} — {{ s.hostname }} (scraper{{ s.scraper_version }})</option>{% endfor %}
+            <label class="visually-hidden" for="manual-site">Honeypot site</label>
+            <select class="input" name="site_id" id="manual-site" required
+                    aria-describedby="manual-site-guidance" {% if manual_prompt_running %}disabled{% endif %}>
+                {% for s in sites %}
+                <option value="{{ s.site_id }}" {% if manual_site_id == s.site_id %}selected{% endif %}>{{ s.site_id }} — {{ s.hostname }} (scraper{{ s.scraper_version }})</option>
+                {% endfor %}
             </select>
+            <button class="btn btn--primary" {% if manual_prompt_running %}disabled{% endif %}>
+                {{ 'Generating…' if manual_prompt_running else ('Regenerate prompt' if manual_prompt_ready else 'Generate prompt') }}
+            </button>
             {% else %}
-            <p class="help">No sites configured — <a href="/sites">deploy one</a> first.</p>
+            <a class="btn btn--primary" href="/sites">Deploy a site</a>
             {% endif %}
-            <button class="btn btn--primary" {% if not sites %}disabled{% endif %}>Generate prompt</button>
-            {% if manual and manual.prompt %}
-            <div class="mt-3">
-                <div class="flex items-center justify-between">
-                    <span class="field-label" style="margin:0">Prompt{% if manual.subject %} · subject <strong>{{ manual.subject }}</strong>{% endif %}</span>
+        </form>
+        <p class="help manual-target__help" id="manual-site-guidance">
+            {% if sites %}
+                {% if manual_prompt_ready %}The visible prompt and evaluation are locked to <span class="mono">{{ manual.site_id }}</span>.{% else %}Choose the honeypot whose canary content you want to test.{% endif %}
+            {% else %}No honeypot sites are configured yet.{% endif %}
+        </p>
+        <p class="notice notice--warn manual-scope-warning" id="manual-scope-warning" role="status" hidden></p>
+    </div>
+
+    {% if manual_prompt_ready %}
+    <div class="manual-workspace">
+        <!-- Step 2: take the prompt to each chatbot. -->
+        <section class="manual-panel" aria-labelledby="manual-prompt-title">
+            <div class="manual-panel__head">
+                <div class="manual-panel__title">
+                    <span class="manual-step-num">2</span>
+                    <span><strong id="manual-prompt-title">Query each chatbot</strong>
+                    {% if manual.subject %}<small>Subject: {{ manual.subject }}</small>{% endif %}</span>
+                </div>
+                <div class="manual-panel__tools">
+                    <button type="button" class="btn btn--ghost btn--sm" id="copy-manual-prompt">Copy prompt</button>
                     <a class="btn btn--ghost btn--sm" href="/query/prompt.txt">Download .txt</a>
                 </div>
-                <textarea class="input mono" rows="8" readonly onclick="this.select()" style="font-size:12px">{{ manual.prompt }}</textarea>
-                <p class="help">Paste this into each chatbot and record one response per model.</p>
             </div>
-            {% endif %}
-        </form>
+            <textarea class="input mono manual-prompt" id="manual-generated-prompt" rows="11"
+                      readonly aria-label="Generated retrieval prompt">{{ manual.prompt }}</textarea>
+            <p class="help">Send this exact prompt to each chatbot, then add its complete answer in step 3.</p>
+            <span class="visually-hidden" id="manual-copy-status" aria-live="polite"></span>
+        </section>
 
-        <!-- Step 2: bring the responses back -->
-        <form method="post" action="/query/manual" enctype="multipart/form-data">
-            <label class="field-label">2 · Evaluate the responses</label>
-            {% if sites %}
-            <select class="input mb-2" name="site_id">
-                {% for s in sites %}<option value="{{ s.site_id }}" {% if manual and manual.site_id == s.site_id %}selected{% endif %}>{{ s.site_id }} — {{ s.hostname }} (scraper{{ s.scraper_version }})</option>{% endfor %}
-            </select>
-            {% endif %}
-            <input class="input mb-2" type="file" name="responses_file" accept=".xlsx,.xlsm,.csv">
-            <p class="help" style="margin-top:0">Spreadsheet with <span class="mono">Model</span> and <span class="mono">Responses</span> columns — or paste inline:</p>
-            {% for i in range(3) %}
-            <div class="manual-response-row grid gap-2 mb-2">
-                <input class="input" name="manual_model" placeholder="Model{% if i == 0 %} (e.g. ERNIE){% endif %}">
-                <textarea class="input" name="manual_response" rows="2" placeholder="Its response to the prompt"></textarea>
+        <!-- Step 3: bring responses back. The site is inherited from the prompt. -->
+        <section class="manual-panel" aria-labelledby="manual-responses-title">
+            <div class="manual-panel__head">
+                <div class="manual-panel__title">
+                    <span class="manual-step-num">3</span>
+                    <span><strong id="manual-responses-title">Add chatbot answers</strong>
+                    <small>Start with one; add more only when needed</small></span>
+                </div>
             </div>
-            {% endfor %}
-            <button class="btn btn--cta" {% if not sites %}disabled{% endif %}>Evaluate responses</button>
-        </form>
+            <form method="post" action="/query/manual" enctype="multipart/form-data"
+                  id="manual-evaluation-form" data-manual-form>
+                <input type="hidden" name="site_id" value="{{ manual.site_id }}">
+                <div class="manual-scope-lock" title="Inherited from the generated prompt">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                    Evaluating <span class="mono">{{ manual.site_id }}</span> — the same site used to generate this prompt
+                </div>
+
+                <div class="manual-response-list" id="manual-response-list">
+                    <article class="manual-response-row" data-response-row>
+                        <div class="manual-response-row__head">
+                            <span class="manual-response-row__title">Chatbot response <span data-response-number>1</span></span>
+                            <button type="button" class="manual-remove" data-remove-response hidden>Remove</button>
+                        </div>
+                        <div class="manual-response-row__fields">
+                            <label class="manual-model-field">
+                                <span class="field-label">Model or chatbot</span>
+                                <input class="input" name="manual_model" list="manual-model-options"
+                                       placeholder="e.g. ERNIE 4.5" autocomplete="off" required>
+                            </label>
+                            <div class="manual-response-field">
+                                <div class="manual-response-field__label">
+                                    <span class="field-label">Complete response</span>
+                                    <button type="button" class="manual-expand" data-expand-response>
+                                        Open large editor
+                                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+                                    </button>
+                                </div>
+                                <textarea class="input manual-compact-response" name="manual_response" rows="3"
+                                          aria-label="Complete chatbot response 1"
+                                          placeholder="Paste the chatbot's full answer here…" required data-compact-response></textarea>
+                                <span class="manual-response-count" data-response-count>0 characters</span>
+                            </div>
+                        </div>
+                    </article>
+                </div>
+
+                <button type="button" class="btn btn--ghost btn--sm manual-add" id="add-manual-response" data-add-response>
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                    Add another response
+                </button>
+
+                <div class="manual-submit">
+                    <p>Each answer is analyzed independently against <span class="mono">{{ manual.site_id }}</span>'s canary rows.</p>
+                    <button class="btn btn--cta" data-evaluate-submit>Evaluate responses</button>
+                </div>
+            </form>
+        </section>
     </div>
-</div>
+    {% else %}
+    <div class="manual-empty">
+        <span class="manual-empty__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v13H7l-3 3V4Z"/><path d="M8 9h8M8 13h5"/></svg>
+        </span>
+        <div><strong>Generate a prompt to continue</strong>
+            <p>The prompt and response fields will appear here, already linked to the selected site.</p></div>
+    </div>
+    {% endif %}
+
+    <datalist id="manual-model-options">
+        {% for k in provider_keys if k.access == 'manual' %}<option value="{{ k.chatbot }}">{{ k.publisher }}</option>{% endfor %}
+    </datalist>
+
+    <template id="manual-response-template">
+        <article class="manual-response-row" data-response-row>
+            <div class="manual-response-row__head">
+                <span class="manual-response-row__title">Chatbot response <span data-response-number></span></span>
+                <button type="button" class="manual-remove" data-remove-response>Remove</button>
+            </div>
+            <div class="manual-response-row__fields">
+                <label class="manual-model-field">
+                    <span class="field-label">Model or chatbot</span>
+                    <input class="input" name="manual_model" list="manual-model-options"
+                           placeholder="e.g. Kimi K2" autocomplete="off" required>
+                </label>
+                <div class="manual-response-field">
+                    <div class="manual-response-field__label">
+                        <span class="field-label">Complete response</span>
+                        <button type="button" class="manual-expand" data-expand-response>
+                            Open large editor
+                            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+                        </button>
+                    </div>
+                    <textarea class="input manual-compact-response" name="manual_response" rows="3"
+                              aria-label="Complete chatbot response"
+                              placeholder="Paste the chatbot's full answer here…" required data-compact-response></textarea>
+                    <span class="manual-response-count" data-response-count>0 characters</span>
+                </div>
+            </div>
+        </article>
+    </template>
+
+    <dialog class="manual-dialog" id="manual-response-dialog" aria-labelledby="manual-dialog-title">
+        <form method="dialog" class="manual-dialog__surface">
+            <div class="manual-dialog__head">
+                <div>
+                    <span class="manual-target__eyebrow">Response editor</span>
+                    <h3 id="manual-dialog-title">Paste the complete chatbot answer</h3>
+                    <p id="manual-dialog-model">Chatbot response</p>
+                </div>
+                <button class="manual-dialog__close" value="cancel" aria-label="Close response editor">×</button>
+            </div>
+            <div class="manual-dialog__body">
+                <label class="field-label" for="manual-response-editor">Complete response</label>
+                <textarea class="input manual-dialog__editor" id="manual-response-editor" rows="18"
+                          placeholder="Paste the chatbot's full answer here…"></textarea>
+            </div>
+            <div class="manual-dialog__foot">
+                <span class="manual-response-count" id="manual-dialog-count">0 characters</span>
+                <div>
+                    <button class="btn btn--ghost" value="cancel">Cancel</button>
+                    <button class="btn btn--primary" type="button" id="save-manual-response">Save response</button>
+                </div>
+            </div>
+        </form>
+    </dialog>
+</section>
 
 <!-- Membership inference + model timeline -->
 <div class="grid lg:grid-cols-2 gap-5 mb-6">
-    <form method="post" action="/provenance/membership-demo" class="card card--pad">
+    <form method="post" action="/provenance/membership-demo" class="card card--pad" id="membership">
         <h2 class="section-title" style="margin-top:0">Membership inference</h2>
         <p class="muted" style="font-size:12.5px">Score served vs. never-served watermark docs with Min-K%/Min-K%++
            and test the gap — statistical proof of training membership without any regurgitation. The offline demo
@@ -323,7 +485,7 @@
         <div class="flex flex-wrap items-end gap-3">
             <div><label class="field-label">Watermark docs</label><input class="input" name="n" value="24" style="width:110px"></div>
             <div><label class="field-label">Seed</label><input class="input" name="seed" placeholder="optional" style="width:100px"></div>
-            <button class="btn btn--ghost">Run demo</button>
+            <button class="btn btn--ghost" {% if background_job and background_job.kind == 'membership-inference' and not background_job.done %}disabled{% endif %}>Run demo</button>
         </div>
         {% if membership %}
         <div class="grid grid-cols-2 lg:grid-cols-5 gap-3 mt-4">
@@ -471,5 +633,187 @@
   }
   document.querySelectorAll('#keymode-toggle button').forEach(btn =>
     btn.addEventListener('click', () => applyKeyMode(btn.dataset.keymode)));
+
+  // Manual evaluation: keep one selected site bound to the generated prompt,
+  // grow the response list on demand, and offer a large editor without making
+  // every response card tall.
+  (function () {
+    const workflow = document.getElementById('manual');
+    if (!workflow) return;
+
+    const promptBox = document.getElementById('manual-generated-prompt');
+    const copyButton = document.getElementById('copy-manual-prompt');
+    const copyStatus = document.getElementById('manual-copy-status');
+    if (promptBox && copyButton) {
+      copyButton.addEventListener('click', async function () {
+        let copied = false;
+        try {
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(promptBox.value);
+            copied = true;
+          }
+        } catch (error) { /* use the selection fallback below */ }
+        if (!copied) {
+          promptBox.focus();
+          promptBox.select();
+          try { copied = document.execCommand('copy'); } catch (error) { copied = false; }
+        }
+        const original = copyButton.textContent;
+        copyButton.textContent = copied ? 'Copied' : 'Select prompt';
+        if (copyStatus) copyStatus.textContent = copied
+          ? 'Prompt copied to clipboard.'
+          : 'Copy was unavailable. The prompt text is selected.';
+        window.setTimeout(function () { copyButton.textContent = original; }, 1800);
+      });
+    }
+
+    const siteSelect = document.getElementById('manual-site');
+    const evaluationForm = document.getElementById('manual-evaluation-form');
+    const evaluateButton = evaluationForm && evaluationForm.querySelector('[data-evaluate-submit]');
+    const scopeWarning = document.getElementById('manual-scope-warning');
+    const promptSite = workflow.dataset.promptSite;
+    let siteMismatch = false;
+
+    function syncEvaluationScope() {
+      if (!siteSelect || !promptSite || !evaluationForm) return;
+      siteMismatch = siteSelect.value !== promptSite;
+      evaluationForm.classList.toggle('is-stale', siteMismatch);
+      if (evaluateButton) evaluateButton.disabled = siteMismatch;
+      if (scopeWarning) {
+        scopeWarning.hidden = !siteMismatch;
+        scopeWarning.textContent = siteMismatch
+          ? 'This prompt was generated for ' + promptSite + '. Generate a new prompt before evaluating the newly selected site, or switch back to ' + promptSite + '.'
+          : '';
+      }
+    }
+    if (siteSelect && promptSite) {
+      siteSelect.addEventListener('change', syncEvaluationScope);
+      syncEvaluationScope();
+    }
+    if (evaluationForm) {
+      evaluationForm.addEventListener('submit', function (event) {
+        syncEvaluationScope();
+        if (!siteMismatch) return;
+        event.preventDefault();
+        if (scopeWarning) scopeWarning.hidden = false;
+        siteSelect.focus();
+      });
+    }
+
+    const list = document.getElementById('manual-response-list');
+    const addButton = document.getElementById('add-manual-response');
+    const rowTemplate = document.getElementById('manual-response-template');
+    const dialog = document.getElementById('manual-response-dialog');
+    const dialogEditor = document.getElementById('manual-response-editor');
+    const dialogModel = document.getElementById('manual-dialog-model');
+    const dialogCount = document.getElementById('manual-dialog-count');
+    const dialogSave = document.getElementById('save-manual-response');
+    let activeCompactResponse = null;
+
+    function characterLabel(length) {
+      return length.toLocaleString() + (length === 1 ? ' character' : ' characters');
+    }
+    function updateCompactCount(textarea) {
+      const counter = textarea.closest('[data-response-row]').querySelector('[data-response-count]');
+      if (counter) counter.textContent = characterLabel(textarea.value.length);
+    }
+    function updateDialogCount() {
+      if (dialogCount && dialogEditor) dialogCount.textContent = characterLabel(dialogEditor.value.length);
+    }
+    function responseRows() {
+      return list ? Array.from(list.querySelectorAll('[data-response-row]')) : [];
+    }
+    function renumberResponses() {
+      const rows = responseRows();
+      rows.forEach(function (row, index) {
+        const number = index + 1;
+        const numberLabel = row.querySelector('[data-response-number]');
+        const model = row.querySelector('[name="manual_model"]');
+        const response = row.querySelector('[data-compact-response]');
+        const remove = row.querySelector('[data-remove-response]');
+        if (numberLabel) numberLabel.textContent = number;
+        if (model) model.setAttribute('aria-label', 'Model or chatbot for response ' + number);
+        if (response) response.setAttribute('aria-label', 'Complete chatbot response ' + number);
+        if (remove) {
+          remove.hidden = rows.length === 1;
+          remove.setAttribute('aria-label', 'Remove chatbot response ' + number);
+        }
+      });
+    }
+    function openLargeEditor(compact) {
+      if (!dialog || !dialogEditor || typeof dialog.showModal !== 'function') {
+        compact.focus();
+        compact.select();
+        return;
+      }
+      activeCompactResponse = compact;
+      dialogEditor.value = compact.value;
+      const row = compact.closest('[data-response-row]');
+      const model = row.querySelector('[name="manual_model"]');
+      const number = row.querySelector('[data-response-number]');
+      dialogModel.textContent = model.value.trim() || ('Chatbot response ' + number.textContent);
+      updateDialogCount();
+      dialog.showModal();
+      window.setTimeout(function () { dialogEditor.focus(); }, 0);
+    }
+
+    if (list) {
+      list.addEventListener('input', function (event) {
+        if (event.target.matches('[data-compact-response]')) updateCompactCount(event.target);
+      });
+      list.addEventListener('click', function (event) {
+        const expand = event.target.closest('[data-expand-response]');
+        if (expand) {
+          openLargeEditor(expand.closest('[data-response-row]').querySelector('[data-compact-response]'));
+          return;
+        }
+        const remove = event.target.closest('[data-remove-response]');
+        if (!remove) return;
+        const row = remove.closest('[data-response-row]');
+        const hasContent = Array.from(row.querySelectorAll('input, textarea')).some(function (field) {
+          return field.value.trim();
+        });
+        if (hasContent && !window.confirm('Remove this chatbot response?')) return;
+        row.remove();
+        renumberResponses();
+      });
+      responseRows().forEach(function (row) {
+        updateCompactCount(row.querySelector('[data-compact-response]'));
+      });
+      renumberResponses();
+    }
+    if (addButton && list && rowTemplate) {
+      addButton.addEventListener('click', function () {
+        const row = rowTemplate.content.firstElementChild.cloneNode(true);
+        list.appendChild(row);
+        renumberResponses();
+        row.querySelector('[name="manual_model"]').focus();
+        row.scrollIntoView({block: 'nearest'});
+      });
+    }
+    if (dialogEditor) dialogEditor.addEventListener('input', updateDialogCount);
+    if (dialogSave) {
+      dialogSave.addEventListener('click', function () {
+        if (!activeCompactResponse) return;
+        activeCompactResponse.value = dialogEditor.value;
+        activeCompactResponse.dispatchEvent(new Event('input', {bubbles: true}));
+        dialog.close('save');
+      });
+    }
+    if (dialogEditor && dialogSave) {
+      dialogEditor.addEventListener('keydown', function (event) {
+        if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+          event.preventDefault();
+          dialogSave.click();
+        }
+      });
+    }
+    if (dialog) {
+      dialog.addEventListener('click', function (event) {
+        if (event.target === dialog) dialog.close('cancel');
+      });
+      dialog.addEventListener('close', function () { activeCompactResponse = null; });
+    }
+  })();
 </script>
 {% endblock %}

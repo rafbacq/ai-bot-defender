@@ -326,3 +326,79 @@ def test_severity_of_maps_the_verdict_to_the_three_row_tiers():
     # clean — a self-consistent beacon, and an honest non-JS client.
     assert fs.severity_of({"fp_present": True, "verdict": {"score": 0}})["level"] == "clean"
     assert fs.severity_of({"fp_present": False, "verdict": {"score": 0}})["level"] == "clean"
+
+
+def test_probe_reason_flags_hostile_targets_but_not_legit_paths():
+    """probe_reason judges the request TARGET independent of the client identity."""
+    from app.services import fingerprint_service as fs
+
+    # Secrets / config / VCS / IDE / backup exfiltration.
+    for uri in (
+        "/.env", "/.env.production", "/.envrc", "/api/shared/.env",
+        "/.git/config", "/.git/HEAD", "/.aws/credentials", "/.ssh/id_rsa",
+        "/.vscode/sftp.json", "/.DS_Store", "/wp-config.php", "/config.json",
+        "/storage/logs/laravel.log", "/backup.zip", "/db.sql", "/actuator/env",
+        "/server-status", "/_profiler",
+    ):
+        assert fs.probe_reason(uri) is not None, uri
+
+    # Exploit / admin-panel / CMS / device / open-resolver recon.
+    for uri in (
+        "/wp-includes/wlwmanifest.xml", "/wp-login.php", "/xmlrpc.php?rsd",
+        "/login.action", "/geoserver/web/", "/druid/index.html",
+        "/ecp/Current/exporttool/microsoft.exchange.ediscovery.export",
+        "/___proxy_subdomain_cpanel", "/v2/_catalog", "/cgi-bin/luci",
+        "/dns-query?name=1.odns.m.dnsmeasure.top&type=A", "/index.php",
+    ):
+        assert fs.probe_reason(uri) is not None, uri
+
+    # Path traversal is caught even when it hides under an allowlisted prefix.
+    assert fs.probe_reason("/.well-known/../../.env") is not None
+    assert fs.probe_reason("/static/../../etc/passwd") is not None
+
+    # Legit honeypot paths must stay clean (query strings and case ignored). The
+    # query is stripped before matching, so a benign `?name=`/`?v=` never reddens
+    # the root, and a bare `/query` (a real admin route, were this helper reused)
+    # is left for the identity engine rather than blanket-flagged.
+    for uri in (
+        "/", "/favicon.ico", "/robots.txt", "/js/fp.js", "/__fpbeacon",
+        "/css/site.css?v=1", "/static/css/app.css?v=123",
+        "/.well-known/acme-challenge/LbAY57zYhGIXkoeBsFYkMN",
+        "/.well-known/security.txt", "/sitemap.xml",
+        "/?name=1.odns.m.dnsmeasure.top&type=A", "/query", "/query?name=x",
+        None, "",
+    ):
+        assert fs.probe_reason(uri) is None, uri
+
+
+def test_severity_of_marks_secrets_and_exploit_probes_malicious():
+    """A hostile request target reddens the row even when the client looks honest.
+
+    The `.env` sweeps and tool-UA scanners this deployment actually sees would
+    otherwise rate 'clean' (an honest bot UA that never runs JS is self-consistent),
+    so the URI signal is what closes the gap the crawler-graph engine leaves open.
+    """
+    from app.services import fingerprint_service as fs
+
+    # Fake-Googlebot HEAD /.env: no fingerprint, self-consistent identity -> was clean.
+    env_probe = fs.severity_of(
+        {"uri": "/.env.production", "fp_present": False, "verdict": {"score": 0}}
+    )
+    assert env_probe["level"] == "malicious" and "secrets" in env_probe["reason"]
+
+    # Tool-UA scanners hitting framework paths (zgrab/Go-http-client) -> malicious.
+    assert fs.severity_of(
+        {"uri": "/actuator/health", "fp_present": False, "verdict": {"score": 0}}
+    )["level"] == "malicious"
+    assert fs.severity_of(
+        {"uri": "/wp-includes/wlwmanifest.xml", "fp_present": False, "verdict": {"score": 0}}
+    )["level"] == "malicious"
+
+    # A real browser hitting the honeypot page stays green (no false positive).
+    assert fs.severity_of(
+        {"uri": "/", "fp_present": True, "verdict": {"score": 0}}
+    )["level"] == "clean"
+    # Fingerprint rows (no `uri` key) are unaffected — the engine still decides.
+    assert fs.severity_of(
+        {"fp_present": True, "verdict": {"score": 0}}
+    )["level"] == "clean"

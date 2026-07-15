@@ -17,6 +17,8 @@ lazily; without it everything degrades to a "not trained" state.
 """
 
 import json
+import os
+import tempfile
 
 import numpy as np
 
@@ -186,7 +188,7 @@ def score_endpoints(endpoints):
 
 
 # ------------------------------------------------------------ live second opinion
-def score_live(threshold=0.5, since_hours=None, limit=None):
+def score_live(threshold=0.5, since_hours=None, limit=None, cancel_check=None):
     """Score the current logdb endpoints with the robust detector and persist
     ``robust_predictions.json`` for the /logs second-opinion panel. Also compares
     against the production detector's disguise verdict. Degrades gracefully."""
@@ -196,12 +198,16 @@ def score_live(threshold=0.5, since_hours=None, limit=None):
 
     if not available():
         return {"ok": False, "reason": "robust detector not trained / torch missing"}
+    if cancel_check:
+        cancel_check()
     try:
         visits = db.fetch_visits(limit=limit, since_hours=since_hours)
     except Exception as exc:
         return {"ok": False, "reason": f"logdb unavailable: {exc}"}
     if not visits:
         return {"ok": False, "reason": "no visits in logdb"}
+    if cancel_check:
+        cancel_check()
     try:
         handshakes = db.fetch_handshakes(since_hours=since_hours)
         tcp = db.fetch_tcp_fingerprints(since_hours=since_hours)
@@ -215,12 +221,16 @@ def score_live(threshold=0.5, since_hours=None, limit=None):
     endpoints = enrich.aggregate_endpoints(visits)
     enrich.attach_browser_fingerprints(endpoints, bfp)
     consistency.annotate(endpoints)
+    if cancel_check:
+        cancel_check()
 
     probs = score_endpoints(endpoints)
     # production disguise verdict per IP (from campaign membership)
     g = builder.build_graph(endpoints)
     mem, _ = community.detect_communities(g)
     camps = cmod.build_campaigns(g, mem, endpoints)
+    if cancel_check:
+        cancel_check()
     prod_disguised = set()
     for c in camps:
         if c.get("disguise_suspected") or c.get("agentic_suspected"):
@@ -244,8 +254,25 @@ def score_live(threshold=0.5, since_hours=None, limit=None):
         "threshold": threshold,
         "predictions": rows[:500],
     }
+    if cancel_check:
+        cancel_check()
     config.ensure_output_dir()
-    with open(config.ROBUST_PREDS, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2)
+    fd, tmp = tempfile.mkstemp(
+        prefix="robust_predictions_", suffix=".json.tmp",
+        dir=config.OUTPUT_DIR,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if cancel_check:
+            cancel_check()
+        os.replace(tmp, config.ROBUST_PREDS)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
     payload["ok"] = True
     return payload

@@ -39,6 +39,7 @@ Routes:
 
 import math
 import secrets
+from concurrent.futures import CancelledError
 from datetime import datetime
 from urllib.parse import urlencode, urlsplit
 
@@ -53,8 +54,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from . import config
 from .services import (
     auth_service, fingerprint_service, graph_intel, keys_service, provenance_service,
-    querying_service, request_log, run_manager, selfplay_service, sites, stats,
-    template_gen, totp_service,
+    job_catalog, querying_service, request_log, run_manager, selfplay_service, sites, stats,
+    task_service, template_gen, totp_service,
 )
 
 app = FastAPI(title="AI Bot Defender")
@@ -127,6 +128,62 @@ def _is_admin(request: Request) -> bool:
     return bool(request.session.get("is_admin"))
 
 
+def _job_identity(request):
+    """Return ``(username, is_admin)`` for job ownership checks.
+
+    ``None`` is accepted for direct route calls in the offline unit suite; real
+    HTTP requests are always authenticated by ``auth_guard`` before reaching a
+    job endpoint.
+    """
+    if request is None:
+        return None, False
+    try:
+        session = request.session
+    except (AttributeError, AssertionError):
+        return None, False
+    return session.get("username"), bool(session.get("is_admin"))
+
+
+def _page_task(request, job_id="", *, kinds=None):
+    """Resolve an explicit task id or rediscover this account's live page task."""
+    owner, is_admin = _job_identity(request)
+    if job_id:
+        try:
+            task = task_service.status(job_id, requester=owner, is_admin=is_admin)
+        except task_service.TaskForbidden:
+            return None
+    else:
+        task = task_service.latest(
+            requester=owner,
+            is_admin=is_admin,
+            kinds=kinds,
+            active_only=True,
+        )
+    if task:
+        job_id = task["id"]
+        task.pop("result", None)
+        task.update(
+            status_url=f"/jobs/{job_id}/status",
+            cancel_url=f"/jobs/{job_id}/cancel",
+        )
+    return task
+
+
+def _recent_task(request, *, kinds, max_age=7 * 24 * 60 * 60,
+                 completed_only=False):
+    """Newest owner-scoped task/result for restoring a page after returning."""
+    owner, is_admin = _job_identity(request)
+    jobs = task_service.list_jobs(
+        requester=owner,
+        is_admin=is_admin,
+        kinds=kinds,
+        max_age=max_age,
+    )
+    if completed_only:
+        jobs = [job for job in jobs if job.get("done")]
+    return jobs[0] if jobs else None
+
+
 def _admin_secret_matches(candidate: str) -> bool:
     return secrets.compare_digest(str(candidate or ""), config.ADMIN_SECRET)
 
@@ -156,6 +213,44 @@ app.add_middleware(
     same_site="lax",
     https_only=config.SESSION_HTTPS_ONLY,
 )
+
+
+# --- Shared cancellable background operations ------------------------------
+@app.get("/jobs/{job_id}/status")
+def task_status(request: Request, job_id: str):
+    owner, is_admin = _job_identity(request)
+    try:
+        state = task_service.status(job_id, requester=owner, is_admin=is_admin)
+    except task_service.TaskForbidden as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=403)
+    if state is None:
+        return JSONResponse({
+            "id": job_id, "status": "missing", "done": True, "ok": False,
+            "label": "This job was not found (it may have expired).",
+        }, status_code=404)
+    return JSONResponse(state, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/jobs/active")
+def active_jobs(request: Request):
+    """Account-scoped catalog polled from every authenticated application page."""
+    owner, is_admin = _job_identity(request)
+    return JSONResponse(
+        job_catalog.summary(owner=owner, is_admin=is_admin),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/jobs/{job_id}/cancel")
+def task_cancel(request: Request, job_id: str):
+    owner, is_admin = _job_identity(request)
+    try:
+        state = task_service.cancel(job_id, requester=owner, is_admin=is_admin)
+    except task_service.TaskForbidden as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=403)
+    if state is None:
+        return JSONResponse({"detail": "Job not found."}, status_code=404)
+    return JSONResponse(state, headers={"Cache-Control": "no-store"})
 
 
 def _pretty_timestamp(value):
@@ -206,8 +301,19 @@ def api_stats():
 
 # --- Site Configurator -----------------------------------------------------
 @app.get("/sites", response_class=HTMLResponse)
-def sites_page(request: Request, deployed: str = "", ok: str = ""):
+def sites_page(request: Request, deployed: str = "", ok: str = "", job: str = "",
+               cancelled: str = ""):
     versions = sites.available_scraper_versions() or [1]
+    background_job = _page_task(request, job, kinds={"site-deploy"})
+    recent = _recent_task(
+        request, kinds={"site-deploy"}, completed_only=True,
+    )
+    recent_result = (recent or {}).get("result") or {}
+    if not deployed and recent_result.get("site_id"):
+        deployed = recent_result["site_id"]
+        ok = "1" if recent_result.get("ok") else "0"
+    deploy_output = recent_result.get("output") or _LAST_DEPLOY.get("output")
+    deploy_site_id = recent_result.get("site_id") or _LAST_DEPLOY.get("site_id")
     return templates.TemplateResponse(
         request,
         "sites.html",
@@ -220,8 +326,10 @@ def sites_page(request: Request, deployed: str = "", ok: str = ""):
             "suggested": sites.suggest_ports(),
             "deployed": deployed,
             "ok": ok,
-            "deploy_output": _LAST_DEPLOY.get("output"),
-            "deploy_site_id": _LAST_DEPLOY.get("site_id"),
+            "deploy_output": deploy_output,
+            "deploy_site_id": deploy_site_id,
+            "background_job": background_job,
+            "cancelled": cancelled,
         },
     )
 
@@ -253,24 +361,69 @@ def deploy(
     db_password: str = Form(""),
     db_host_port: str = Form(...),
     reset_db: str = Form(""),
+    request: Request = None,
 ):
     site_id = site_id.strip()
     if not site_id or not port.strip() or not db_host_port.strip():
         _LAST_DEPLOY.update(site_id=site_id, output="site_id, port and db_host_port are required.")
         return RedirectResponse("/sites?ok=0", status_code=303)
 
-    sites.write_site_config(
-        site_id,
-        scraper_version=scraper_version,
-        port=port.strip(),
-        genmode=(genmode == "true"),
-        db_user=db_user.strip(),
-        db_password=db_password.strip(),
-        db_host_port=db_host_port.strip(),
-    )
-    ok, output = sites.deploy_site(site_id, reset_db=bool(reset_db))
-    _LAST_DEPLOY.update(site_id=site_id, output=output)
-    return RedirectResponse(f"/sites?deployed={site_id}&ok={1 if ok else 0}", status_code=303)
+    def write_config():
+        return sites.write_site_config(
+            site_id,
+            scraper_version=scraper_version,
+            port=port.strip(),
+            genmode=(genmode == "true"),
+            db_user=db_user.strip(),
+            db_password=db_password.strip(),
+            db_host_port=db_host_port.strip(),
+        )
+
+    # Preserve direct-call behavior for the offline route unit tests. Real HTTP
+    # requests always take the cancellable background path below.
+    if request is None:
+        write_config()
+        ok, output = sites.deploy_site(site_id, reset_db=bool(reset_db))
+        _LAST_DEPLOY.update(site_id=site_id, output=output)
+        return RedirectResponse(
+            f"/sites?deployed={site_id}&ok={1 if ok else 0}", status_code=303
+        )
+
+    owner, _ = _job_identity(request)
+
+    def deploy_worker(task):
+        task.update(label=f"Saving configuration for {site_id}…")
+        write_config()
+        task.check_cancelled()
+        task.update(label=f"Starting deployment for {site_id}…")
+        ok, output = sites.deploy_site(
+            site_id, reset_db=bool(reset_db), task=task,
+        )
+        task.check_cancelled()
+        _LAST_DEPLOY.update(site_id=site_id, output=output)
+        return {
+            "ok": ok,
+            "label": f"{site_id} deployed." if ok else f"Deployment of {site_id} failed.",
+            "error": None if ok else output[-1000:],
+            "redirect": f"/sites?deployed={site_id}&ok={1 if ok else 0}",
+            "site_id": site_id,
+            "output": output,
+            "reset_db": bool(reset_db),
+        }
+
+    try:
+        job_id = task_service.start(
+            "site-deploy", deploy_worker, owner=owner,
+            label=f"Queueing deployment for {site_id}…",
+            exclusive_key="site-deploy",
+            redirect="/sites?ok=0",
+        )
+    except task_service.TaskBusy as exc:
+        if exc.job_id:
+            return RedirectResponse(f"/sites?job={exc.job_id}", status_code=303)
+        _LAST_DEPLOY.update(site_id=site_id, output=str(exc))
+        return RedirectResponse("/sites?ok=0", status_code=303)
+    return RedirectResponse(f"/sites?job={job_id}", status_code=303)
 
 
 # --- Crawler Analytics (requests + fingerprints + campaigns, one page) -------
@@ -309,6 +462,8 @@ def logs_page(
     page: int = 1,
     page_size: int = 100,
     ok: str = "",
+    job: str = "",
+    cancelled: str = "",
 ):
     # Keep the rendered page metadata in lockstep with fetch_requests(), which
     # applies these same safety bounds internally. Otherwise a hand-edited query
@@ -332,6 +487,14 @@ def logs_page(
     # Fold a per-row `disguised` flag + a 3-tier severity, and pass the summary for the panel.
     disguise = fingerprint_service.disguise_summary(max_age=5)
     _annotate_rows(data, disguise)
+
+    background_job = _page_task(
+        request, job, kinds={"campaign-intelligence"},
+    )
+    recent_intel = _recent_task(
+        request, kinds={"campaign-intelligence"}, completed_only=True,
+    )
+    recent_intel_result = (recent_intel or {}).get("result") or {}
 
     page_count = max(1, math.ceil((data["total"] or 0) / page_size))
     return templates.TemplateResponse(
@@ -358,8 +521,10 @@ def logs_page(
             "report": graph_intel.load_report(),
             "has_viz": graph_intel.viz_path() is not None,
             "has_interactive": graph_intel.interactive_viz_path() is not None,
-            "intel_error": _LAST_INTEL.get("error"),
+            "intel_error": recent_intel_result.get("error") or _LAST_INTEL.get("error"),
             "ok": ok,
+            "background_job": background_job,
+            "cancelled": cancelled,
         },
     )
 
@@ -420,21 +585,74 @@ def intel_redirect():
 
 
 @app.post("/intel/recompute")
-def intel_recompute(limit: str = Form(""), since_hours: str = Form(""), use_gnn: str = Form("")):
+def intel_recompute(limit: str = Form(""), since_hours: str = Form(""),
+                    use_gnn: str = Form(""), request: Request = None):
     lim = int(limit) if limit.strip().isdigit() else None
     since = int(since_hours) if since_hours.strip().isdigit() else None
+    def recompute(cancel_check=None, progress=None):
+        try:
+            if progress:
+                progress("Loading traffic and building the campaign graph…")
+            graph_intel.recompute(
+                limit=lim, since_hours=since, use_gnn=bool(use_gnn),
+                cancel_check=cancel_check,
+            )
+            _LAST_INTEL.pop("error", None)
+            ok = 1
+        except graph_intel.IntelError as exc:
+            _LAST_INTEL["error"] = str(exc)
+            ok = 0
+        # Refresh the robust detector over the same traffic. It shares the
+        # campaign job's cancellation token so Cancel stops the entire action.
+        if ok and selfplay_service.available() and selfplay_service.status().get(
+            "robust_detector_trained"
+        ):
+            if progress:
+                progress("Refreshing the robust detector's second opinion…")
+            selfplay_service.score_live(
+                since_hours=since, cancel_check=cancel_check,
+            )
+        return ok
+
+    if request is None:
+        ok = recompute()
+        return RedirectResponse(f"/logs?ok={ok}", status_code=303)
+
+    owner, _ = _job_identity(request)
+
+    def intel_worker(task):
+        try:
+            ok = recompute(
+                cancel_check=task.check_cancelled,
+                progress=lambda label: task.update(label=label),
+            )
+        except CancelledError:
+            raise
+        except Exception as exc:
+            _LAST_INTEL["error"] = f"{type(exc).__name__}: {exc}"
+            ok = 0
+        return {
+            "ok": bool(ok),
+            "label": "Campaign analysis complete." if ok else "Campaign analysis failed.",
+            "error": None if ok else _LAST_INTEL.get("error"),
+            "redirect": f"/logs?ok={ok}",
+            "limit": lim,
+            "since_hours": since,
+            "use_gnn": bool(use_gnn),
+        }
+
     try:
-        graph_intel.recompute(limit=lim, since_hours=since, use_gnn=bool(use_gnn))
-        _LAST_INTEL.pop("error", None)
-        ok = 1
-    except graph_intel.IntelError as exc:
+        job_id = task_service.start(
+            "campaign-intelligence", intel_worker, owner=owner,
+            label="Queueing campaign analysis…", exclusive_key="campaign-intelligence",
+            redirect="/logs?ok=0",
+        )
+    except task_service.TaskBusy as exc:
+        if exc.job_id:
+            return RedirectResponse(f"/logs?job={exc.job_id}", status_code=303)
         _LAST_INTEL["error"] = str(exc)
-        ok = 0
-    # Refresh the self-play robust detector's second opinion over the same live
-    # traffic (best-effort; no-op when self-play hasn't been trained yet).
-    if selfplay_service.available() and selfplay_service.status().get("robust_detector_trained"):
-        selfplay_service.score_live(since_hours=since)
-    return RedirectResponse(f"/logs?ok={ok}", status_code=303)
+        return RedirectResponse("/logs?ok=0", status_code=303)
+    return RedirectResponse(f"/logs?job={job_id}", status_code=303)
 
 
 @app.get("/intel/graph.png")
@@ -478,7 +696,8 @@ def selfplay_page(request: Request):
 
 @app.post("/selfplay/run")
 def selfplay_run(kind: str = Form("train"), iterations: str = Form(""),
-                 cost_budget: str = Form(""), risk_mode: str = Form("")):
+                 cost_budget: str = Form(""), risk_mode: str = Form(""),
+                 request: Request = None):
     overrides = {}
     if iterations.strip().isdigit():
         overrides["iterations"] = int(iterations)
@@ -490,7 +709,10 @@ def selfplay_run(kind: str = Form("train"), iterations: str = Form(""),
     if risk_mode in ("expectation", "cvar"):
         overrides["risk_mode"] = risk_mode
     try:
-        selfplay_service.launch_training(kind=kind, overrides=overrides)
+        owner, _ = _job_identity(request)
+        selfplay_service.launch_training(
+            kind=kind, overrides=overrides, owner=owner,
+        )
         _LAST_SELFPLAY.pop("error", None)
     except selfplay_service.SelfPlayError as exc:
         _LAST_SELFPLAY["error"] = str(exc)
@@ -502,15 +724,28 @@ def selfplay_status():
     """Live job status + log tail (polled by the page while a run is in flight)."""
     st = selfplay_service.status()
     st["log_tail"] = selfplay_service.job_log(tail=6000)
-    return JSONResponse(st)
+    return JSONResponse(st, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/selfplay/cancel")
+def selfplay_cancel(request: Request):
+    owner, is_admin = _job_identity(request)
+    try:
+        job = selfplay_service.cancel_job(requester=owner, is_admin=is_admin)
+    except selfplay_service.SelfPlayForbidden as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=403)
+    return JSONResponse({"job": job}, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/selfplay/score-live")
-def selfplay_score_live():
-    """Run the robust detector over current logdb traffic (the second opinion)."""
-    res = selfplay_service.score_live()
-    if not res.get("ok"):
-        _LAST_SELFPLAY["error"] = f"Second-opinion scoring failed: {res.get('reason')}"
+def selfplay_score_live(request: Request = None):
+    """Start cancellable robust-detector scoring in the background."""
+    try:
+        owner, _ = _job_identity(request)
+        selfplay_service.launch_score(owner=owner)
+        _LAST_SELFPLAY.pop("error", None)
+    except selfplay_service.SelfPlayError as exc:
+        _LAST_SELFPLAY["error"] = str(exc)
     return RedirectResponse("/selfplay", status_code=303)
 
 
@@ -584,7 +819,30 @@ def _recent_investigations(limit=14):
 
 
 @app.get("/query", response_class=HTMLResponse)
-def query_page(request: Request, demo: str = ""):
+def query_page(request: Request, demo: str = "", job: str = "", cancelled: str = ""):
+    background_job = _page_task(
+        request, job, kinds={"manual-prompt", "membership-inference"},
+    )
+    prompt_task = _recent_task(
+        request, kinds={"manual-prompt"}, completed_only=True,
+    )
+    membership_task = _recent_task(
+        request, kinds={"membership-inference"}, completed_only=True,
+    )
+    prompt_result = (prompt_task or {}).get("result") or {}
+    membership_result = (membership_task or {}).get("result") or {}
+    # Keep the owner-scoped generated prompt while still surfacing a validation
+    # error from the response POST. Previously, a saved prompt masked that error
+    # entirely, making a rejected manual submission look like a no-op.
+    manual = dict(prompt_result.get("manual") or _LAST_MANUAL)
+    manual_error = _LAST_MANUAL.pop("error", None)
+    if manual_error:
+        manual["error"] = manual_error
+    membership = membership_result.get("membership") or _LAST_PROV.get("membership")
+    task_error = (
+        membership_result.get("error")
+        or prompt_result.get("error")
+    )
     return templates.TemplateResponse(
         request,
         "forensics.html",
@@ -598,14 +856,16 @@ def query_page(request: Request, demo: str = ""):
             "timeline": provenance_service.timeline(),
             "prov_providers": provenance_service.provider_status(),
             "recent": _recent_investigations(),
-            "membership": _LAST_PROV.get("membership"),
-            "prov_error": _LAST_PROV.get("error"),
-            "manual": _LAST_MANUAL,
+            "membership": membership,
+            "prov_error": task_error or _LAST_PROV.get("error"),
+            "manual": manual,
             "provider_keys": keys_service.provider_rows(),
             "keys_msg": _LAST_KEYS.pop("msg", None),
             "keys_err": _LAST_KEYS.pop("err", None),
             "run_error": _LAST_RUN.pop("error", None),
             "demo": demo,
+            "background_job": background_job,
+            "cancelled": cancelled,
         },
     )
 
@@ -624,6 +884,7 @@ def query_run(
     key_mode: str = Form("offline"),
     max_questions: int = Form(3),
     seed: str = Form(""),
+    request: Request = None,
 ):
     """Start a detection run in the background and redirect to its live page.
 
@@ -637,11 +898,14 @@ def query_run(
     if err:
         _LAST_RUN["error"] = err
         return RedirectResponse("/query#launch", status_code=303)
+    owner, _ = _job_identity(request)
     if mode == "local" and site_id.strip():
-        run_id = run_manager.start_detection(site_id=site_id.strip(), models=chosen)
+        run_id = run_manager.start_detection(
+            site_id=site_id.strip(), models=chosen, owner=owner,
+        )
     else:
         run_id = run_manager.start_detection(
-            url=url.strip() or "http://127.0.0.1/", models=chosen
+            url=url.strip() or "http://127.0.0.1/", models=chosen, owner=owner,
         )
     return RedirectResponse(f"/query/runs/{run_id}", status_code=303)
 
@@ -649,7 +913,21 @@ def query_run(
 @app.get("/query/runs/{run_id}/status")
 def query_run_status(run_id: str):
     """Live status for the run page's poller (JSON)."""
-    return JSONResponse(run_manager.status(run_id))
+    return JSONResponse(
+        run_manager.status(run_id), headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/query/runs/{run_id}/cancel")
+def query_run_cancel(request: Request, run_id: str):
+    owner, is_admin = _job_identity(request)
+    try:
+        state = run_manager.cancel(run_id, requester=owner, is_admin=is_admin)
+    except run_manager.RunForbidden as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=403)
+    if state is None:
+        return JSONResponse({"detail": "Run not found or no longer active."}, status_code=404)
+    return JSONResponse(state, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/query/runs/{run_id}/download/{artifact}")
@@ -704,23 +982,83 @@ _LAST_MANUAL = {}
 
 
 @app.post("/query/prompt")
-def query_prompt(mode: str = Form("local"), site_id: str = Form(""), url: str = Form("")):
-    _LAST_MANUAL.clear()
-    try:
+def query_prompt(mode: str = Form("local"), site_id: str = Form(""),
+                 url: str = Form(""), request: Request = None):
+    if request is None:
+        _LAST_MANUAL.clear()
+
+    def generate(cancel_check=None):
         if mode == "local" and site_id.strip():
-            result = querying_service.generate_prompt(site_id=site_id.strip())
-            _LAST_MANUAL["site_id"] = site_id.strip()
+            result = querying_service.generate_prompt(
+                site_id=site_id.strip(), cancel_check=cancel_check,
+            )
+            selected_site = site_id.strip()
         else:
-            result = querying_service.generate_prompt(url=url.strip() or "http://127.0.0.1/")
-        _LAST_MANUAL.update(result)
-    except Exception as exc:
-        _LAST_MANUAL["error"] = f"{type(exc).__name__}: {exc}"
-    return RedirectResponse("/query#manual", status_code=303)
+            result = querying_service.generate_prompt(
+                url=url.strip() or "http://127.0.0.1/",
+                cancel_check=cancel_check,
+            )
+            selected_site = None
+        if cancel_check:
+            cancel_check()
+        manual = {}
+        if selected_site:
+            manual["site_id"] = selected_site
+        manual.update(result)
+        return manual
+
+    if request is None:
+        try:
+            _LAST_MANUAL.update(generate())
+        except Exception as exc:
+            _LAST_MANUAL["error"] = f"{type(exc).__name__}: {exc}"
+        return RedirectResponse("/query#manual", status_code=303)
+
+    owner, _ = _job_identity(request)
+
+    def prompt_worker(task):
+        task.update(label="Scraping the page and composing the retrieval prompt…")
+        try:
+            manual = generate(cancel_check=task.check_cancelled)
+            return {
+                "ok": True, "label": "Manual retrieval prompt is ready.",
+                "redirect": "/query#manual",
+                "manual": manual,
+            }
+        except CancelledError:
+            raise
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            return {
+                "ok": False, "label": "Prompt generation failed.",
+                "error": message, "redirect": "/query#manual",
+                "manual": {"error": message},
+            }
+
+    try:
+        job_id = task_service.start(
+            "manual-prompt", prompt_worker, owner=owner,
+            label="Queueing prompt generation…",
+            exclusive_key=f"manual-prompt:{owner or 'anonymous'}",
+            redirect="/query#manual",
+        )
+    except task_service.TaskBusy as exc:
+        if exc.job_id:
+            return RedirectResponse(f"/query?job={exc.job_id}#manual", status_code=303)
+        _LAST_MANUAL["error"] = str(exc)
+        return RedirectResponse("/query#manual", status_code=303)
+    return RedirectResponse(f"/query?job={job_id}#manual", status_code=303)
 
 
 @app.get("/query/prompt.txt")
-def query_prompt_download():
-    prompt = _LAST_MANUAL.get("prompt")
+def query_prompt_download(request: Request = None):
+    prompt = None
+    if request is not None:
+        latest = _recent_task(
+            request, kinds={"manual-prompt"}, completed_only=True,
+        )
+        prompt = (((latest or {}).get("result") or {}).get("manual") or {}).get("prompt")
+    prompt = prompt or _LAST_MANUAL.get("prompt")
     if not prompt:
         return PlainTextResponse("No prompt generated yet.", status_code=404)
     return PlainTextResponse(
@@ -735,6 +1073,7 @@ async def query_manual(
     responses_file: UploadFile | None = File(None),
     manual_model: list[str] = Form(default=[]),
     manual_response: list[str] = Form(default=[]),
+    request: Request = None,
 ):
     from auto_query.manual_io import ManualResponsesError, load_manual_responses
 
@@ -750,12 +1089,14 @@ async def query_manual(
             ]
         if not records:
             raise ManualResponsesError(
-                "No responses given — upload a Model/Responses spreadsheet or "
-                "fill in at least one model + response pair."
+                "No responses given — add at least one model and its complete response."
             )
         if not site_id.strip():
             raise ManualResponsesError("Pick the honeypot site the prompt came from.")
-        run_id = run_manager.start_manual(records=records, site_id=site_id.strip())
+        owner, _ = _job_identity(request)
+        run_id = run_manager.start_manual(
+            records=records, site_id=site_id.strip(), owner=owner,
+        )
     except ManualResponsesError as exc:
         _LAST_MANUAL["error"] = str(exc)
         return RedirectResponse("/query#manual", status_code=303)
@@ -795,6 +1136,7 @@ def provenance_run(
     page_removed: str = Form(""),
     max_questions: int = Form(3),
     seed: str = Form(""),
+    request: Request = None,
 ):
     # Same querying-mode contract as /query/run — the provenance/RAG buttons
     # share the launcher form, so the toggle governs them too.
@@ -803,16 +1145,19 @@ def provenance_run(
         _LAST_PROV["error"] = choice_err
         return RedirectResponse("/query#launch", status_code=303)
     seed_val = int(seed) if seed.strip().lstrip("-").isdigit() else None
+    owner, _ = _job_identity(request)
     try:
         if kind == "rag":
             run = provenance_service.start_rag(
                 mode, site_id.strip(), url.strip(), chosen,
                 page_removed=bool(page_removed), max_questions=max_questions, seed=seed_val,
+                owner=owner,
             )
         else:
             run = provenance_service.start_provenance(
                 mode, site_id.strip(), url.strip(), chosen,
                 max_questions=max_questions, seed=seed_val,
+                owner=owner,
             )
         _LAST_PROV.pop("error", None)
         return RedirectResponse(f"/provenance/runs/{run['run_id']}", status_code=303)
@@ -822,20 +1167,81 @@ def provenance_run(
 
 
 @app.post("/provenance/membership-demo")
-def provenance_membership(n: int = Form(24), seed: str = Form("")):
+def provenance_membership(n: int = Form(24), seed: str = Form(""),
+                          request: Request = None):
     seed_val = int(seed) if seed.strip().isdigit() else None
+
+    def run_demo(cancel_check=None):
+        result = provenance_service.membership_demo(
+            n=n, seed=seed_val, cancel_check=cancel_check,
+        )
+        if cancel_check:
+            cancel_check()
+        return result
+
+    if request is None:
+        try:
+            _LAST_PROV["membership"] = run_demo()
+            _LAST_PROV.pop("error", None)
+        except Exception as exc:
+            _LAST_PROV["error"] = f"{type(exc).__name__}: {exc}"
+        return RedirectResponse("/query?demo=1", status_code=303)
+
+    owner, _ = _job_identity(request)
+
+    def membership_worker(task):
+        task.update(label="Scoring served and control watermark documents…")
+        try:
+            membership = run_demo(cancel_check=task.check_cancelled)
+            return {
+                "ok": True, "label": "Membership inference complete.",
+                "redirect": "/query?demo=1",
+                "membership": membership,
+            }
+        except CancelledError:
+            raise
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            return {
+                "ok": False, "label": "Membership inference failed.",
+                "error": message, "redirect": "/query#membership",
+            }
+
     try:
-        _LAST_PROV["membership"] = provenance_service.membership_demo(n=n, seed=seed_val)
-        _LAST_PROV.pop("error", None)
-    except Exception as exc:
-        _LAST_PROV["error"] = f"{type(exc).__name__}: {exc}"
-    return RedirectResponse("/query?demo=1", status_code=303)
+        job_id = task_service.start(
+            "membership-inference", membership_worker, owner=owner,
+            label="Queueing membership inference…",
+            exclusive_key=f"membership-inference:{owner or 'anonymous'}",
+            redirect="/query#membership",
+        )
+    except task_service.TaskBusy as exc:
+        if exc.job_id:
+            return RedirectResponse(f"/query?job={exc.job_id}#membership", status_code=303)
+        _LAST_PROV["error"] = str(exc)
+        return RedirectResponse("/query#membership", status_code=303)
+    return RedirectResponse(f"/query?job={job_id}#membership", status_code=303)
 
 
 @app.get("/provenance/runs/{run_id}/status")
 def provenance_run_status(run_id: str):
     """Live status for the provenance/RAG report page's poller (JSON)."""
-    return JSONResponse(provenance_service.status(run_id))
+    return JSONResponse(
+        provenance_service.status(run_id), headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/provenance/runs/{run_id}/cancel")
+def provenance_run_cancel(request: Request, run_id: str):
+    owner, is_admin = _job_identity(request)
+    try:
+        state = provenance_service.cancel(
+            run_id, requester=owner, is_admin=is_admin,
+        )
+    except provenance_service.ProbeForbidden as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=403)
+    if not state.get("present"):
+        return JSONResponse({"detail": "Probe not found."}, status_code=404)
+    return JSONResponse(state, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/provenance/runs/{run_id}", response_class=HTMLResponse)
@@ -863,7 +1269,37 @@ _LAST_EDIT = {}
 
 @app.get("/generator", response_class=HTMLResponse)
 def generator_page(request: Request, ok: str = "", saved: str = "", job: str = "",
-                   version: str = ""):
+                   version: str = "", cancelled: str = ""):
+    owner, is_admin = _job_identity(request)
+    active_generation = None
+    if job:
+        try:
+            active_generation = template_gen.generation_status(
+                job, requester=owner, is_admin=is_admin,
+            )
+        except template_gen.GenerationForbidden:
+            job = ""
+    else:
+        active_generation = template_gen.latest_generation(
+            requester=owner, is_admin=is_admin, active_only=True,
+        )
+        if active_generation:
+            job = active_generation["id"]
+
+    latest_generation = template_gen.latest_generation(
+        requester=owner,
+        is_admin=is_admin,
+        active_only=False,
+        max_age=7 * 24 * 60 * 60,
+    )
+    completed_generation = (
+        latest_generation
+        if latest_generation and latest_generation.get("done")
+        else None
+    )
+    if not ok and not job and completed_generation:
+        ok = "1" if completed_generation.get("status") == "ok" else "0"
+    generation_result = completed_generation or {}
     return templates.TemplateResponse(
         request,
         "generator.html",
@@ -874,9 +1310,12 @@ def generator_page(request: Request, ok: str = "", saved: str = "", job: str = "
             "interpreter": template_gen.current_interpreter(),
             "ok": ok,
             "job": job,
-            "gen_output": _LAST_GEN.get("output"),
-            "gen_installed": _LAST_GEN.get("installed"),
-            "gen_type": _LAST_GEN.get("type"),
+            "gen_output": (generation_result.get("output")
+                           if completed_generation else _LAST_GEN.get("output")),
+            "gen_installed": (generation_result.get("installed")
+                              if completed_generation else _LAST_GEN.get("installed")),
+            "gen_type": (generation_result.get("type")
+                         if completed_generation else _LAST_GEN.get("type")),
             "saved": saved,
             # Which scraper<N> the editor should reopen — the save redirect carries
             # it back so a save doesn't drop you onto the first template.
@@ -884,30 +1323,50 @@ def generator_page(request: Request, ok: str = "", saved: str = "", job: str = "
             "edit_ok": _LAST_EDIT.get("ok"),
             "edit_msg": _LAST_EDIT.get("message"),
             "edit_info": _LAST_EDIT.get("info"),
+            "cancelled": cancelled,
         },
     )
 
 
 @app.post("/generator/run")
-def generator_run(template_type: str = Form("towns")):
+def generator_run(template_type: str = Form("towns"), request: Request = None):
     # Generation runs the fine-tuned model and can take minutes, so it runs on a
     # background worker thread: we redirect immediately to the page, which polls
     # /generator/status/{job} to drive a live progress bar. (One template per
     # category per run — "all" = every category on one model load — deduped via
     # the registry, so there is no count/seed knob.)
-    job_id = template_gen.start_generation(template_type)
+    try:
+        if request is None:
+            job_id = template_gen.start_generation(template_type)
+        else:
+            owner, _ = _job_identity(request)
+            job_id = template_gen.start_generation(template_type, owner=owner)
+    except template_gen.GenerationBusy as exc:
+        if exc.job_id:
+            return RedirectResponse(f"/generator?job={exc.job_id}", status_code=303)
+        _LAST_GEN.update(type=template_type, output=str(exc), installed=[])
+        return RedirectResponse("/generator?ok=0", status_code=303)
     return RedirectResponse(f"/generator?job={job_id}", status_code=303)
 
 
 @app.get("/generator/status/{job_id}")
-def generator_status(job_id: str):
+def generator_status(job_id: str, request: Request = None):
     """Live status for the generator progress bar (polled by the page).
 
     When the job finishes, its full result is copied into ``_LAST_GEN`` so the
     page can reload to ``/generator?ok=N`` and render the normal result notice
     (installed list + full model output) — the same view the blocking path used.
     """
-    job = template_gen.generation_status(job_id)
+    try:
+        if request is None:
+            job = template_gen.generation_status(job_id)
+        else:
+            owner, is_admin = _job_identity(request)
+            job = template_gen.generation_status(
+                job_id, requester=owner, is_admin=is_admin,
+            )
+    except template_gen.GenerationForbidden as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=403)
     if job is None:
         return JSONResponse({
             "present": False, "done": True, "status": "missing", "ok": False,
@@ -929,7 +1388,21 @@ def generator_status(job_id: str):
         "category": job.get("category"),
         "installed": len(job.get("installed") or []),
         "log": log[-4000:],  # live tail; the full output rides _LAST_GEN on done
-    })
+    }, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/generator/cancel/{job_id}")
+def generator_cancel(request: Request, job_id: str):
+    owner, is_admin = _job_identity(request)
+    try:
+        job = template_gen.cancel_generation(
+            job_id, requester=owner, is_admin=is_admin,
+        )
+    except template_gen.GenerationForbidden as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=403)
+    if job is None:
+        return JSONResponse({"detail": "Generation job not found."}, status_code=404)
+    return JSONResponse(job, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/generator/edit")

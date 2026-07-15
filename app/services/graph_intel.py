@@ -18,6 +18,7 @@ logdb psql``), so this works from inside the path-mirrored app container.
 """
 
 import json
+from concurrent.futures import CancelledError
 
 from .. import config
 
@@ -112,7 +113,7 @@ def interactive_viz_path():
     return path if path.exists() else None
 
 
-def recompute(limit=None, since_hours=None, use_gnn=False):
+def recompute(limit=None, since_hours=None, use_gnn=False, cancel_check=None):
     """Re-run the pipeline against logdb and persist + return the result.
 
     ``use_gnn`` additionally trains the GraphSAGE classifier and applies its
@@ -130,7 +131,10 @@ def recompute(limit=None, since_hours=None, use_gnn=False):
         return cg_pipeline.run_intel(
             limit=limit, since_hours=since_hours,
             resolve_asn=True, use_gnn=use_gnn, write=True, render=True,
+            cancel_check=cancel_check,
         )
+    except CancelledError:
+        raise
     except Exception as exc:
         raise IntelError(str(exc)) from exc
 

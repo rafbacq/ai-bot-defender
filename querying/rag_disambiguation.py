@@ -19,6 +19,7 @@ is interpreted correctly.
 
 import json
 import subprocess
+from concurrent.futures import CancelledError
 from datetime import datetime, timezone
 
 from . import config, ground_truth
@@ -87,12 +88,13 @@ def _any_leak(combined, rows, threshold):
     return best >= threshold, round(best, 4)
 
 
-def _query(model, role_prompt, questions, context, browsing):
+def _query(model, role_prompt, questions, context, browsing, cancel_check=None):
     """One probing pass. Returns ``(combined_answer_text, [error, ...])`` —
     ``llm_responses`` isolates failures per question, so a provider problem
     surfaces here as errors + missing text, never as an exception."""
     answers = llm_responses([model], (role_prompt, questions), context=context,
-                            options={"browsing": browsing})
+                            options={"browsing": browsing},
+                            cancel_check=cancel_check)
     qa = answers.get(model, [])
     combined = "\n\n".join(a["answer"] for a in qa if a.get("answer"))
     errors = [a["error"] for a in qa if "error" in a]
@@ -100,7 +102,7 @@ def _query(model, role_prompt, questions, context, browsing):
 
 
 def disambiguate_model(model, role_prompt, questions, rows, context, *, site,
-                       threshold, page_removed):
+                       threshold, page_removed, cancel_check=None):
     """Run the browsing-off / browsing-on probes for one model and classify.
 
     Provider failures are *reported*, not swallowed: a pass that produced no
@@ -111,10 +113,20 @@ def disambiguate_model(model, role_prompt, questions, rows, context, *, site,
     """
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    off, errors_off = _query(model, role_prompt, questions, context, browsing=False)
+    if cancel_check:
+        cancel_check()
+    off, errors_off = _query(
+        model, role_prompt, questions, context, browsing=False,
+        cancel_check=cancel_check,
+    )
     leak_off, best_off = _any_leak(off, rows, threshold)
 
-    on, errors_on = _query(model, role_prompt, questions, context, browsing=True)
+    if cancel_check:
+        cancel_check()
+    on, errors_on = _query(
+        model, role_prompt, questions, context, browsing=True,
+        cancel_check=cancel_check,
+    )
     leak_on, best_on = _any_leak(on, rows, threshold)
 
     fetches = _live_fetches(site, started) if site else {"n": 0, "agents": []}
@@ -159,7 +171,7 @@ def disambiguate_model(model, role_prompt, questions, rows, context, *, site,
 def run_rag_experiment(*, target_url, host_header=None, verify_tls=True, site_id=None,
                        db_name=None, db_user=None, project_root=None, models=None,
                        page_removed=False, max_questions=None, seed=None, persist=True,
-                       run_id=None):
+                       run_id=None, cancel_check=None):
     """Run the RAG-vs-training experiment across models; persist + return the report.
 
     ``run_id`` lets a background caller pre-assign the id it redirects to."""
@@ -179,12 +191,16 @@ def run_rag_experiment(*, target_url, host_header=None, verify_tls=True, site_id
         "error": None,
     }
     try:
+        if cancel_check:
+            cancel_check()
         record = parser(target_url, host_header=host_header, verify=verify_tls)
         # The page may be intentionally removed; still proceed using the subject we
         # can recover (or a placeholder) so browsing-off probing can run.
         subject = (record or {}).get("main_idea") or "the requested subject"
         probe_record = record if (record and record.get("main_idea")) else {"main_idea": subject}
         role_prompt, questions = generate_probes(probe_record, max_questions or config.MAX_PROBES, seed=seed)
+        if cancel_check:
+            cancel_check()
 
         if site_id and db_name and db_user:
             rows = ground_truth.load_site_rows(project_root, site_id, db_name, db_user)
@@ -196,13 +212,19 @@ def run_rag_experiment(*, target_url, host_header=None, verify_tls=True, site_id
         leak = ground_truth.pick_leak_candidates(rows, prefer_user_agent=PROBE_USER_AGENT)
         context = {"subject": subject, "leak_candidates": leak}
 
-        results = [
-            disambiguate_model(m, role_prompt, questions, rows, context,
-                               site=site_host, threshold=config.HIGH_RISK_THRESHOLD,
-                               page_removed=page_removed)
-            for m in models
-        ]
+        results = []
+        for model in models:
+            if cancel_check:
+                cancel_check()
+            results.append(disambiguate_model(
+                model, role_prompt, questions, rows, context,
+                site=site_host, threshold=config.HIGH_RISK_THRESHOLD,
+                page_removed=page_removed, cancel_check=cancel_check,
+            ))
         run.update(subject=subject, results=results, status="completed")
+    except CancelledError:
+        run["status"] = "cancelled"
+        run["error"] = None
     except Exception as exc:
         run["status"] = "failed"
         run["error"] = f"{type(exc).__name__}: {exc}"

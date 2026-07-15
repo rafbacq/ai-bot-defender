@@ -30,6 +30,7 @@ from one crawler row (the engine's "strong attribution" bar).
 import os
 import secrets
 import sys
+from concurrent.futures import CancelledError
 from datetime import datetime, timezone
 
 import requests
@@ -79,6 +80,11 @@ def _emit(progress, event, data=None):
         progress(event, data or {})
     except Exception:
         pass
+
+
+def _check_cancelled(cancel_check):
+    if cancel_check is not None:
+        cancel_check()
 
 
 def _fetch_html(url, host_header=None, verify=True, timeout=10):
@@ -263,7 +269,7 @@ def _map_results(run, raw_responses, evaluation, n_rows):
 
 
 def run_detection(*, site_id=None, url=None, models, csv_path=None, persist=True,
-                  run_id=None, progress=None):
+                  run_id=None, progress=None, cancel_check=None):
     """Full automated investigation: prompt -> API query -> evaluation.
 
     ``models`` is a list of LiteLLM model ids (``mock/*`` ids run offline).
@@ -277,10 +283,12 @@ def run_detection(*, site_id=None, url=None, models, csv_path=None, persist=True
     run["site_id"] = site_id
 
     try:
+        _check_cancelled(cancel_check)
         refresh_env()  # pick up keys saved to .env since the process started
         _emit(progress, "stage", {"stage": "resolving",
                                   "label": "Resolving the target site and ground truth…"})
         inputs = _resolve_inputs(site_id=site_id, url=url, csv_path=csv_path)
+        _check_cancelled(cancel_check)
         run["target_url"] = inputs.target_url
         run["host_header"] = inputs.host_header
         run["ground_truth_source"] = inputs.source
@@ -291,6 +299,7 @@ def run_detection(*, site_id=None, url=None, models, csv_path=None, persist=True
             inputs.template_html, inputs.faker_template,
             rendered_html=inputs.rendered_html,
         )
+        _check_cancelled(cancel_check)
         run["subject"] = artifacts["website_record"].get("main_idea")
         run["role_prompt"] = artifacts["role_prompt"]
         # The engine composes ONE retrieval prompt (attributes folded in),
@@ -324,16 +333,22 @@ def run_detection(*, site_id=None, url=None, models, csv_path=None, persist=True
                 "error_kind": item.get("ErrorKind"),
                 "error_detail": item.get("ErrorDetail"),
             }),
+            cancel_check=cancel_check,
         )
 
+        _check_cancelled(cancel_check)
         _emit(progress, "stage", {"stage": "evaluating",
                                   "label": "Extracting evidence and attributing crawlers…"})
         evaluation = evaluate_pipeline(
             raw_responses, inputs.faker_template, inputs.rows
         )
         _map_results(run, raw_responses, evaluation, len(inputs.rows))
+        _check_cancelled(cancel_check)
         run["status"] = "completed"
 
+    except CancelledError:
+        run["status"] = "cancelled"
+        run["error"] = None
     except GroundTruthError as exc:
         run["status"] = "failed"
         run["error"] = f"Ground truth unavailable: {exc}"
@@ -349,7 +364,8 @@ def run_detection(*, site_id=None, url=None, models, csv_path=None, persist=True
 
 
 def run_manual_evaluation(*, site_id=None, url=None, csv_path=None, records,
-                          persist=True, run_id=None, progress=None):
+                          persist=True, run_id=None, progress=None,
+                          cancel_check=None):
     """Evaluate manually collected responses exactly like API-acquired ones.
 
     ``records`` is the canonical ``[{"Model": ..., "Responses": ...}]`` list
@@ -364,10 +380,12 @@ def run_manual_evaluation(*, site_id=None, url=None, csv_path=None, records,
     run["site_id"] = site_id
 
     try:
+        _check_cancelled(cancel_check)
         refresh_env()
         _emit(progress, "stage", {"stage": "resolving",
                                   "label": "Resolving the target site and ground truth…"})
         inputs = _resolve_inputs(site_id=site_id, url=url, csv_path=csv_path)
+        _check_cancelled(cancel_check)
         run["target_url"] = inputs.target_url
         run["host_header"] = inputs.host_header
         run["ground_truth_source"] = inputs.source
@@ -385,6 +403,7 @@ def run_manual_evaluation(*, site_id=None, url=None, csv_path=None, records,
 
         # The responses were collected by hand — report them as already in.
         for item in normalized:
+            _check_cancelled(cancel_check)
             _emit(progress, "model_done", {
                 "model": item["Model"], "ok": True,
                 "answer": item.get("Responses", ""),
@@ -396,8 +415,12 @@ def run_manual_evaluation(*, site_id=None, url=None, csv_path=None, records,
             normalized, inputs.faker_template, inputs.rows
         )
         _map_results(run, normalized, evaluation, len(inputs.rows))
+        _check_cancelled(cancel_check)
         run["status"] = "completed"
 
+    except CancelledError:
+        run["status"] = "cancelled"
+        run["error"] = None
     except GroundTruthError as exc:
         run["status"] = "failed"
         run["error"] = f"Ground truth unavailable: {exc}"
@@ -412,17 +435,20 @@ def run_manual_evaluation(*, site_id=None, url=None, csv_path=None, records,
     return run
 
 
-def generate_prompt(*, site_id=None, url=None):
+def generate_prompt(*, site_id=None, url=None, cancel_check=None):
     """Prompt pipeline only — for the manual workflow's copy/download step.
 
     Returns ``{"subject", "role_prompt", "prompt", "attributes"}``. Raises on
     failure (no run record is written for a prompt preview).
     """
+    _check_cancelled(cancel_check)
     inputs = _resolve_inputs(site_id=site_id, url=url, need_rows=False)
+    _check_cancelled(cancel_check)
     artifacts = generate_prompt_pipeline(
         inputs.template_html, inputs.faker_template,
         rendered_html=inputs.rendered_html,
     )
+    _check_cancelled(cancel_check)
     return {
         "subject": artifacts["website_record"].get("main_idea"),
         "role_prompt": artifacts["role_prompt"],

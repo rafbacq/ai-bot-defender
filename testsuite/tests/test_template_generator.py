@@ -19,6 +19,8 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 STUB_HTML = "<html><head><title>T</title></head><body>{{ var1 }}</body></html>"
 STUB_VARLIST = "\n".join(["fake.city()"] * 10) + "\n"
 
@@ -269,6 +271,49 @@ def test_streaming_generation_job_installs_and_reaches_100(isolated_app_config, 
     assert "non-progress log line" in job["output"]
     assert "@@GENPROGRESS@@" not in job["output"]
     assert "installed" in (paths["history"] / "generations.jsonl").read_text(encoding="utf-8")
+
+
+def test_generation_is_rediscovered_deduplicated_and_checkpointed(
+    isolated_app_config, monkeypatch,
+):
+    """Leaving the generator page cannot orphan or duplicate its model process."""
+    from app.services import template_gen
+
+    paths = isolated_app_config
+    script = STUB_STREAMING_GENERATOR.replace(
+        "import json, sys", "import json, sys, time",
+    ).replace(
+        'emit(6, "loading", "Loading the model...")',
+        'emit(6, "loading", "Loading the model...")\ntime.sleep(0.35)',
+    )
+    (paths["generator"] / "generate_templates.py").write_text(
+        script, encoding="utf-8",
+    )
+    monkeypatch.setenv("TEMPLATE_GEN_PYTHON", sys.executable)
+
+    job_id = template_gen.start_generation("towns", owner="alice")
+    discovered = template_gen.latest_generation(
+        requester="alice", active_only=True,
+    )
+    assert discovered["id"] == job_id and discovered["done"] is False
+
+    with pytest.raises(template_gen.GenerationBusy) as busy:
+        template_gen.start_generation("books", owner="alice")
+    assert busy.value.job_id == job_id
+
+    deadline = time.time() + 30
+    state = template_gen.generation_status(job_id, requester="alice")
+    while not state["done"] and time.time() < deadline:
+        time.sleep(0.03)
+        state = template_gen.generation_status(job_id, requester="alice")
+    assert state["status"] == "ok" and state["installed"]
+
+    with template_gen._JOBS_LOCK:
+        template_gen._JOBS.pop(job_id, None)
+    restored = template_gen.generation_status(job_id, requester="alice")
+    assert restored["status"] == "ok" and restored["installed"] == state["installed"]
+    with pytest.raises(template_gen.GenerationForbidden):
+        template_gen.generation_status(job_id, requester="bob")
 
 
 def test_streaming_generation_job_reports_unknown_category(isolated_app_config):
