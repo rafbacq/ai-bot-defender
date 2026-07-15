@@ -128,6 +128,54 @@ def test_total_request_count_is_best_effort(monkeypatch):
     assert request_log.total_request_count() is None
 
 
+def test_landing_stats_uses_live_disguised_devices_not_saved_campaigns(monkeypatch):
+    """The overview must agree with /logs when a new disguised device arrives.
+
+    Campaign intelligence is an explicit, persisted analysis snapshot; device
+    disguise is a cheap live fingerprint aggregate. Reusing the former made the
+    front page stay stale until somebody manually recomputed campaigns.
+    """
+    from app.services import stats
+
+    monkeypatch.setattr(stats.sites, "list_sites", lambda: [{"site_id": "site-001"}])
+    monkeypatch.setattr(stats.sites, "active_proxy_sites", lambda: ["site-001.example"])
+    monkeypatch.setattr(stats.querying_service, "available_models", lambda: ["mock/a", "mock/b"])
+    monkeypatch.setattr(stats.querying_service, "model_ready", lambda model: model == "mock/a")
+    monkeypatch.setattr(stats.querying_service, "runs_summary", lambda: {
+        "queries_completed": 3,
+        "matches_found": 1,
+        "best_score": 0.8,
+        "total_runs": 2,
+    })
+    monkeypatch.setattr(stats.request_log, "total_request_count", lambda: 82)
+    monkeypatch.setattr(stats.fingerprint_service, "summary_counts", lambda: {
+        "fingerprints": 18,
+        "unique_devices": 6,
+        "tcp_fingerprints": 237,
+    })
+    monkeypatch.setattr(stats.fingerprint_service, "disguise_summary", lambda: {
+        "total_devices": 6,
+        "disguised": 1,
+        "roaming": 0,
+        "devices": [],
+    })
+    monkeypatch.setattr(stats.graph_intel, "summary", lambda: {
+        "campaigns": 4,
+        "disguised": 0,  # deliberately stale campaign snapshot
+        "contradiction": 2,
+        "generated_at": "2026-07-13T20:15:37+00:00",
+    })
+    monkeypatch.setattr(stats.selfplay_service, "summary", lambda: None)
+
+    result = stats.landing_stats()
+
+    assert result["llm_models"] == 1
+    assert result["disguised"] == 1
+    assert result["campaigns"] == 4
+    assert result["contradictions"] == 2
+    assert result["intel_generated_at"] == "2026-07-13T20:15:37+00:00"
+
+
 # --- fingerprint_service ---------------------------------------------------
 def test_fingerprint_viewer_falls_back_without_tcp_table_and_scores_rows(monkeypatch):
     """When tcp_fingerprints is missing the viewer retries without the TCP join and
@@ -177,9 +225,10 @@ def test_fingerprint_summary_degrades_when_db_unavailable(monkeypatch):
 
 def test_disguise_summary_groups_by_device_and_flags_identity_rotation(monkeypatch):
     """disguise_summary flags identity rotation (engine/OS changes) as disguised and
-    network rotation as roaming, while every legitimate shape — a browser auto-update,
-    a second same-engine browser, iOS shells, Docker-gateway renumbering, dual-stack,
-    v6 privacy churn — stays unflagged; it degrades to empty when the DB is absent."""
+    broad network rotation as roaming, while every legitimate shape — a browser
+    auto-update, a second same-engine browser, iOS shells, Docker-gateway
+    renumbering, dual-stack, v6 privacy churn, and 2-3-network commuting — stays
+    unflagged; it degrades to empty when the DB is absent."""
     from app.services import fingerprint_service
 
     EDGE149 = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -217,10 +266,16 @@ def test_disguise_summary_groups_by_device_and_flags_identity_rotation(monkeypat
         # have minted a different fp_id) -> disguised, rows go red.
         {"fp_id": "dev-spoof", "beacons": 9, "n_ua": 2, "n_ip": 1,
          "uas": [CHROME_WIN, FIREFOX_WIN], "ips": ["45.10.5.12"], "sites": ["site-001"]},
-        # One identity roaming public /24s (VPN hop or a commuting phone) ->
-        # roaming, rows only go orange.
-        {"fp_id": "dev-roam", "beacons": 7, "n_ua": 1, "n_ip": 3,
-         "uas": [CHROME_WIN], "ips": ["45.10.5.13", "45.10.9.1", "2600:1700:1:2::9"],
+        # One identity commuting across three public /24s (home/work/cellular)
+        # is ordinary mobility and must remain clean.
+        {"fp_id": "dev-commuter", "beacons": 7, "n_ua": 1, "n_ip": 3,
+         "uas": [CHROME_WIN], "ips": ["45.10.5.13", "45.10.9.1", "45.10.12.7"],
+         "sites": ["site-001"]},
+        # Four public /24s crosses the campaign-aligned roaming guard -> rows
+        # are surfaced as suspicious, but never malicious on this basis alone.
+        {"fp_id": "dev-roam", "beacons": 7, "n_ua": 1, "n_ip": 4,
+         "uas": [CHROME_WIN],
+         "ips": ["45.10.5.13", "45.10.9.1", "45.10.12.7", "45.10.18.4"],
          "sites": ["site-001"]},
     ]}
 
@@ -237,6 +292,8 @@ def test_disguise_summary_groups_by_device_and_flags_identity_rotation(monkeypat
         f"exactly the spoof and the roamer should be flagged, got {sorted(flagged)}"
     assert flagged["dev-spoof"]["basis"] == "identities"
     assert flagged["dev-roam"]["basis"] == "networks"
+    assert flagged["dev-roam"]["n_net"] == 4
+    assert "dev-commuter" not in flagged
     assert out["disguised"] == 1 and out["roaming"] == 1
     # Identity-based disguise sorts above network roaming.
     assert out["devices"][0]["fp_id"] == "dev-spoof"

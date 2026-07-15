@@ -11,6 +11,14 @@ server {
     # `server { listen 80; server_name <names>; return 301 https://$host$request_uri; }`.
     listen 80;
     listen 443 ssl;
+{% if proxy.tls_fullchain is defined and proxy.tls_key is defined %}
+    # Publicly-trusted certificate (Let's Encrypt, managed by
+    # scripts/setup-letsencrypt.sh). Overrides the self-signed wildcard
+    # inherited from nginx.conf's http{} scope; the wildcard still backs the
+    # catch-all and the *.localhost alias.
+    ssl_certificate     {{ proxy.tls_fullchain }};
+    ssl_certificate_key {{ proxy.tls_key }};
+{% endif %}
     # Browsers resolve *.localhost to loopback, so this branded alias gives
     # operators a usable local URL that still enters nginx and reaches all_visits.
     # proxy.server_aliases (a list, optional; global in all.yml or per-site) adds
@@ -41,6 +49,14 @@ server {
         proxy_connect_timeout 200ms;
         proxy_read_timeout 1s;
         proxy_pass http://$fp_upstream:8000$request_uri;
+    }
+
+    # ACME (Let's Encrypt) HTTP-01 challenge files, written by the certbot
+    # container into the shared webroot volume. Listed before `location /` so
+    # challenge requests never reach the Flask backend and are never mirrored
+    # into all_visits (the mirror lives only inside `location /`).
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
     }
 
     location / {

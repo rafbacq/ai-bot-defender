@@ -71,6 +71,9 @@ services:
       SMTP_EMAIL: ${SMTP_EMAIL:-}
       SMTP_APP_PASSWORD: ${SMTP_APP_PASSWORD:-}
       SESSION_HTTPS_ONLY: ${SESSION_HTTPS_ONLY:-false}
+      # Optional org-wide TOTP enrollment force. False keeps MFA self-service;
+      # already-enrolled users are challenged at login either way.
+      REQUIRE_2FA: ${REQUIRE_2FA:-false}
     working_dir: ${PWD}
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     volumes:

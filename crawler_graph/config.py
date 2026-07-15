@@ -101,6 +101,12 @@ DISGUISE_MIN_NETBLOCKS = int(os.environ.get("INTEL_DISGUISE_MIN_NETBLOCKS", "2")
 # person plausibly roams (home + work + cellular ~= 3). A commuting phone is a
 # single stitched device on 2-3 ASNs at casual volume and must not be flagged.
 DISGUISE_DEVICE_MIN_ASNS = int(os.environ.get("INTEL_DISGUISE_DEVICE_MIN_ASNS", "4"))
+# Keep the per-device roaming signal aligned with the campaign-level ASN guard:
+# 2-3 public networks under one identity is ordinary human mobility, while a
+# wider footprint is sufficiently unusual to surface for review.
+DISGUISE_DEVICE_ROAM_MIN_NETBLOCKS = int(os.environ.get(
+    "INTEL_DISGUISE_DEVICE_ROAM_MIN_NETBLOCKS", "4"
+))
 # Score weights for each kind of cross-layer contradiction (higher = stronger
 # bot/disguise signal). The OS contradiction (claimed UA OS vs the TCP/IP kernel
 # inference) is the spoof-resistant headline signal.

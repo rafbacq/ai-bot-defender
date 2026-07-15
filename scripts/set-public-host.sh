@@ -73,6 +73,12 @@ sed -E -i "s|^(  base_domain: )\"[^\"]*\"|\\1\"$BASE_DOMAIN\"|" "$ALL_YML"
 sed -E -i "s|^(  server_aliases: )\[[^]]*\]|\\1[$ALIASES]|" "$ALL_YML"
 log "updated $ALL_YML"
 
+# Keep the admin vhost's canonical name on the same base domain.
+if [ -f proxy/admin.d/admin.conf ]; then
+    sed -E -i "s|server_name admin\.[^;]*;|server_name admin.$BASE_DOMAIN;|g" proxy/admin.d/admin.conf
+    log "updated proxy/admin.d/admin.conf server_name -> admin.$BASE_DOMAIN"
+fi
+
 # Warn about per-site canonical overrides this script deliberately never touches.
 for f in configs/sites/*.yaml; do
     [ -e "$f" ] || continue
@@ -94,7 +100,10 @@ upsert() {
 }
 upsert PROXY_BASE_DOMAIN "$BASE_DOMAIN"
 upsert PROXY_EXTRA_SAN "$EXTRA_SAN"
-log "updated $ENV_FILE (PROXY_BASE_DOMAIN, PROXY_EXTRA_SAN)"
+# The control center's canonical public URL follows the base domain (used in
+# invitation emails and shown on the admin console).
+upsert APP_BASE_URL "https://admin.$BASE_DOMAIN"
+log "updated $ENV_FILE (PROXY_BASE_DOMAIN, PROXY_EXTRA_SAN, APP_BASE_URL)"
 
 # --- 3. TLS cert -------------------------------------------------------------
 if [ -s "$CRT" ] && openssl x509 -in "$CRT" -noout -ext subjectAltName 2>/dev/null \
@@ -135,8 +144,16 @@ for f in "${site_files[@]}"; do
     if grep -q 'server_name:' "$f"; then
         host=$(sed -nE 's/^ *server_name: *"?([^"]*)"?.*/\1/p' "$f" | head -1)
     fi
-    code_http=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Host: $host" http://localhost/ || true)
-    code_https=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' --resolve "$host:443:127.0.0.1" "https://$host/" || true)
+    # The playbook just recreated the site's web container; give it up to 30s
+    # to boot before calling the site broken (a fresh Flask + DB connect takes
+    # a few seconds, and nginx 502s until then).
+    code_http=000; code_https=000
+    for _ in 1 2 3 4 5 6; do
+        code_http=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Host: $host" http://localhost/ || true)
+        code_https=$(curl -sk -m 10 -o /dev/null -w '%{http_code}' --resolve "$host:443:127.0.0.1" "https://$host/" || true)
+        [ "$code_http" = "200" ] && [ "$code_https" = "200" ] && break
+        sleep 5
+    done
     if [ "$code_http" = "200" ] && [ "$code_https" = "200" ]; then
         log "OK  $host  (http $code_http, https $code_https)"
     else
@@ -151,3 +168,10 @@ for f in "${site_files[@]}"; do
     sid=$(basename "$f" .yaml)
     log "  http://$sid.$BASE_DOMAIN/   https://$sid.$BASE_DOMAIN/"
 done
+log "  control center: https://admin.$BASE_DOMAIN/"
+
+if grep -q '^  tls_fullchain:' "$ALL_YML"; then
+    log "NOTE: a Let's Encrypt cert is wired in but was issued for the PREVIOUS"
+    log "hostnames — run scripts/setup-letsencrypt.sh now to reissue for the new"
+    log "ones (until then browsers see a name mismatch on the trusted cert)."
+fi

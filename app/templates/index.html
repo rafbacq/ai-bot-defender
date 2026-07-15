@@ -14,24 +14,29 @@
     <h2 class="section-title">At a glance</h2>
     <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
         {% set cells = [
-            ('Websites live', 'sites_live'),
-            ('LLM models', 'llm_models'),
-            ('Queries run', 'queries_completed'),
-            ('Leaks detected', 'matches_found'),
-            ('Requests logged', 'requests_logged'),
-            ('Device fingerprints', 'device_fingerprints'),
-            ('Campaigns', 'campaigns'),
-            ('Disguised', 'disguised'),
-            ('Contradictions', 'contradictions'),
-            ('Robust detector AUC', 'robust_auc'),
+            ('Websites routed', 'sites_live', 'live'),
+            ('Models ready', 'llm_models', 'live configuration'),
+            ('Queries run', 'queries_completed', 'live'),
+            ('Leaks detected', 'matches_found', 'live'),
+            ('Requests logged', 'requests_logged', 'live'),
+            ('Device fingerprints', 'device_fingerprints', 'live'),
+            ('Campaigns', 'campaigns', 'last analysis'),
+            ('Disguised devices', 'disguised', 'live'),
+            ('Contradictory campaigns', 'contradictions', 'last analysis'),
+            ('Robust detector AUC', 'robust_auc', 'last training'),
         ] %}
-        {% for label, key in cells %}
-        <div class="stat">
-            <div class="stat__value" data-stat="{{ key }}">{% set v = stats[key] %}{{ v if v is not none else '—' }}</div>
+        {% for label, key, source in cells %}
+        <div class="stat" title="Source: {{ source }}">
+            <div class="stat__value" data-stat="{{ key }}" aria-live="polite">{% set v = stats[key] %}{{ v if v is not none else '—' }}</div>
             <div class="stat__label">{{ label }}</div>
+            <div class="muted" style="font-size:10px;margin-top:2px">{{ source }}</div>
         </div>
         {% endfor %}
     </div>
+    <p class="muted" style="font-size:12px;margin:10px 0 0">
+        <span id="stats-refresh-status">Live counters refresh every 5 seconds.</span>
+        Campaign and contradiction counts update when traffic analysis is run.
+    </p>
 </section>
 
 <!-- Navigation -->
@@ -43,7 +48,7 @@
                 <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6"/><path d="M10 3v5.5L4.5 18a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 8.5V3"/><path d="M7 14h10"/></svg>
             </span>
             <h3>LLM Forensics</h3>
-            <p>Probe target models for canary leaks, then date and prove when they ingested your content.</p>
+            <p>Probe target models for canary leaks, then gather evidence about whether and when they encountered your content.</p>
             <span class="nav-card__cta">Run forensics →</span>
         </a>
         <a href="/sites" class="nav-card">
@@ -86,10 +91,10 @@
     <h2 class="section-title">How detection works</h2>
     <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {% set steps = [
-            ('1', 'Seed', 'Each honeypot serves unique fake facts (canary tokens) per visitor, keyed by User-Agent and ASN.'),
+            ('1', 'Seed', 'Each honeypot serves unique fake facts (canary tokens) per visitor or device, falling back to User-Agent and ASN when no device identifier is available.'),
             ('2', 'Log', 'The reverse proxy mirrors every request into one database, so you see which crawlers visited.'),
             ('3', 'Probe', 'The console asks target LLMs about a page’s subject using adversarial retrieval prompts.'),
-            ('4', 'Match', 'Answers are compared to the canary tokens — high overlap proves the model ingested the page.'),
+            ('4', 'Match', 'Answers are compared to the canary tokens — high overlap is evidence that the model retained or retrieved the page’s content.'),
         ] %}
         {% for n, title, body in steps %}
         <div class="step">
@@ -104,18 +109,54 @@
 
 {% block scripts %}
 <script>
-  // Keep the headline numbers current without a full reload.
-  async function refreshStats() {
-    try {
-      const res = await fetch('/api/stats', { cache: 'no-store' });
-      if (!res.ok) return;
-      const data = await res.json();
-      document.querySelectorAll('[data-stat]').forEach(el => {
-        const v = data[el.dataset.stat];
-        el.textContent = (v === null || v === undefined) ? '—' : v;
-      });
-    } catch (_) {}
-  }
-  setInterval(refreshStats, 10000);
+  // Keep live headline numbers current without a full reload. Self-scheduling
+  // after each response avoids overlapping database requests if one refresh is
+  // slow. Hidden tabs wait; returning to the page refreshes immediately.
+  (function () {
+    const POLL_MS = 5000;
+    const status = document.getElementById('stats-refresh-status');
+    let inFlight = false;
+    let timer = null;
+
+    async function refreshStats() {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const res = await fetch('/api/stats', {
+          cache: 'no-store',
+          headers: { 'Accept': 'application/json' },
+        });
+        if (!res.ok) throw new Error('stats request failed');
+        const data = await res.json();
+        document.querySelectorAll('[data-stat]').forEach(el => {
+          const v = data[el.dataset.stat];
+          const next = (v === null || v === undefined) ? '—' : String(v);
+          if (el.textContent !== next) el.textContent = next;
+        });
+        if (status) status.textContent = `Live counters updated ${new Date().toLocaleTimeString()}.`;
+      } catch (_) {
+        if (status) status.textContent = 'Live refresh unavailable; retrying shortly.';
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    function scheduleNext() {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(async function () {
+        if (!document.hidden) await refreshStats();
+        scheduleNext();
+      }, POLL_MS);
+    }
+
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) refreshStats();
+    });
+    window.addEventListener('focus', refreshStats);
+
+    // Do not wait for the first interval: the database may have changed between
+    // the server-side render and this script becoming ready.
+    refreshStats().finally(scheduleNext);
+  })();
 </script>
 {% endblock %}

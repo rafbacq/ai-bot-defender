@@ -20,6 +20,7 @@ from email.mime.text import MIMEText
 from passlib.context import CryptContext
 
 from .. import config
+from . import totp_service
 
 
 class AuthError(ValueError):
@@ -29,15 +30,28 @@ class AuthError(ValueError):
 _pwd_context = CryptContext(
     schemes=["bcrypt"], deprecated="auto", bcrypt__truncate_error=True
 )
+# Verified against instead of returning early when the identifier doesn't exist,
+# so a login attempt costs one bcrypt either way — response timing no longer
+# reveals whether a username or email is registered.
+_DUMMY_HASH = _pwd_context.hash("timing-equalizer-not-a-real-password")
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,49}$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_INVALID_LOGIN = "Invalid username, email, or password."
 
 _signup_attempts: dict[str, deque[float]] = defaultdict(deque)
 _login_attempts: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+_totp_attempts: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+_admin_attempts: dict[str, deque[float]] = defaultdict(deque)
 _rate_lock = threading.Lock()
 
 SIGNUP_LIMIT, SIGNUP_WINDOW = 5, 60
 LOGIN_LIMIT, LOGIN_WINDOW = 10, 60
+# 6-digit codes have a 1-in-10^6 guess chance; 10 tries/min makes online
+# brute force hopeless within a code's 90s validity window.
+TOTP_LIMIT, TOTP_WINDOW = 10, 60
+# The admin console guards deploy/approval powers with one shared secret, so
+# its brute-force budget is the strictest: 5 attempts per 5 minutes per IP.
+ADMIN_LIMIT, ADMIN_WINDOW = 5, 300
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -69,6 +83,11 @@ def _get_conn() -> sqlite3.Connection:
         "CREATE UNIQUE INDEX IF NOT EXISTS users_username_nocase "
         "ON users(username COLLATE NOCASE)"
     )
+    # Additive migration for databases created before TOTP support (mirrors the
+    # collector's ADD COLUMN IF NOT EXISTS pattern; SQLite needs the pragma check).
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    if "totp_secret" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN totp_secret TEXT")
     return conn
 
 
@@ -89,6 +108,21 @@ def _normalize_username(username: str) -> str:
     return value
 
 
+def _normalize_login_identifier(identifier: str) -> tuple[str, str]:
+    """Return (kind, normalized value) for a username-or-email login field.
+
+    Login validation is intentionally generic: format errors must not help an
+    attacker distinguish an account lookup from a bad credential attempt.
+    """
+    value = (identifier or "").strip()
+    try:
+        if "@" in value:
+            return "email", _normalize_email(value)
+        return "username", _normalize_username(value)
+    except AuthError:
+        raise AuthError(_INVALID_LOGIN) from None
+
+
 def _check_rate_limit(bucket, key, limit: int, window: int) -> bool:
     now = time.monotonic()
     with _rate_lock:
@@ -106,6 +140,67 @@ def _reset_rate_limits() -> None:
     with _rate_lock:
         _signup_attempts.clear()
         _login_attempts.clear()
+        _totp_attempts.clear()
+        _admin_attempts.clear()
+
+
+def admin_login_allowed(ip: str) -> bool:
+    """Rate-gate attempts at the shared administrator secret (per source IP)."""
+    return _check_rate_limit(_admin_attempts, ip or "unknown", ADMIN_LIMIT, ADMIN_WINDOW)
+
+
+def get_totp_secret(username: str) -> str | None:
+    """Return the user's enrolled TOTP secret, or None when not enrolled."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT totp_secret FROM users WHERE username = ? COLLATE NOCASE",
+            (username,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row and row[0] else None
+
+
+def set_totp_secret(username: str, secret: str) -> None:
+    """Persist a verified enrollment (called only after the user proves a code)."""
+    conn = _get_conn()
+    try:
+        updated = conn.execute(
+            "UPDATE users SET totp_secret = ? WHERE username = ? COLLATE NOCASE",
+            (secret, username),
+        )
+        if updated.rowcount != 1:
+            raise AuthError("Unknown account.")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_totp_secret(username: str) -> None:
+    """Remove a user's TOTP enrollment after their current code is verified."""
+    conn = _get_conn()
+    try:
+        updated = conn.execute(
+            "UPDATE users SET totp_secret = NULL "
+            "WHERE username = ? COLLATE NOCASE",
+            (username,),
+        )
+        if updated.rowcount != 1:
+            raise AuthError("Unknown account.")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def verify_totp_login(username: str, code: str, ip: str) -> None:
+    """Check a login-time TOTP code, with its own per-(user, IP) rate limit."""
+    key = (username.casefold(), ip or "unknown")
+    if not _check_rate_limit(_totp_attempts, key, TOTP_LIMIT, TOTP_WINDOW):
+        raise AuthError("Too many code attempts -- try again in a minute.")
+    secret = get_totp_secret(username)
+    if not secret or not totp_service.verify_code(secret, code):
+        raise AuthError("That code isn't valid. Enter the current 6-digit code.")
 
 
 def _send_email(to_email: str, subject: str, body: str) -> bool:
@@ -292,22 +387,33 @@ def create_account(
     return normalized_username
 
 
-def verify_login(username: str, password: str, ip: str) -> str:
-    """Verify credentials and return the username exactly as it was registered."""
-    normalized_username = _normalize_username(username)
-    key = (normalized_username.casefold(), ip or "unknown")
-    if not _check_rate_limit(_login_attempts, key, LOGIN_LIMIT, LOGIN_WINDOW):
-        raise AuthError("Too many login attempts -- try again in a minute.")
-
+def verify_login(identifier: str, password: str, ip: str) -> str:
+    """Verify a username or approved account email; return canonical username."""
+    identifier_kind, normalized_identifier = _normalize_login_identifier(identifier)
     conn = _get_conn()
     try:
-        row = conn.execute(
-            "SELECT username, password_hash FROM users "
-            "WHERE username = ? COLLATE NOCASE",
-            (normalized_username,),
-        ).fetchone()
+        if identifier_kind == "email":
+            # Account emails are normalized before storage and can enter this
+            # table only by consuming an administrator-approved email record.
+            row = conn.execute(
+                "SELECT username, password_hash FROM users WHERE email = ?",
+                (normalized_identifier,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT username, password_hash FROM users "
+                "WHERE username = ? COLLATE NOCASE",
+                (normalized_identifier,),
+            ).fetchone()
     finally:
         conn.close()
+
+    # Both aliases for a known account share one rate-limit bucket, preventing
+    # username+email login support from doubling an attacker's guess budget.
+    rate_identifier = row[0].casefold() if row else normalized_identifier.casefold()
+    key = (rate_identifier, ip or "unknown")
+    if not _check_rate_limit(_login_attempts, key, LOGIN_LIMIT, LOGIN_WINDOW):
+        raise AuthError("Too many login attempts -- try again in a minute.")
 
     valid = False
     if row is not None:
@@ -315,6 +421,12 @@ def verify_login(username: str, password: str, ip: str) -> str:
             valid = _pwd_context.verify(password or "", row[1])
         except (TypeError, ValueError):
             valid = False
+    else:
+        # Burn the same bcrypt cost for unknown identifiers (see _DUMMY_HASH).
+        try:
+            _pwd_context.verify(password or "", _DUMMY_HASH)
+        except (TypeError, ValueError):
+            pass
     if not valid:
-        raise AuthError("Invalid username or password.")
+        raise AuthError(_INVALID_LOGIN)
     return row[0]

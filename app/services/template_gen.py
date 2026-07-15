@@ -655,18 +655,44 @@ def _stream_generation_job(job_id, type_id, gen_dir, timeout):
     _finish_job(job_id, ok, output, installed)
 
 
+_HEAD_OPEN_RE = re.compile(r"(<head\b[^>]*>)", re.IGNORECASE)
 _HEAD_CLOSE_RE = re.compile(r"</head>", re.IGNORECASE)
 
 
 def _with_fingerprint_beacon(html):
-    """Ensure the page loads /js/fp.js (the Layer-1 fingerprint beacon + the
-    __abd_fp stable-canary cookie — the contract every deployed scraper<N>.html
-    honors; see CLAUDE.md 'Device fingerprinting'). The generator's HTML shell
-    predates that layer, so inject the one-line tag before </head> on install."""
-    if "fp.js" in html:
+    """Keep every installed page fingerprinted and usable on mobile browsers.
+
+    The generator predates both the Layer-1 beacon and the public site's shared
+    responsive stylesheet.  Add the same-origin head assets when a generated or
+    edited template omits them.  Malformed fragments without a real ``<head>``
+    are left alone so ``save_template`` can retain its existing warning path.
+    """
+    if not _HEAD_OPEN_RE.search(html) or not _HEAD_CLOSE_RE.search(html):
         return html
-    return _HEAD_CLOSE_RE.sub(
-        '<script src="/js/fp.js" defer></script>\n</head>', html, count=1)
+
+    lower = html.lower()
+    head_assets = []
+    if not re.search(r"<meta\b[^>]*\bcharset\s*=", html, re.IGNORECASE):
+        head_assets.append('<meta charset="utf-8">')
+    if not re.search(
+            r"<meta\b[^>]*\bname\s*=\s*(['\"])viewport\1", html,
+            re.IGNORECASE):
+        head_assets.append(
+            '<meta name="viewport" content="width=device-width, initial-scale=1, '
+            'viewport-fit=cover">')
+    if "/css/site.css" not in lower:
+        head_assets.append('<link rel="stylesheet" href="/css/site.css?v=1">')
+
+    if head_assets:
+        html = _HEAD_OPEN_RE.sub(
+            lambda match: match.group(1) + "\n" + "\n".join(head_assets),
+            html,
+            count=1,
+        )
+    if "fp.js" not in lower:
+        html = _HEAD_CLOSE_RE.sub(
+            '<script src="/js/fp.js" defer></script>\n</head>', html, count=1)
+    return html
 
 
 def _read_varlist(path):

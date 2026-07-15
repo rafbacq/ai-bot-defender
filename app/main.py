@@ -1,7 +1,9 @@
 """AI Bot Defender — unified FastAPI web application.
 
 Routes:
-    GET/POST /login             Sign in to an approved local account
+    GET/POST /login             Sign in by username or approved account email
+    GET  /account               Manage the signed-in account's optional TOTP 2FA
+    GET/POST /account/2fa/*     Set up, enable, or disable account TOTP
     GET/POST /signup            Create an account from a one-time approval
     GET  /request-access        Link to the external access-request form
     GET/POST /admin/approve     Review-approved email administration
@@ -52,7 +54,7 @@ from . import config
 from .services import (
     auth_service, fingerprint_service, graph_intel, keys_service, provenance_service,
     querying_service, request_log, run_manager, selfplay_service, sites, stats,
-    template_gen,
+    template_gen, totp_service,
 )
 
 app = FastAPI(title="AI Bot Defender")
@@ -60,7 +62,7 @@ app.mount("/static", StaticFiles(directory=str(config.STATIC_DIR)), name="static
 templates = Jinja2Templates(directory=str(config.TEMPLATE_DIR))
 
 
-def _css_version():
+def _css_version(*_a, **_k):
     """mtime of app.css, used to cache-bust the stylesheet link. The CSS is served
     from the bind mount (it changes without a rebuild/restart), and browsers happily
     reuse a cached copy — a stale sheet is how the /logs severity tints once shipped
@@ -79,6 +81,8 @@ templates.env.globals["css_version"] = _css_version
 # wraps the guard and request.session is already populated when the guard runs.
 _PUBLIC_PATHS = frozenset({
     "/login",
+    "/login/2fa",
+    "/login/setup-2fa",
     "/signup",
     "/request-access",
     "/logout",
@@ -98,6 +102,21 @@ def _safe_next_url(value: str | None) -> str:
     if parsed.scheme or parsed.netloc or any(ch in value for ch in "\r\n"):
         return "/"
     return value
+
+
+def _request_ip(request: Request) -> str:
+    """The real client address, for rate-limit keying.
+
+    Behind the admin nginx vhost every request arrives from the proxy
+    container's address, which would collapse all public visitors into one
+    rate-limit bucket (and let one attacker starve everyone). nginx sets
+    X-Real-IP to the true client and only nginx (or a trusted SSH tunnel
+    user hitting the loopback port directly) can reach this app, so the
+    header is trustworthy here — honeypot visitors have no path to this vhost.
+    """
+    return request.headers.get("x-real-ip") or (
+        request.client.host if request.client else "unknown"
+    )
 
 
 def _is_authenticated(request: Request) -> bool:
@@ -172,7 +191,17 @@ def index(request: Request):
 
 @app.get("/api/stats")
 def api_stats():
-    return JSONResponse(stats.landing_stats())
+    # This endpoint exists solely for the overview's live counters. Explicit
+    # response headers prevent a browser, tunnel, or future reverse proxy from
+    # serving a previous snapshot even if the caller forgets fetch(no-store).
+    return JSONResponse(
+        stats.landing_stats(),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 # --- Site Configurator -----------------------------------------------------
@@ -281,6 +310,11 @@ def logs_page(
     page_size: int = 100,
     ok: str = "",
 ):
+    # Keep the rendered page metadata in lockstep with fetch_requests(), which
+    # applies these same safety bounds internally. Otherwise a hand-edited query
+    # can serve one page size while displaying and dividing by another.
+    page = max(1, page)
+    page_size = min(500, max(25, page_size))
     error = None
     data = {"total": 0, "last_24h": 0, "latest_ts": None, "rows": []}
     options = {"sites": [], "methods": []}
@@ -943,6 +977,13 @@ def admin_approve_page(request: Request):
 
 @app.post("/admin/login")
 def admin_login(request: Request, admin_secret: str = Form(...)):
+    if not auth_service.admin_login_allowed(_request_ip(request)):
+        return templates.TemplateResponse(
+            request,
+            "admin_login.html",
+            {"error": "Too many attempts — try again in a few minutes."},
+            status_code=429,
+        )
     if not _admin_secret_matches(admin_secret):
         return templates.TemplateResponse(
             request,
@@ -1014,7 +1055,7 @@ def signup_submit(
     password: str = Form(...),
     institution: str = Form(...),
 ):
-    ip = request.client.host if request.client else "unknown"
+    ip = _request_ip(request)
     try:
         canonical_username = auth_service.create_account(
             username, email, password, institution, ip
@@ -1034,9 +1075,7 @@ def signup_submit(
             },
             status_code=400,
         )
-    request.session.clear()
-    request.session["username"] = canonical_username
-    return RedirectResponse("/", status_code=303)
+    return _begin_second_factor(request, canonical_username, "/")
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -1059,7 +1098,7 @@ def login_submit(
     next: str = Form("/"),
 ):
     destination = _safe_next_url(next)
-    ip = request.client.host if request.client else "unknown"
+    ip = _request_ip(request)
     try:
         canonical_username = auth_service.verify_login(username, password, ip)
     except auth_service.AuthError as exc:
@@ -1069,9 +1108,210 @@ def login_submit(
             {"error": str(exc), "next": destination, "username": username},
             status_code=400,
         )
+    return _begin_second_factor(request, canonical_username, destination)
+
+
+def _complete_login(request: Request, username: str, destination: str):
     request.session.clear()
-    request.session["username"] = canonical_username
+    request.session["username"] = username
     return RedirectResponse(destination, status_code=303)
+
+
+def _begin_second_factor(request: Request, username: str, destination: str):
+    """Password (or a fresh signup) accepted — decide the second step.
+
+    Enrolled users must present a TOTP code; un-enrolled users are walked
+    through enrollment when REQUIRE_2FA is on. The pending_* session keys are
+    NOT a login: the auth guard only honors session["username"], which is set
+    exclusively by _complete_login after the second factor passes.
+    """
+    request.session.clear()
+    if auth_service.get_totp_secret(username):
+        request.session["pending_2fa_user"] = username
+        request.session["pending_next"] = destination
+        return RedirectResponse("/login/2fa", status_code=303)
+    if config.REQUIRE_2FA:
+        request.session["pending_setup_user"] = username
+        request.session["pending_setup_secret"] = totp_service.generate_secret()
+        request.session["pending_next"] = destination
+        return RedirectResponse("/login/setup-2fa", status_code=303)
+    return _complete_login(request, username, destination)
+
+
+@app.get("/login/2fa", response_class=HTMLResponse)
+def twofactor_page(request: Request):
+    if not request.session.get("pending_2fa_user"):
+        return RedirectResponse("/login", status_code=303)
+    return templates.TemplateResponse(request, "twofactor.html", {"error": ""})
+
+
+@app.post("/login/2fa")
+def twofactor_submit(request: Request, code: str = Form(...)):
+    username = request.session.get("pending_2fa_user")
+    if not username:
+        return RedirectResponse("/login", status_code=303)
+    destination = _safe_next_url(request.session.get("pending_next"))
+    try:
+        auth_service.verify_totp_login(username, code, _request_ip(request))
+    except auth_service.AuthError as exc:
+        return templates.TemplateResponse(
+            request, "twofactor.html", {"error": str(exc)}, status_code=400
+        )
+    return _complete_login(request, username, destination)
+
+
+@app.get("/login/setup-2fa", response_class=HTMLResponse)
+def twofactor_setup_page(request: Request):
+    username = request.session.get("pending_setup_user")
+    secret = request.session.get("pending_setup_secret")
+    if not (username and secret):
+        return RedirectResponse("/login", status_code=303)
+    return templates.TemplateResponse(
+        request,
+        "twofactor_setup.html",
+        {
+            "error": "",
+            "secret": secret,
+            "otpauth_uri": totp_service.provisioning_uri(secret, username),
+        },
+    )
+
+
+@app.post("/login/setup-2fa")
+def twofactor_setup_submit(request: Request, code: str = Form(...)):
+    username = request.session.get("pending_setup_user")
+    secret = request.session.get("pending_setup_secret")
+    if not (username and secret):
+        return RedirectResponse("/login", status_code=303)
+    destination = _safe_next_url(request.session.get("pending_next"))
+    if not totp_service.verify_code(secret, code):
+        return templates.TemplateResponse(
+            request,
+            "twofactor_setup.html",
+            {
+                "error": "That code didn't match. Scan the QR code (or re-enter "
+                "the secret) in your authenticator app and try the current code.",
+                "secret": secret,
+                "otpauth_uri": totp_service.provisioning_uri(secret, username),
+            },
+            status_code=400,
+        )
+    # Persist only after the user proves their authenticator produces valid
+    # codes — a mis-scanned secret must never lock the account.
+    auth_service.set_totp_secret(username, secret)
+    return _complete_login(request, username, destination)
+
+
+def _account_context(username: str, *, error: str = "", ok: str = ""):
+    """Shared, freshly-read account state for the page and POST error paths."""
+    return {
+        "active_page": "account",
+        "username": username,
+        "twofactor_enabled": bool(auth_service.get_totp_secret(username)),
+        "error": error,
+        "ok": ok,
+    }
+
+
+def _account_setup_context(username: str, secret: str, *, error: str = ""):
+    """Render context for voluntary setup, isolated from login-time enrollment."""
+    return {
+        "active_page": "account",
+        "error": error,
+        "secret": secret,
+        "otpauth_uri": totp_service.provisioning_uri(secret, username),
+        "setup_action": "/account/2fa/enable",
+        "submit_label": "Enable two-factor",
+        "cancel_url": "/account",
+    }
+
+
+@app.get("/account", response_class=HTMLResponse)
+def account_page(request: Request, ok: str = ""):
+    username = request.session.get("username")
+    if not username:
+        return RedirectResponse("/login", status_code=303)
+    return templates.TemplateResponse(
+        request, "account.html", _account_context(username, ok=ok)
+    )
+
+
+@app.get("/account/2fa/setup", response_class=HTMLResponse)
+def account_twofactor_setup_page(request: Request):
+    username = request.session.get("username")
+    if not username:
+        return RedirectResponse("/login", status_code=303)
+    if auth_service.get_totp_secret(username):
+        request.session.pop("account_setup_secret", None)
+        return RedirectResponse("/account", status_code=303)
+
+    # This key is deliberately distinct from pending_setup_secret: account
+    # enrollment happens inside an authenticated session and must never be
+    # mistaken for a login-time forced-enrollment session.
+    secret = totp_service.generate_secret()
+    request.session["account_setup_secret"] = secret
+    return templates.TemplateResponse(
+        request,
+        "twofactor_setup.html",
+        _account_setup_context(username, secret),
+    )
+
+
+@app.post("/account/2fa/enable")
+def account_twofactor_enable(request: Request, code: str = Form(...)):
+    username = request.session.get("username")
+    if not username:
+        return RedirectResponse("/login", status_code=303)
+    if auth_service.get_totp_secret(username):
+        request.session.pop("account_setup_secret", None)
+        return RedirectResponse("/account", status_code=303)
+
+    secret = request.session.get("account_setup_secret")
+    if not secret:
+        return RedirectResponse("/account/2fa/setup", status_code=303)
+    if not totp_service.verify_code(secret, code):
+        return templates.TemplateResponse(
+            request,
+            "twofactor_setup.html",
+            _account_setup_context(
+                username,
+                secret,
+                error=(
+                    "That code didn't match. Scan the QR code (or re-enter "
+                    "the secret) in your authenticator app and try the current code."
+                ),
+            ),
+            status_code=400,
+        )
+
+    auth_service.set_totp_secret(username, secret)
+    request.session.pop("account_setup_secret", None)
+    return RedirectResponse("/account?ok=enabled", status_code=303)
+
+
+@app.post("/account/2fa/disable")
+def account_twofactor_disable(request: Request, code: str = Form(...)):
+    username = request.session.get("username")
+    if not username:
+        return RedirectResponse("/login", status_code=303)
+    if not auth_service.get_totp_secret(username):
+        return RedirectResponse("/account", status_code=303)
+
+    try:
+        # Reuse the login verifier so disable attempts share the same strict
+        # per-account/IP online-guess budget as the login challenge.
+        auth_service.verify_totp_login(username, code, _request_ip(request))
+    except auth_service.AuthError as exc:
+        return templates.TemplateResponse(
+            request,
+            "account.html",
+            _account_context(username, error=str(exc)),
+            status_code=400,
+        )
+
+    auth_service.clear_totp_secret(username)
+    request.session.pop("account_setup_secret", None)
+    return RedirectResponse("/account?ok=disabled", status_code=303)
 
 
 @app.post("/logout")

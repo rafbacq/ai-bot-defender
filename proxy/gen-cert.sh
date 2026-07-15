@@ -28,7 +28,7 @@ CERT_DIR="${CERT_DIR:-/certs}"
 BASE_DOMAIN="${BASE_DOMAIN:-dukecodeplus.example}"
 LOCAL_BASE_DOMAIN="${LOCAL_BASE_DOMAIN:-dukecodeplus.localhost}"
 # Optional extra subjectAltName entries, comma-separated, in openssl syntax
-# (e.g. "IP:18.206.209.106" so https://<raw public IP>/ matches the cert too).
+# (e.g. "IP:44.216.255.139" so https://<raw public IP>/ matches the cert too).
 EXTRA_SAN="${EXTRA_SAN:-}"
 CRT="$CERT_DIR/wildcard.crt"
 KEY="$CERT_DIR/wildcard.key"

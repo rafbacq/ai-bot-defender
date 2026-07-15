@@ -6,7 +6,7 @@
     <div class="page-head">
         <span class="eyebrow">Welcome back</span>
         <h1>Log in</h1>
-        <p>Use your approved AI Bot Defender account.</p>
+        <p>Use your username or the approved email on your AI Bot Defender account.</p>
     </div>
 
     <section class="card card--pad auth-card">
@@ -19,9 +19,11 @@
         <form method="post" action="/login" class="auth-form">
             <input type="hidden" name="next" value="{{ next }}">
             <label>
-                <span class="field-label">Username</span>
+                <span class="field-label">Username or approved email</span>
                 <input class="input" type="text" name="username" value="{{ username }}"
-                       required maxlength="50" autocomplete="username" autofocus>
+                       required maxlength="254" autocomplete="username" inputmode="email"
+                       autocapitalize="none" spellcheck="false" autofocus>
+                <span class="help">Enter the username you chose or the email approved for this account.</span>
             </label>
             <label>
                 <span class="field-label">Password</span>

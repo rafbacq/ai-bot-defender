@@ -83,6 +83,10 @@ node_modules
 
 package.json
 package-lock.json
+# The app's browser CSS build is intentionally reproducible even though older
+# root-level Node manifests remain machine-local.
+!frontend/package.json
+!frontend/package-lock.json
 botdefenderjunethirty.txt
 SIGNIN_README.md
 AI-Bot-Defender-Research-Roadmap.tex

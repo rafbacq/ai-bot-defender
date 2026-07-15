@@ -1,0 +1,10 @@
+{
+  "name": "ai-bot-defender-frontend",
+  "private": true,
+  "scripts": {
+    "build:css": "tailwindcss -c tailwind.config.js -i tailwind.input.css -o ../app/static/css/tailwind.css --minify && touch ../app/static/css/app.css"
+  },
+  "devDependencies": {
+    "tailwindcss": "3.4.17"
+  }
+}

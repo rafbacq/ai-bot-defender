@@ -175,6 +175,30 @@ def test_logs_page_wires_in_traffic_fingerprints_and_campaigns(app_main):
     assert ctx["disguise"]["disguised"] == 1
 
 
+def test_logs_page_clamps_pagination_to_the_service_bounds(app_main, monkeypatch):
+    """Hand-edited pagination cannot desync displayed counts from served rows."""
+    main, rendered = app_main
+    calls = []
+
+    def fetch_requests(**kwargs):
+        calls.append(kwargs)
+        return {
+            "total": 501,
+            "last_24h": 1,
+            "latest_ts": "2026-06-01T00:00:00+00:00",
+            "rows": [],
+        }
+
+    monkeypatch.setattr(main.request_log, "fetch_requests", fetch_requests)
+    main.logs_page(object(), page=-9, page_size=9999)
+    ctx = rendered[-1][1]
+
+    assert calls[0]["page"] == 1 and calls[0]["page_size"] == 500
+    assert ctx["filters"]["page"] == 1 and ctx["filters"]["page_size"] == 500
+    assert ctx["page_count"] == 2
+    assert main._css_version("stale-template-arg") >= 0
+
+
 def test_forensics_page_merges_detection_and_provenance(app_main):
     """The consolidated forensics page exposes the shared model pool and recent
     detection + provenance investigations."""
@@ -192,6 +216,9 @@ def test_json_stats_and_csv_export_endpoints(app_main):
     main, _ = app_main
     stats = main.api_stats()
     assert stats.body and stats.media_type == "application/json"
+    assert stats.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
+    assert stats.headers["pragma"] == "no-cache"
+    assert stats.headers["expires"] == "0"
 
     csv_resp = main.logs_export()
     assert csv_resp.media_type == "text/csv"

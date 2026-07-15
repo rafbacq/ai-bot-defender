@@ -273,9 +273,11 @@ def summary_counts():
 #     shells share WebKit) are ONE identity; a second engine, another claimed
 #     OS, a headed->HeadlessChrome flip, a tool, or a bot UA is a real second
 #     identity. This basis is the actual disguise — the rows go red.
-#   * ``basis="networks"`` — one identity seen from >=2 public network blocks.
-#     That shape is ALSO a phone hopping Wi-Fi/LTE, a commuter, or a privacy
-#     VPN, so it only marks the rows suspicious (orange), never malicious.
+#   * ``basis="networks"`` — one identity seen from at least
+#     ``DISGUISE_DEVICE_ROAM_MIN_NETBLOCKS`` public network blocks, matching the
+#     campaign-level mobility guard. A phone hopping Wi-Fi/LTE, a commuter, or
+#     a privacy VPN commonly spans 2-3 blocks, so only a wider footprint marks
+#     the rows suspicious (orange), never malicious.
 #     Blocks are counted per address family (max of v4 /24s and v6 /48s — a
 #     dual-stack line is one network, and v6 privacy-extension suffix rotation
 #     stays inside its /48); private/loopback/CGNAT sources don't count at all,
@@ -340,10 +342,12 @@ def disguise_summary(limit=50, max_age=0):
     *candidates* (>=2 raw UA strings or >=2 distinct IPs); the decisive tests run
     here in Python — the normalized identity count (a browser that merely
     auto-updated or a second same-engine browser is ONE identity) and the public
-    per-family netblock count (Docker-gateway renumbering, dual-stack, and v6
-    privacy suffixes never count as rotation). ``basis="identities"`` devices are
-    the real disguise (rows go malicious); ``basis="networks"`` devices merely
-    roam (rows go suspicious). Degrades to empty when the table doesn't exist yet.
+    per-family netblock count (Docker-gateway renumbering, dual-stack, v6
+    privacy suffixes, and normal 2-3-network mobility never count as rotation).
+    ``basis="identities"`` devices are the real disguise (rows go malicious);
+    ``basis="networks"`` requires at least
+    ``DISGUISE_DEVICE_ROAM_MIN_NETBLOCKS`` public blocks and merely roams (rows
+    go suspicious). Degrades to empty when the table doesn't exist yet.
 
     ``max_age`` (seconds) lets hot callers — the /logs page and its Prev/Next
     paging fragment — reuse a recent result instead of paying a psql shell-out
@@ -354,6 +358,9 @@ def disguise_summary(limit=50, max_age=0):
         return _DISGUISE_CACHE["data"]
     min_ua = getattr(_cg_config, "DISGUISE_MIN_UAS", 2) if _cg_config else 2
     min_net = getattr(_cg_config, "DISGUISE_MIN_NETBLOCKS", 2) if _cg_config else 2
+    roam_min = getattr(
+        _cg_config, "DISGUISE_DEVICE_ROAM_MIN_NETBLOCKS", 4
+    ) if _cg_config else 4
     sql = f"""
     WITH dev AS (
         SELECT fp_id,
@@ -387,7 +394,7 @@ def disguise_summary(limit=50, max_age=0):
             dev["n_net"] = _public_netblock_count(dev.get("ips"))
             if dev["n_identities"] >= min_ua:
                 dev["basis"] = "identities"
-            elif dev["n_net"] >= min_net:
+            elif dev["n_net"] >= roam_min:
                 dev["basis"] = "networks"
             else:
                 continue

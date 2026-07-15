@@ -27,7 +27,7 @@
                 <input class="input" type="text" name="username" value="{{ values.get('username', '') }}"
                        required maxlength="50" pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,49}"
                        autocomplete="username">
-                <span class="help">Letters, numbers, dots, hyphens, and underscores. You will use this username—not your email—to log in.</span>
+                <span class="help">Letters, numbers, dots, hyphens, and underscores. You can log in with this username or your approved email.</span>
             </label>
             <label>
                 <span class="field-label">Password</span>
@@ -48,7 +48,7 @@
         </form>
         <div class="auth-links">
             <p>Not approved yet? <a href="/request-access">Request access first</a>.</p>
-            <p>Already registered? <a href="/login">Log in with your username</a>.</p>
+            <p>Already registered? <a href="/login">Log in with your username or approved email</a>.</p>
         </div>
     </section>
 </div>

@@ -44,7 +44,7 @@
         <select class="input" name="site">
             <option {% if filters.site == 'All sites' %}selected{% endif %}>All sites</option>
             {% for s in options.sites %}
-            <option {% if filters.site == s %}selected{% endif %}>{{ s }}{% if s in active %} (active){% else %} (historical){% endif %}</option>
+            <option value="{{ s }}" {% if filters.site == s %}selected{% endif %}>{{ s }}{% if s in active %} (active){% else %} (historical){% endif %}</option>
             {% endfor %}
         </select>
     </div>
@@ -67,12 +67,12 @@
 </form>
 
 <div id="traffic" class="flex items-center justify-between mb-2">
-    <span class="muted" style="font-size:13px">Page {{ filters.page }} of {{ page_count }} · {{ data.rows|length }} rows · row color is the cross-layer verdict:
+    <span class="muted" style="font-size:13px"><span id="traffic-page-summary">Page {{ filters.page }} of {{ page_count }} · {{ data.rows|length }} rows</span> · row color is the cross-layer verdict:
         <span class="sev sev--clean">clean</span>
         <span class="sev sev--suspicious">suspicious — verify</span>
         <span class="sev sev--malicious">malicious</span>
         (hover a row for the reason, Detail for the evidence)</span>
-    <a class="btn btn--ghost btn--sm"
+    <a id="csv-export" class="btn btn--ghost btn--sm"
        href="/logs/export.csv?site={{ filters.site|urlencode }}&method={{ filters.method|urlencode }}&search={{ filters.search|urlencode }}&page={{ filters.page }}&page_size={{ filters.page_size }}">
         Download CSV
     </a>
@@ -361,12 +361,19 @@
         var prev = document.getElementById('pager-prev');
         var next = document.getElementById('pager-next');
         var ind = document.getElementById('pager-indicator');
+        var summary = document.getElementById('traffic-page-summary');
+        var csv = document.getElementById('csv-export');
         var prevP = page > 1 ? page - 1 : 1, nextP = page < pageCount ? page + 1 : pageCount;
         prev.setAttribute('data-page', prevP); prev.href = urlForPage(prevP).full + '#traffic';
         prev.classList.toggle('is-disabled', page <= 1);
         next.setAttribute('data-page', nextP); next.href = urlForPage(nextP).full + '#traffic';
         next.classList.toggle('is-disabled', page >= pageCount);
         ind.textContent = page + ' / ' + pageCount;
+        if (summary) {
+          var rowCount = tbody.querySelectorAll('[data-detail-toggle]').length;
+          summary.textContent = 'Page ' + page + ' of ' + pageCount + ' · ' + rowCount + ' rows';
+        }
+        if (csv) csv.href = '/logs/export.csv?' + urlForPage(page).search;
       }
       function loadPage(page, push) {
         page = Math.max(1, Math.min(page, pageCount));

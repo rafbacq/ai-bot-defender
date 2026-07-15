@@ -57,6 +57,14 @@ SESSION_HTTPS_ONLY = os.environ.get("SESSION_HTTPS_ONLY", "false").strip().lower
 }
 SESSION_MAX_AGE = 14 * 24 * 60 * 60
 
+# Optional organization-wide force for TOTP enrollment. Keep this false for
+# self-service opt-in: enrolled users are still challenged at every login, while
+# un-enrolled users can enable 2FA from /account whenever they choose. An
+# organization may set it true to force un-enrolled users through setup at login.
+REQUIRE_2FA = os.environ.get("REQUIRE_2FA", "false").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
 USERS_DB = Path(os.environ.get("USERS_DB", str(CONFIGS_DIR / "users.db")))
 
 INSTITUTIONS = (

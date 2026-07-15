@@ -303,7 +303,7 @@
             <input class="input mb-2" type="file" name="responses_file" accept=".xlsx,.xlsm,.csv">
             <p class="help" style="margin-top:0">Spreadsheet with <span class="mono">Model</span> and <span class="mono">Responses</span> columns — or paste inline:</p>
             {% for i in range(3) %}
-            <div class="grid gap-2 mb-2" style="grid-template-columns: 160px 1fr">
+            <div class="manual-response-row grid gap-2 mb-2">
                 <input class="input" name="manual_model" placeholder="Model{% if i == 0 %} (e.g. ERNIE){% endif %}">
                 <textarea class="input" name="manual_response" rows="2" placeholder="Its response to the prompt"></textarea>
             </div>
@@ -320,7 +320,7 @@
         <p class="muted" style="font-size:12.5px">Score served vs. never-served watermark docs with Min-K%/Min-K%++
            and test the gap — statistical proof of training membership without any regurgitation. The offline demo
            (mock backend) shows served docs test as <em>member</em> and controls do not.</p>
-        <div class="flex items-end gap-3">
+        <div class="flex flex-wrap items-end gap-3">
             <div><label class="field-label">Watermark docs</label><input class="input" name="n" value="24" style="width:110px"></div>
             <div><label class="field-label">Seed</label><input class="input" name="seed" placeholder="optional" style="width:100px"></div>
             <button class="btn btn--ghost">Run demo</button>

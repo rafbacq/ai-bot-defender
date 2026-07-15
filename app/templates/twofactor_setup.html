@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Set up two-factor · AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="auth-shell">
+    <div class="page-head">
+        <span class="eyebrow">Protect your account</span>
+        <h1>Set up two-factor authentication</h1>
+        <p>Use an authenticator app (Google Authenticator, Authy, 1Password, …)
+           to add a second login factor to your account.</p>
+    </div>
+
+    <section class="card card--pad auth-card">
+        {% if error %}
+        <div class="notice notice--err auth-notice" role="alert">
+            <div class="notice__title">Unable to enable</div>
+            <div>{{ error }}</div>
+        </div>
+        {% endif %}
+
+        <ol class="auth-steps" style="margin: 0 0 1rem 1.25rem; display: grid; gap: .35rem;">
+            <li>Scan the QR code below with your authenticator app
+                (or add the secret manually).</li>
+            <li>Enter the 6-digit code the app shows to finish.</li>
+        </ol>
+
+        <div style="display: flex; justify-content: center; margin-bottom: 1rem;">
+            <div id="qr" style="background: #fff; padding: 12px; border-radius: 8px;"></div>
+        </div>
+
+        <p style="text-align: center; margin-bottom: 1rem;">
+            <span class="field-label">Manual entry secret</span><br>
+            <code style="user-select: all; word-break: break-all;">{{ secret }}</code>
+        </p>
+
+        <form method="post" action="{{ setup_action|default('/login/setup-2fa') }}" class="auth-form">
+            <label>
+                <span class="field-label">Code from your app</span>
+                <input class="input" type="text" name="code" required
+                       inputmode="numeric" pattern="[0-9 ]*" minlength="6" maxlength="7"
+                       autocomplete="one-time-code" placeholder="123456" autofocus>
+            </label>
+            <button type="submit" class="btn btn--primary btn--block">{{ submit_label|default('Enable two-factor') }}</button>
+        </form>
+        <p class="auth-links"><a href="{{ cancel_url|default('/login') }}">Cancel</a></p>
+    </section>
+</div>
+
+{# Client-side QR render of the otpauth:// URI. If the CDN is unreachable the
+   manual-entry secret above still enrolls the authenticator app fine. #}
+<script src="https://cdn.jsdelivr.net/gh/davidshimjs/qrcodejs@master/qrcode.min.js"></script>
+<script>
+  (function () {
+    if (typeof QRCode === "undefined") return;
+    new QRCode(document.getElementById("qr"), {
+      text: {{ otpauth_uri | tojson }},
+      width: 180,
+      height: 180,
+      correctLevel: QRCode.CorrectLevel.M,
+    });
+  })();
+</script>
+{% endblock %}

@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Account · AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="auth-shell">
+    <div class="page-head">
+        <span class="eyebrow">Signed-in account</span>
+        <h1>{{ username }}</h1>
+        <p>Manage the second factor used when you log in.</p>
+    </div>
+
+    <section class="card card--pad auth-card">
+        {% if ok == 'enabled' %}
+        <div class="notice notice--ok auth-notice" role="status">
+            <div class="notice__title">Two-factor authentication enabled</div>
+            <div>Your next login will require a current authenticator code.</div>
+        </div>
+        {% elif ok == 'disabled' %}
+        <div class="notice notice--ok auth-notice" role="status">
+            <div class="notice__title">Two-factor authentication disabled</div>
+            <div>Your password is now sufficient to log in.</div>
+        </div>
+        {% endif %}
+
+        {% if error %}
+        <div class="notice notice--err auth-notice" role="alert">
+            <div class="notice__title">Unable to disable two-factor authentication</div>
+            <div>{{ error }}</div>
+        </div>
+        {% endif %}
+
+        <h2 class="auth-card__title">Two-factor authentication</h2>
+        {% if twofactor_enabled %}
+        <p><span class="sev sev--clean">On</span> Your authenticator app is required after every successful password login.</p>
+        <form method="post" action="/account/2fa/disable" class="auth-form">
+            <label>
+                <span class="field-label">Current authenticator code</span>
+                <input class="input" type="text" name="code" required
+                       inputmode="numeric" pattern="[0-9 ]*" minlength="6" maxlength="7"
+                       autocomplete="one-time-code" placeholder="123456">
+                <span class="help">Disabling an active enrollment always requires a current code.</span>
+            </label>
+            <button type="submit" class="btn btn--ghost btn--block">Disable two-factor</button>
+        </form>
+        {% else %}
+        <p><span class="sev sev--suspicious">Off</span> You currently log in with your password only.</p>
+        <a class="btn btn--primary btn--block" href="/account/2fa/setup">Set up two-factor</a>
+        {% endif %}
+    </section>
+</div>
+{% endblock %}

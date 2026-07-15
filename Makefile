@@ -1,13 +1,24 @@
-.PHONY: app app-build app-down app-logs app-dev playbook stack-up stack-down up-all down-all \
+.PHONY: frontend-css app app-build app-down app-logs app-dev playbook stack-up stack-down up-all down-all \
 	ensure-net net-down proxy proxy-build proxy-down proxy-logs intel intel-selftest provenance \
 	provenance-all test-suite selfplay-up selfplay-down selfplay-selftest \
-	selfplay-calibrate selfplay-train selfplay-coevolve selfplay-ingest set-public-host
+	selfplay-calibrate selfplay-train selfplay-coevolve selfplay-ingest set-public-host letsencrypt
 
 SITES := $(patsubst configs/sites/%.yaml,%,$(wildcard configs/sites/*.yaml))
 APP_COMPOSE := docker compose -f docker-compose.app.yml
 PROXY_COMPOSE := docker compose -f docker-compose.proxy.yml
 TRAINER_COMPOSE := docker compose -f docker-compose.app.yml --profile trainer
 ANSIBLE_PLAYBOOK := $(APP_COMPOSE) exec -T -w $(CURDIR)/ansible app ansible-playbook
+FRONTEND_INPUTS := frontend/tailwind.input.css frontend/tailwind.config.js \
+	frontend/package.json frontend/package-lock.json $(wildcard app/templates/*.html)
+
+# Compile responsive utility classes once and serve them from the app itself.
+# The generated file is tracked so production does not need Node at runtime;
+# this target only runs npm when a template or frontend build input changed.
+app/static/css/tailwind.css: $(FRONTEND_INPUTS)
+	npm --prefix frontend ci
+	npm --prefix frontend run build:css
+
+frontend-css: app/static/css/tailwind.css
 
 # --- Rebuild-only-when-needed bookkeeping ----------------------------------
 # `make app` / `make proxy` used to `up -d --build` on EVERY run, forcing a full
@@ -50,7 +61,7 @@ net-down:
 # just (re)start the container (code is picked up from the runtime bind mount,
 # so no rebuild is needed for code edits). Use `make app-build` to force a
 # rebuild after changing a requirements file / the Dockerfile.
-app: ensure-net
+app: frontend-css ensure-net
 	@if ! docker image inspect $(APP_IMAGE) >/dev/null 2>&1; then \
 		echo "==> Building app image (first run -- the slow one; reused afterwards)"; \
 		$(APP_COMPOSE) build app && mkdir -p $(STAMP_DIR) && touch $(APP_STAMP); \
@@ -67,7 +78,7 @@ app: ensure-net
 
 # Force a full rebuild of the app image, then start it. Run this after editing a
 # requirements file or the Dockerfile (the only changes a rebuild is needed for).
-app-build: ensure-net
+app-build: frontend-css ensure-net
 	$(APP_COMPOSE) build app
 	@mkdir -p $(STAMP_DIR) && touch $(APP_STAMP)
 	$(APP_COMPOSE) up -d
@@ -102,6 +113,7 @@ proxy: ensure-net
 		echo "==> Proxy images up to date -- starting without rebuild ('make proxy-build' to force)"; \
 	fi
 	$(PROXY_COMPOSE) up -d
+	@bash scripts/sync-tls-capture-netns.sh
 	@echo
 	@echo "Reverse proxy:  http://localhost:80  +  https://localhost:443  (route sites by Host header / TLS SNI)"
 
@@ -110,6 +122,7 @@ proxy-build: ensure-net
 	$(PROXY_COMPOSE) build
 	@mkdir -p $(STAMP_DIR) && touch $(PROXY_STAMP)
 	$(PROXY_COMPOSE) up -d
+	@bash scripts/sync-tls-capture-netns.sh
 	@echo
 	@echo "Reverse proxy (rebuilt):  http://localhost:80  +  https://localhost:443"
 
@@ -127,6 +140,13 @@ proxy-logs:
 # without an Elastic IP) or when a real domain is acquired.
 set-public-host:
 	@bash scripts/set-public-host.sh $(HOST)
+
+# Issue/refresh the publicly-trusted Let's Encrypt cert for every public
+# hostname (honeypot sites + admin control center) and wire nginx to it.
+# LE_DRY_RUN=1 for a staging dry-run. Re-run after adding a site or changing
+# the public host.
+letsencrypt:
+	@bash scripts/setup-letsencrypt.sh
 
 # --- Site deployment -------------------------------------------------------
 playbook: app

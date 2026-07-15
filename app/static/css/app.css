@@ -51,7 +51,13 @@
 
 * { box-sizing: border-box; }
 
-html, body { margin: 0; }
+html {
+  margin: 0;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+body { margin: 0; min-width: 0; }
+img, video, canvas { max-width: 100%; height: auto; }
 
 body {
   font-family: "Source Sans 3", system-ui, sans-serif;
@@ -229,7 +235,7 @@ h2.section-title { font-size: 13px; font-weight: 700; text-transform: uppercase;
 .chipstack { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
 
 /* ---------- Tables ---------- */
-.table-wrap { overflow: auto; }
+.table-wrap { overflow: auto; -webkit-overflow-scrolling: touch; }
 table.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .tbl th { text-align: left; font-weight: 700; color: var(--graphite); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; padding: 11px 12px; border-bottom: 2px solid var(--limestone); background: var(--whisper); position: sticky; top: 0; }
 .tbl td { padding: 11px 12px; border-bottom: 1px solid var(--limestone); vertical-align: top; }
@@ -299,13 +305,59 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .auth-decline { border-color: var(--copper); color: var(--copper); }
 .auth-decline:hover { border-color: var(--copper); color: var(--copper); }
 .auth-admin-help { margin-top: 14px; overflow-wrap: anywhere; }
+.manual-response-row { grid-template-columns: 160px minmax(0, 1fr); }
 
 @media (max-width: 760px) {
+  .wrap {
+    padding-left: 16px;
+    padding-right: 16px;
+    /* Keep controls clear of an iPhone notch in landscape; the first values
+       are fallbacks for older engines that do not understand env()/max(). */
+    padding-left: max(16px, env(safe-area-inset-left));
+    padding-right: max(16px, env(safe-area-inset-right));
+  }
+  .page { padding-top: 22px; padding-bottom: 40px; }
+  .page-head { margin-bottom: 22px; }
+  .page-head h1 { font-size: 24px; line-height: 1.18; }
+  .card--pad { padding: 18px; }
+  .stat { padding: 14px; min-width: 0; }
+  .stat__value { font-size: 26px; }
   .auth-admin-grid { grid-template-columns: 1fr; }
-  .site-header__inner { gap: 12px; }
+  .site-header__inner {
+    gap: 10px; height: auto; min-height: 60px;
+    padding-top: 8px; padding-bottom: 8px;
+  }
+  .brand { flex: none; }
   .brand__name, .main-nav__user { display: none; }
-  .main-nav { min-width: 0; overflow-x: auto; }
-  .main-nav__link { white-space: nowrap; padding-left: 9px; padding-right: 9px; }
+  .main-nav {
+    flex: 1; min-width: 0; overflow-x: auto; justify-content: flex-start;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  .main-nav::-webkit-scrollbar { display: none; }
+  .main-nav__link {
+    display: inline-flex; align-items: center; min-height: 44px;
+    white-space: nowrap; padding-left: 9px; padding-right: 9px;
+  }
+  .theme-toggle { width: 44px; height: 44px; min-width: 44px; margin-left: 0; }
+  .btn { min-height: 44px; }
+  /* iOS Safari zooms the viewport when a focused field is below 16px. */
+  .input, select.input, textarea.input { font-size: 16px; }
+  .keygrid, .dl-grid { grid-template-columns: minmax(0, 1fr); }
+  .segmented { max-width: 100%; overflow-x: auto; }
+  .genprog { padding: 17px; }
+  .genprog__head { gap: 10px; }
+  .genprog__pct { font-size: 1.8rem; }
+  .manual-response-row { grid-template-columns: minmax(0, 1fr); }
+  .site-footer {
+    padding-bottom: 20px;
+    padding-bottom: max(20px, env(safe-area-inset-bottom));
+  }
+}
+
+@media (max-width: 380px) {
+  .brand__mark { padding-left: 7px; padding-right: 7px; }
+  .main-nav { gap: 2px; }
+  .main-nav__link { padding-left: 7px; padding-right: 7px; font-size: 13px; }
 }
 
 /* ---------- Steps ---------- */

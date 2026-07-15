@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#012169">
     <script>
       // Apply the saved (or system) theme to <html> before first paint so the
       // page never flashes the wrong theme. The toggle handler (bottom of body)
@@ -21,32 +22,22 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,400;0,500;0,600;0,700;0,800&display=swap" rel="stylesheet">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-      // Tailwind handles layout utilities; the Duke-branded components live in app.css.
-      // Palette = official Duke Navy/Royal Blue + the extended palette (full strength only).
-      tailwind.config = {
-        theme: {
-          extend: {
-            colors: {
-              navy: '#012169', royal: '#00539B', prussian: '#005587', shale: '#0577B1',
-              copper: '#C84E00', persimmon: '#E89923', dandelion: '#FFD960',
-              piedmont: '#A1B70D', eno: '#339898', magnolia: '#1D6363', ironweed: '#993399',
-              hatteras: '#E2E6ED', whisper: '#F3F2F1', ginger: '#FCF7E5',
-              dogwood: '#988675', shackleford: '#DAD0C6',
-              iron: '#262626', graphite: '#666666', granite: '#B5B5B5', limestone: '#E5E5E5',
-            },
-            fontFamily: { sans: ['"Source Sans 3"', 'system-ui', 'sans-serif'] },
-          }
-        }
-      }
-    </script>
-    {# ?v=<mtime> busts the browser cache whenever app.css changes on disk. #}
-    <link rel="stylesheet" href="{{ url_for('static', path='css/app.css') }}?v={{ css_version() }}">
+    {#
+      Both stylesheets are local and root-relative on purpose. request.url_for()
+      produced an http:// URL behind the HTTPS nginx proxy, which mobile Safari
+      correctly blocked as mixed content. The compiled utility sheet replaces
+      Tailwind's runtime CDN script, so styling does not depend on third-party
+      JavaScript, content blockers, or an external network request.
+    #}
+    {# Use the no-argument helper for both links so this template remains safe
+       while an already-running worker still has the previous helper signature.
+       The frontend build touches app.css, making this shared version change. #}
+    <link rel="stylesheet" href="/static/css/tailwind.css?v={{ css_version() }}">
+    <link rel="stylesheet" href="/static/css/app.css?v={{ css_version() }}">
 </head>
 <body>
     {% set nav = [('home', '/', 'Overview'), ('sites', '/sites', 'Sites'), ('generator', '/generator', 'Generator'), ('traffic', '/logs', 'Crawler Analytics'), ('forensics', '/query', 'LLM Forensics'), ('selfplay', '/selfplay', 'Adversarial')] %}
-    {% set labels = {'sites': 'Site Configurator', 'generator': 'Template Generator', 'logs': 'Crawler Analytics', 'query': 'LLM Forensics', 'provenance': 'LLM Forensics', 'selfplay': 'Adversarial Self-Play'} %}
+    {% set labels = {'sites': 'Site Configurator', 'generator': 'Template Generator', 'logs': 'Crawler Analytics', 'query': 'LLM Forensics', 'provenance': 'LLM Forensics', 'selfplay': 'Adversarial Self-Play', 'account': 'Account'} %}
     {# A sub-view sets active_section (traffic|forensics) so its parent top-nav item
        highlights; pages that are their own top-nav item just fall back to active_page. #}
     {% set section = active_section | default(active_page) %}
@@ -68,11 +59,12 @@
                     <svg class="theme-toggle__sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
                 </button>
                 {% if request.session.get('username') %}
-                <span class="main-nav__user" title="Signed-in account">{{ request.session.get('username') }}</span>
+                <a href="/account" class="main-nav__user" title="Manage signed-in account">{{ request.session.get('username') }}</a>
                 <form method="post" action="/logout" class="main-nav__form">
                     <button type="submit" class="main-nav__link main-nav__button">Log out</button>
                 </form>
                 {% elif request.session.get('is_admin') %}
+                <a href="/admin/approve" class="main-nav__link">Admin approval</a>
                 <span class="main-nav__user">Access admin</span>
                 <form method="post" action="/logout" class="main-nav__form">
                     <button type="submit" class="main-nav__link main-nav__button">Lock</button>
@@ -80,6 +72,8 @@
                 {% else %}
                 <a href="/login" class="main-nav__link">Log in</a>
                 <a href="/request-access" class="main-nav__link">Request access</a>
+                <a href="/signup" class="main-nav__link">Create account</a>
+                <a href="/admin/approve" class="main-nav__link">Admin approval</a>
                 {% endif %}
             </nav>
         </div>

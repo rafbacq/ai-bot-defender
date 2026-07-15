@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Two-factor code · AI Bot Defender{% endblock %}
+
+{% block content %}
+<div class="auth-shell">
+    <div class="page-head">
+        <span class="eyebrow">Second factor</span>
+        <h1>Enter your code</h1>
+        <p>Open your authenticator app and enter the current 6-digit code.</p>
+    </div>
+
+    <section class="card card--pad auth-card">
+        {% if error %}
+        <div class="notice notice--err auth-notice" role="alert">
+            <div class="notice__title">Unable to verify</div>
+            <div>{{ error }}</div>
+        </div>
+        {% endif %}
+        <form method="post" action="/login/2fa" class="auth-form">
+            <label>
+                <span class="field-label">Authenticator code</span>
+                <input class="input" type="text" name="code" required
+                       inputmode="numeric" pattern="[0-9 ]*" minlength="6" maxlength="7"
+                       autocomplete="one-time-code" placeholder="123456" autofocus>
+            </label>
+            <button type="submit" class="btn btn--primary btn--block">Verify</button>
+        </form>
+        <p class="auth-links"><a href="/login">Back to login</a></p>
+    </section>
+</div>
+{% endblock %}

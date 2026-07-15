@@ -25,6 +25,10 @@ def isolated_auth(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SMTP_EMAIL", "")
     monkeypatch.setattr(config, "SMTP_APP_PASSWORD", "")
     monkeypatch.setattr(config, "ADMIN_SECRET", "test-admin-secret")
+    # config loads the machine-local .env (a public deployment sets
+    # REQUIRE_2FA=true there); pin the flag so these flow assertions are
+    # deterministic. The TOTP layer has its own dedicated test below.
+    monkeypatch.setattr(config, "REQUIRE_2FA", False)
     auth_service._reset_rate_limits()
     yield auth_service, users_db
     auth_service._reset_rate_limits()
@@ -44,6 +48,10 @@ def test_approval_signup_and_login_round_trip(isolated_auth):
     )
     assert username == "Researcher_1"
     assert auth.verify_login("researcher_1", "correct horse", "127.0.0.2") == username
+    assert (
+        auth.verify_login(" RESEARCHER@DUKE.EDU ", "correct horse", "127.0.0.2")
+        == username
+    )
 
     with sqlite3.connect(users_db) as conn:
         password_hash, stored_email = conn.execute(
@@ -57,8 +65,10 @@ def test_approval_signup_and_login_round_trip(isolated_auth):
     assert password_hash.startswith("$2")
     assert used == 1
 
-    with pytest.raises(auth.AuthError, match="Invalid username or password"):
+    with pytest.raises(auth.AuthError, match="Invalid username, email, or password"):
         auth.verify_login(username, "wrong password", "127.0.0.3")
+    with pytest.raises(auth.AuthError, match="Invalid username, email, or password"):
+        auth.verify_login(stored_email, "wrong password", "127.0.0.3")
     with pytest.raises(auth.AuthError, match="already been created"):
         auth.create_account(
             "someone_else", stored_email, "another pass", institution, "127.0.0.4"
@@ -103,6 +113,81 @@ def test_decline_revokes_an_unused_approval(isolated_auth):
     auth.approve_email("declined@example.edu", "Duke University")
     assert auth.decline_email("declined@example.edu") is False
     assert auth.is_approved("declined@example.edu") is None
+
+
+def test_approved_email_cannot_log_in_until_its_account_exists(isolated_auth):
+    """An unused approval is an invitation, not an account or login credential."""
+    auth, _ = isolated_auth
+    auth.approve_email("invited@example.edu", "Duke University")
+
+    with pytest.raises(auth.AuthError, match="Invalid username, email, or password"):
+        auth.verify_login("INVITED@EXAMPLE.EDU", "any password", "192.0.2.20")
+
+
+def test_username_and_email_share_login_rate_limit(isolated_auth, monkeypatch):
+    auth, _ = isolated_auth
+    auth.approve_email("limited@example.edu", "Duke University")
+    auth.create_account(
+        "limited_user",
+        "limited@example.edu",
+        "correct horse",
+        "Duke University",
+        "127.0.0.1",
+    )
+    monkeypatch.setattr(auth, "LOGIN_LIMIT", 1)
+
+    with pytest.raises(auth.AuthError, match="Invalid username, email, or password"):
+        auth.verify_login("limited_user", "wrong password", "198.51.100.8")
+    with pytest.raises(auth.AuthError, match="Too many login attempts"):
+        auth.verify_login("LIMITED@EXAMPLE.EDU", "correct horse", "198.51.100.8")
+
+
+def test_totp_second_factor_enrolls_and_gates_login(isolated_auth):
+    """The stdlib TOTP layer: RFC 6238 correctness, enrollment, login gating."""
+    import base64
+
+    from app.services import totp_service
+
+    auth, _ = isolated_auth
+
+    # RFC 6238 Appendix B vector (SHA-1): T=59s -> 94287082, last six 287082.
+    rfc_secret = base64.b32encode(b"12345678901234567890").decode().rstrip("=")
+    assert totp_service.verify_code(rfc_secret, "287082", window=0, at=59)
+    assert not totp_service.verify_code(rfc_secret, "000000", window=0, at=59)
+
+    auth.approve_email("totp@example.edu", "Duke University")
+    auth.create_account("totp_user", "totp@example.edu", "long enough", "Duke University", "127.0.0.1")
+    assert auth.get_totp_secret("totp_user") is None
+    # Email login must resolve to the canonical username before the unchanged
+    # TOTP/session flow looks up this account's second-factor enrollment.
+    assert (
+        auth.verify_login("TOTP@EXAMPLE.EDU", "long enough", "127.0.0.2")
+        == "totp_user"
+    )
+
+    secret = totp_service.generate_secret()
+    auth.set_totp_secret("totp_user", secret)
+    assert auth.get_totp_secret("TOTP_USER") == secret  # case-insensitive lookup
+
+    current = totp_service._hotp(secret, int(__import__("time").time() // 30))
+    auth.verify_totp_login("totp_user", current, "127.0.0.1")  # must not raise
+    with pytest.raises(auth.AuthError, match="isn't valid"):
+        auth.verify_totp_login("totp_user", "000000", "127.0.0.1")
+    # Guess budget: TOTP_LIMIT attempts/min per (user, IP), then a hard stop.
+    with pytest.raises(auth.AuthError, match="Too many code attempts"):
+        for _ in range(auth.TOTP_LIMIT + 1):
+            try:
+                auth.verify_totp_login("totp_user", "000000", "10.0.0.9")
+            except auth.AuthError as exc:
+                if "Too many" in str(exc):
+                    raise
+    uri = totp_service.provisioning_uri(secret, "totp_user")
+    assert uri.startswith("otpauth://totp/") and secret in uri
+
+    auth.clear_totp_secret("TOTP_USER")
+    assert auth.get_totp_secret("totp_user") is None
+    with pytest.raises(auth.AuthError, match="Unknown account"):
+        auth.clear_totp_secret("missing-user")
 
 
 @pytest.mark.parametrize(
@@ -173,6 +258,20 @@ async def test_auth_routes_and_guard_protect_existing_features(isolated_auth):
         "/logs?site=site-001&search=bot%20agent"
     ]
     assert (await main.auth_guard(request("/login"), reached)).body == b"reached"
+    assert (await main.auth_guard(request("/account"), reached)).status_code == 303
+
+    login_page = main.login_page(request("/login"))
+    login_html = login_page.body.decode()
+    assert "Username or approved email" in login_html
+    assert 'name="username"' in login_html
+    assert 'maxlength="254"' in login_html
+    for href, label in (
+        ("/login", "Log in"),
+        ("/request-access", "Request access"),
+        ("/signup", "Create account"),
+        ("/admin/approve", "Admin approval"),
+    ):
+        assert f'href="{href}" class="main-nav__link">{label}</a>' in login_html
 
     admin_session = {}
     admin_request = request("/admin/login", method="POST", session=admin_session)
@@ -218,3 +317,146 @@ async def test_auth_routes_and_guard_protect_existing_features(isolated_auth):
     assert login.status_code == 303
     assert login.headers["location"] == "/"
     assert login_session == {"username": "person"}
+
+    auth._reset_rate_limits()
+    email_login_session = {}
+    email_login = main.login_submit(
+        request("/login", method="POST", session=email_login_session),
+        "PERSON@EXAMPLE.EDU",
+        "strong password",
+        "/logs",
+    )
+    assert email_login.status_code == 303
+    assert email_login.headers["location"] == "/logs"
+    assert email_login_session == {"username": "person"}
+
+
+@pytest.mark.anyio
+async def test_account_totp_opt_in_challenge_and_verified_disable(isolated_auth):
+    """An account opts into TOTP, is challenged next login, then proves a code
+    before disabling; a never-enrolled account is not forced through setup."""
+    pytest.importorskip("fastapi")
+    from starlette.requests import Request
+    from app import main
+    from app.services import totp_service
+
+    auth, _ = isolated_auth
+
+    def request(path="/", *, method="GET", session=None):
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": method,
+            "scheme": "https",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 443),
+            "session": session if session is not None else {},
+            "app": main.app,
+            "router": main.app.router,
+        }
+        return Request(scope)
+
+    def current_code(secret):
+        return totp_service._hotp(secret, int(__import__("time").time() // 30))
+
+    def invalid_code(secret, code):
+        candidate = (int(code) + 1) % 1_000_000
+        while totp_service.verify_code(secret, f"{candidate:06d}"):
+            candidate = (candidate + 1) % 1_000_000
+        return f"{candidate:06d}"
+
+    auth.approve_email("opt-in@example.edu", "Duke University")
+    auth.create_account(
+        "opt_in_user",
+        "opt-in@example.edu",
+        "strong password",
+        "Duke University",
+        "127.0.0.1",
+    )
+
+    # REQUIRE_2FA is false in the fixture: a fresh account logs straight in.
+    session = {}
+    login = main.login_submit(
+        request("/login", method="POST", session=session),
+        "opt_in_user",
+        "strong password",
+        "/account",
+    )
+    assert login.status_code == 303 and login.headers["location"] == "/account"
+    assert session == {"username": "opt_in_user"}
+    assert b">Off<" in main.account_page(request("/account", session=session)).body
+
+    setup = main.account_twofactor_setup_page(
+        request("/account/2fa/setup", session=session)
+    )
+    assert setup.status_code == 200
+    secret = session["account_setup_secret"]
+    assert "pending_setup_secret" not in session
+    code = current_code(secret)
+
+    rejected_enable = main.account_twofactor_enable(
+        request("/account/2fa/enable", method="POST", session=session),
+        invalid_code(secret, code),
+    )
+    assert rejected_enable.status_code == 400
+    assert auth.get_totp_secret("opt_in_user") is None
+
+    enabled = main.account_twofactor_enable(
+        request("/account/2fa/enable", method="POST", session=session), code
+    )
+    assert enabled.status_code == 303
+    assert enabled.headers["location"] == "/account?ok=enabled"
+    assert auth.get_totp_secret("opt_in_user") == secret
+    assert session == {"username": "opt_in_user"}
+
+    # Enrollment changes the next password login into the existing challenge.
+    main.logout(request("/logout", method="POST", session=session))
+    challenged = main.login_submit(
+        request("/login", method="POST", session=session),
+        "opt-in@example.edu",
+        "strong password",
+        "/account",
+    )
+    assert challenged.status_code == 303
+    assert challenged.headers["location"] == "/login/2fa"
+    assert session == {"pending_2fa_user": "opt_in_user", "pending_next": "/account"}
+
+    challenge_code = current_code(secret)
+    completed = main.twofactor_submit(
+        request("/login/2fa", method="POST", session=session), challenge_code
+    )
+    assert completed.status_code == 303
+    assert session == {"username": "opt_in_user"}
+    assert b">On<" in main.account_page(request("/account", session=session)).body
+
+    rejected_disable = main.account_twofactor_disable(
+        request("/account/2fa/disable", method="POST", session=session),
+        invalid_code(secret, challenge_code),
+    )
+    assert rejected_disable.status_code == 400
+    assert auth.get_totp_secret("opt_in_user") == secret
+
+    disabled = main.account_twofactor_disable(
+        request("/account/2fa/disable", method="POST", session=session),
+        current_code(secret),
+    )
+    assert disabled.status_code == 303
+    assert disabled.headers["location"] == "/account?ok=disabled"
+    assert auth.get_totp_secret("opt_in_user") is None
+
+    # Once disabled, subsequent password login again completes directly.
+    main.logout(request("/logout", method="POST", session=session))
+    direct = main.login_submit(
+        request("/login", method="POST", session=session),
+        "opt_in_user",
+        "strong password",
+        "/",
+    )
+    assert direct.status_code == 303 and direct.headers["location"] == "/"
+    assert session == {"username": "opt_in_user"}

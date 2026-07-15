@@ -167,6 +167,8 @@ def test_edit_saves_text_and_preserves_canaries_and_beacon(isolated_app_config):
     assert "A tale of {{ var2 }} and {{ var5 }}." in stored
     # The fingerprint beacon dropped by the edit is re-injected on save.
     assert '<script src="/js/fp.js" defer></script>' in stored
+    assert '<meta name="viewport"' in stored
+    assert '<link rel="stylesheet" href="/css/site.css?v=1">' in stored
     assert info["canary_slots"] == [2, 5] and info["beacon_present"] is True
     assert '"type": "edit"' in (paths["history"] / "generations.jsonl").read_text(encoding="utf-8")
 
