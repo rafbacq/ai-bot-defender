@@ -114,6 +114,27 @@ def test_base_nav_links_to_the_current_top_level_pages(repo_root):
         assert href in base, f"base.html navigation is missing {href}"
 
 
+def test_frontend_uses_duke_watch_branding_and_logo(repo_root):
+    """Every rendered page inherits the new name, header logo, and favicon."""
+    templates_dir = repo_root / "app" / "templates"
+    templates = list(templates_dir.glob("*.html"))
+    rendered_text = "\n".join(path.read_text(encoding="utf-8") for path in templates)
+    base = (templates_dir / "base.html").read_text(encoding="utf-8")
+    index = (templates_dir / "index.html").read_text(encoding="utf-8")
+    logo = repo_root / "app" / "static" / "duke-watch-logo.png"
+
+    assert "AI Bot Defender" not in rendered_text
+    assert "Duke Watch" not in rendered_text
+    assert "Duke WATCH" in rendered_text
+    assert (
+        "<h1>Duke WATCH</h1>\n"
+        "    <p>WATCH stands for Web Attribution Through Canary Honeypots" in index
+    )
+    assert 'class="brand__logo" src="/static/duke-watch-logo.png"' in base
+    assert 'rel="icon" type="image/png" href="/static/duke-watch-logo.png"' in base
+    assert logo.exists() and logo.stat().st_size > 0
+
+
 def test_analytics_filters_and_ajax_pager_keep_visible_page_state(repo_root):
     """Site values, header counts, and CSV export must track AJAX pagination."""
     analytics = (repo_root / "app" / "templates" / "analytics.html").read_text(

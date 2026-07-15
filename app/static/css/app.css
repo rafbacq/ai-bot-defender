@@ -79,12 +79,11 @@ a:hover { text-decoration: underline; }
   display: flex; align-items: center; justify-content: space-between;
   height: 60px;
 }
-.brand { display: flex; align-items: center; gap: 12px; }
+.brand { display: flex; align-items: center; gap: 10px; }
 .brand:hover { text-decoration: none; }
-.brand__mark {
-  font-weight: 800; font-size: 15px; letter-spacing: .02em;
-  color: var(--navy); background: var(--white);
-  padding: 3px 9px; border-radius: 4px; line-height: 1;
+.brand__logo {
+  display: block; flex: none; width: 56px; height: 42px;
+  object-fit: cover; object-position: center;
 }
 .brand__name { color: var(--white); font-weight: 700; font-size: 17px; letter-spacing: .01em; }
 
@@ -521,7 +520,7 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 }
 
 @media (max-width: 380px) {
-  .brand__mark { padding-left: 7px; padding-right: 7px; }
+  .brand__logo { width: 50px; height: 38px; }
   .main-nav { gap: 2px; }
   .main-nav__link { padding-left: 7px; padding-right: 7px; font-size: 13px; }
 }

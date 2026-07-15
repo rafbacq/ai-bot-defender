@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}{{ 'Manual evaluation' if run and run.kind == 'manual' else 'Detection run' }} — AI Bot Defender{% endblock %}
+{% block title %}{{ 'Manual evaluation' if run and run.kind == 'manual' else 'Detection run' }} — Duke WATCH{% endblock %}
 
 {% set is_manual = (run and run.kind == 'manual') or (live and live.kind == 'manual') %}
 {% set is_live = live and live.present and not live.done %}
