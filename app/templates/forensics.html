@@ -64,14 +64,12 @@
 {% include '_background_job.html' %}
 
 <!-- KPIs -->
-<div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
+<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
     {% set metrics = [
         ('Detection runs', runs_summary.total_runs),
         ('Leaks detected', runs_summary.matches_found),
         ('Best score', runs_summary.best_score),
         ('Models', models_pool|length),
-        ('Anthropic key', 'yes' if prov_providers.anthropic else 'no'),
-        ('Membership', prov_providers.membership_backend),
     ] %}
     {% for label, value in metrics %}
     <div class="stat">
