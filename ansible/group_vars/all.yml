@@ -32,7 +32,10 @@ database:
 # Reverse proxy (nginx) + central logging. A single local nginx (:80) is the
 # only exposed entry point and routes to each site by Host header. Ansible
 # renders one server block per site into proxy.conf_dir and reloads (not
-# restarts) nginx. A site may override proxy.server_name in its yaml to use a
+# restarts) nginx. proxy.conf_dir is fixed to the host directory bind-mounted
+# by docker-compose.proxy.yml; validation rejects a different destination so a
+# route can never be marked published without nginx actually seeing it. A site
+# may override proxy.server_name in its yaml to use a
 # custom canonical address instead of the "<site_id>.<base_domain>" default.
 # Every site also receives a browser-friendly "<site_id>.<local_base_domain>" alias.
 proxy:
@@ -48,20 +51,32 @@ proxy:
   # ACME/Let's Encrypt.
   base_domain: "44.216.255.139.sslip.io"   # server_name = "{{ site_id }}.{{ proxy.base_domain }}"
   local_base_domain: "dukecodeplus.localhost"  # browser-resolvable local alias
-  # Extra server_name aliases every site answers on. The raw public IP is here
-  # so raw-IP visitors (scanners, curl http://<elastic-ip>/) reach a honeypot
-  # instead of the catch-all 444. NOTE: with more than one site deployed, nginx
-  # logs a conflicting-server-name warning and the alphabetically-first site
-  # wins the raw-IP traffic -- move this list into a single site's yaml then.
-  server_aliases: ["44.216.255.139"]
+  # Optional aliases shared by every site. Keep this empty: a shared raw-IP
+  # alias is ambiguous once more than one name-based vhost exists, causing
+  # nginx to pick the alphabetically first site and corrupt site attribution.
+  # Raw-IP and unknown-Host traffic belongs to nginx's unmatched 444 server.
+  # A truly site-specific alias can still be set in that site's proxy block.
+  server_aliases: []
   # Publicly-trusted cert (Let's Encrypt; managed by scripts/setup-letsencrypt.sh
   # — re-run it after adding a site or changing the base domain). When these two
   # keys are present every site's server block presents this cert instead of the
   # self-signed wildcard. Remove both keys + re-run the playbook to roll back.
   tls_fullchain: "/etc/letsencrypt/live/abd/fullchain.pem"
   tls_key: "/etc/letsencrypt/live/abd/privkey.pem"
+  # After a site has started and its final nginx route has been published,
+  # reconcile the shared certificate with the published canonical hostnames.
+  tls_auto_expand: true
   container: "proxy-nginx"
   conf_dir: "{{ project_root }}/proxy/conf.d"
+
+# Self-hosted monitoring. Per-site alert rules are rendered alongside the
+# other generated deployment artifacts and reloaded without restarting
+# Prometheus. A down monitoring stack never blocks a site deployment.
+monitoring:
+  enabled: true
+  prometheus_container: "mon-prometheus"
+  rules_dir: "{{ project_root }}/monitoring/alerts.d"
+  targets_dir: "{{ project_root }}/monitoring/targets.d"
 
 # Canary tokens. Each entry is a Python expression evaluated server-side
 # with `fake` (faker) in scope. The first 10 entries become var1..var10

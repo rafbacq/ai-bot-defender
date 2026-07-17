@@ -11,6 +11,7 @@ the claimed identity (UA / navigator.platform) contradicts the lower layers.
 import ipaddress
 import re
 import time
+from urllib.parse import unquote, urlsplit
 
 from . import logdb
 
@@ -61,13 +62,22 @@ def _select_sql(where_clause, page_size, offset, with_tcp=True):
     # later one — behind a NAT the "latest SYN from this IP" can be a *different
     # device's* kernel, which must not be glued onto this beacon). The join is
     # optional because tcp_fingerprints is created by the Zeek shipper and may not
-    # exist yet on a fresh stack. The 5s of forward slack absorbs clock skew
-    # between Zeek's packet timestamps and the collector's now().
-    tcp_select = "t.os_guess AS tcp_os, t.ja4t AS ja4t" if with_tcp else "NULL AS tcp_os, NULL AS ja4t"
+    # exist yet on a fresh stack. The lower bound prevents source-port reuse or an
+    # old same-IP SYN from contaminating a later visitor; 5s of forward slack
+    # absorbs clock skew between Zeek and the collector. A same-IP fallback remains
+    # visible, but ``tcp_match_exact = false`` prevents it from accusing this row.
+    tcp_select = (
+        "t.os_guess AS tcp_os, t.ja4t AS ja4t, t.tcp_match_exact"
+        if with_tcp else
+        "NULL AS tcp_os, NULL AS ja4t, NULL::boolean AS tcp_match_exact"
+    )
     tcp_join = (
-        "LEFT JOIN LATERAL (SELECT os_guess, ja4t FROM tcp_fingerprints tt "
-        "WHERE tt.src_ip = b.client_ip AND tt.ts <= b.ts + INTERVAL '5 seconds' "
-        "ORDER BY (tt.src_port = b.client_port) DESC NULLS LAST, tt.ts DESC LIMIT 1) t ON TRUE"
+        "LEFT JOIN LATERAL (SELECT os_guess, ja4t, "
+        "COALESCE(tt.src_port = b.client_port, FALSE) AS tcp_match_exact "
+        "FROM tcp_fingerprints tt WHERE tt.src_ip = b.client_ip "
+        "AND tt.ts BETWEEN b.ts - INTERVAL '5 minutes' AND b.ts + INTERVAL '5 seconds' "
+        "ORDER BY (tt.src_port = b.client_port) DESC NULLS LAST, "
+        "abs(extract(epoch FROM (tt.ts - b.ts))) ASC LIMIT 1) t ON TRUE"
         if with_tcp else ""
     )
     return f"""
@@ -135,16 +145,49 @@ def _ua_is_browser(ua):
     )
 
 
+def _ua_is_declared_crawler(ua):
+    if _known_crawlers is None:
+        return False
+    try:
+        return bool(_known_crawlers.is_declared_crawler(ua))
+    except Exception:
+        return False
+
+
+def _ua_looks_automated(ua):
+    if _known_crawlers is None:
+        return False
+    try:
+        return bool(_known_crawlers.looks_automated(ua))
+    except Exception:
+        return False
+
+
+def _is_document_request(row):
+    """Whether this row represents the honeypot document that can execute fp.js.
+
+    A missing beacon is meaningful only after a browser loads the HTML document.
+    Static assets, robots.txt, favicon requests, HEAD requests, and arbitrary probe
+    paths cannot execute the script themselves and must not receive a row-level
+    browser-no-JS score merely because they carry a browser-shaped User-Agent.
+    """
+    if str(row.get("method") or "").upper() != "GET":
+        return False
+    path, _query = _decoded_request_target(row.get("uri"))
+    return path == "/"
+
+
 def _verdict_for(row):
     """Run the shared consistency engine on one row — a browser fingerprint OR a
     plain request row that carries no beacon.
 
     Fingerprint presence is detected from the row itself (``fp_id``/``canvas_hash``)
     rather than assumed, so the engine's ``browser_no_js`` rule can finally fire for
-    a **browser-UA request that never executed JS** (a headless/agentic crawler — the
-    exact thing this system exists to catch). On a public IP such a row can also trip
-    the UA-vs-TCP-OS contradiction. Automation is left for the engine to decide from
-    the tells (strong/weak weighting) instead of pre-flagging it from the raw count."""
+    a **browser-UA document request that never executed JS** (a headless/agentic
+    crawler — the exact thing this system exists to catch). Resource rows that could
+    never execute fp.js are ineligible. On a public IP such a row can also trip the
+    UA-vs-TCP-OS contradiction. Automation is left for the engine to decide from the
+    tells (strong/weak weighting) instead of pre-flagging it from the raw count."""
     if _consistency is None:
         return None
     has_fp = bool(row.get("fp_id") or row.get("canvas_hash"))
@@ -161,10 +204,14 @@ def _verdict_for(row):
         "webgl_renderers": [row["webgl_renderer"]] if row.get("webgl_renderer") else [],
         "automation_score": auto.get("score") or 0,
         "automation_tells": {k: v for k, v in auto.items() if v is True},
-        "is_automated": False,  # the engine derives this from the tells now
+        # A transparent tool/scanner UA is independent evidence even without JS.
+        # Declared provider UAs are not in this marker list and remain separate.
+        "is_automated": _ua_looks_automated(ua),
         "is_browser": _ua_is_browser(ua),
+        "is_declared_crawler": _ua_is_declared_crawler(ua),
         "has_browser_fingerprint": has_fp,
-        "n_requests": 1,
+        "n_requests": 1 if _is_document_request(row) else 0,
+        "tcp_match_exact": row.get("tcp_match_exact"),
         "behavior_synthetic": bool(beh.get("synthetic")) if has_fp else False,
         "behavior_interacted": bool(beh.get("interacted")) if has_fp else False,
     }
@@ -191,27 +238,35 @@ verdict_for = _verdict_for
 # or a language/CMS the stack doesn't run is by definition probing, not browsing.
 #
 # Patterns are drawn from this deployment's own observed scan traffic plus the
-# standard scanner dictionaries (Androxgh0st `.env` sweeps, l9scan, zgrab). They
-# match against the URI PATH only (query stripped, case-folded). Legit honeypot
-# paths are allowlisted first so a real visit can never be tinted red.
+# standard scanner dictionaries (Androxgh0st `.env` sweeps, l9scan, zgrab). Path
+# and query signatures stay separate: exploit parameters in the query must be
+# visible, but an arbitrary benign root query must not trip a path-name rule.
 _SAFE_EXACT_PATHS = frozenset({
-    "/", "/favicon.ico", "/robots.txt", "/js/fp.js", "/__fpbeacon", "/sitemap.xml",
+    "/", "/favicon.ico", "/robots.txt", "/css/site.css", "/js/fp.js",
+    "/__fpbeacon", "/sitemap.xml",
+    "/sitemap-index.xml", "/sitemap_index.xml",
+    "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png",
 })
-_SAFE_PREFIXES = ("/css/", "/static/", "/.well-known/acme-challenge/")
+# Only ACME owns a legitimate variable path namespace. Application assets are
+# exact because this honeypot currently ships only /css/site.css and /js/fp.js;
+# blanket /css/ or /static/ allowlists hide scanner dictionary requests.
+_SAFE_PREFIXES = ("/.well-known/acme-challenge/",)
 _SAFE_EXACT_WELL_KNOWN = frozenset({"/.well-known/security.txt"})
 
 _PROBE_PATTERNS = [
     # --- Secrets / config / source-control / backup exfiltration ---
-    (r"\.env(\.|$|/|rc\b)", "probing for a secrets file (.env)"),
+    (r"\.env(?:$|[./_~-]|\d|rc\b)", "probing for a secrets file (.env)"),
     (r"\.git(/|$)|\.git/config|\.gitignore", "probing for an exposed .git repository"),
     (r"\.svn(/|$)|\.hg(/|$)|\.bzr(/|$)", "probing for an exposed source-control directory"),
     (r"\.(aws|ssh)(/|$)|id_rsa|id_dsa|id_ecdsa|id_ed25519|authorized_keys",
      "probing for cloud/SSH credentials"),
     (r"\.vscode/|\.idea/|sftp\.json", "probing for exposed IDE/deploy config"),
     (r"\.ds_store", "probing for a leaked .DS_Store directory listing"),
-    (r"wp-config\.php|configuration\.php|/config\.(json|xml|php|ya?ml)\b|/settings\.py",
+    (r"wp-config(?:-sample)?(?:\.[^/?]+)?|configuration\.php|"
+     r"/config\.(json|xml|php|ya?ml)\b|/settings\.py",
      "probing for an application config/credentials file"),
-    (r"credentials|secrets?\.(json|ya?ml|txt)|/dump\.sql|storage/logs|laravel\.log",
+    (r"credentials|secrets?\.(json|ya?ml|txt)|/dump\.sql|storage/logs|laravel\.log|"
+     r"(?:^|/)(?:\.netrc|\.pypirc|\.dev\.vars|firebase-debug\.log|debug\.log|error_log)(?:$|[/?])",
      "probing for credentials/log files"),
     (r"phpinfo|/server-status\b|/server-info\b|/_profiler\b|/actuator(/|$|\b)",
      "probing a debug/status endpoint that leaks internals"),
@@ -230,8 +285,39 @@ _PROBE_PATTERNS = [
      "hosting-panel/registry/console probe"),
     (r"/boaform|/cgi-bin/|/hnap1|/goform|/setup\.cgi|/currentsetting\.htm",
      "router/IoT device-exploit probe"),
-    # Matched on the PATH only (probe_reason strips the query first), so this stays
-    # to the dedicated resolver paths scanners hit and never trips a legit `/query`.
+    (r"/(?:\+webvpn\+|\+cscoe\+|dana-na|remote/login|sslvpnclient|global-protect)(?:/|$)",
+     "VPN-appliance attack-surface probe"),
+    (r"/(?:graphql(?:/|$)|api/(?:graphql|gql)(?:/|$)|grpc\.reflection\.)",
+     "GraphQL/gRPC service-discovery probe"),
+    (r"^/(?:api/swagger\.json|swagger-ui\.html|v2/api-docs|graphiql)/?$",
+     "API documentation/schema discovery probe"),
+    (r"^/_cat/indices/?$|^/app/kibana/?$",
+     "Elasticsearch/Kibana service-discovery probe"),
+    (r"^/(?:_environment|webroot/index\.php/_environment)/?$|"
+     r"^/debug/pprof/cmdline/?$",
+     "framework/runtime diagnostics probe"),
+    (r"/containers/json(?:/|$)", "Docker API discovery probe"),
+    (r"/developmentserver/metadatauploader(?:/|$)",
+     "development-server metadata probe"),
+    (r"/reportserver(?:/|$)|/debug/default/view(?:/|$)|/@vite/env(?:/|$)|"
+     r"/trace\.axd(?:/|$)|/telescope(?:/|$)",
+     "probing a debug/status endpoint that leaks internals"),
+    (r"/meta-inf/|docker-compose(?:\.[^/]+)?\.ya?ml$|/\.bash_history$|/\.npmrc$|"
+     r"/config/(?:production|development|staging)\.json$|/[^/]*service\.pwd$|"
+     r"(?:^|/)(?:dockerfile|procfile|serverless\.ya?ml)$|/functions/\.runtimeconfig\.json$",
+     "probing for an application config/credentials file"),
+    (r"/mcp(?:/|$)|/onvif(?:/|$)|/portal/redlion(?:/|$)",
+     "service/device-management discovery probe"),
+    (r"^/evox/about/?$|^/nmaplowercheck[^/]*$",
+     "scanner/device reconnaissance probe"),
+    (r"^/(?:administrator/components/com_jce/jce\.xml|"
+     r"administrator/manifests/packages/pkg_jce\.xml|"
+     r"plugins/editors/jce/jce\.xml)/?$",
+     "Joomla JCE extension-manifest probe"),
+    (r"^/wp-content/cache/breeze-extra(?:/|$)",
+     "WordPress Breeze cache-plugin probe"),
+    # Matched on the path only, so this stays confined to dedicated resolver
+    # endpoints and never trips a legitimate query parameter named `name`.
     (r"/dns-query\b|/resolve\b", "open-DNS-resolver abuse probe"),
     (r"\.(php|phtml|php5|asp|aspx|jsp|jspx|cgi|action)($|\?)",
      "requesting a server-side script this static stack does not run"),
@@ -240,8 +326,115 @@ _PROBE_PATTERNS = [
 ]
 _PROBE_PATTERNS = [(re.compile(p, re.IGNORECASE), r) for p, r in _PROBE_PATTERNS]
 
+_QUERY_PROBE_PATTERNS = [
+    (r"(?:^|[&;+])rest_route\s*=\s*/?(?:wp/|fluentsmtp/|gravitysmtp/|post-smtp/|wp-mail-smtp/)",
+     "WordPress API enumeration probe (this stack runs no WordPress)"),
+    (r"allow_url_include|auto_prepend_file|php://input",
+     "PHP-CGI argument-injection probe"),
+]
+_QUERY_PROBE_PATTERNS = [
+    (re.compile(pattern, re.IGNORECASE), reason)
+    for pattern, reason in _QUERY_PROBE_PATTERNS
+]
 
-def probe_reason(uri):
+_MAX_TARGET_CHARS = 16_384
+_DANGEROUS_METHODS = frozenset({"CONNECT", "TRACE"})
+_READ_METHODS = frozenset({"GET", "HEAD"})
+
+
+def _decoded_request_target(uri):
+    """Return a normalized ``(path, query)`` without raising on hostile input.
+
+    Two decode passes catch the common double-encoded traversal form without an
+    unbounded decoding loop.  The cap is defensive only—nginx's request-line limit
+    is already smaller—and keeps direct/unit callers from feeding huge strings to
+    the regular expressions.
+    """
+    if uri is None:
+        return "", ""
+    raw_target = str(uri).strip()[:_MAX_TARGET_CHARS]
+    if not raw_target:
+        return "", ""
+
+    # Split the *wire-level* delimiters before percent-decoding. Encoded `%23`
+    # and `%3f` bytes are path data, not fragment/query separators; decoding the
+    # whole target first let `/%23/.env` collapse to `/` and hid the probe.
+    try:
+        if "://" in raw_target:
+            parsed = urlsplit(raw_target)
+            raw_path, raw_query = parsed.path, parsed.query
+        else:
+            without_fragment = raw_target.split("#", 1)[0]
+            raw_path, marker, raw_query = without_fragment.partition("?")
+            if not marker:
+                raw_query = ""
+    except (TypeError, ValueError):
+        without_fragment = raw_target.split("#", 1)[0]
+        raw_path, marker, raw_query = without_fragment.partition("?")
+        if not marker:
+            raw_query = ""
+
+    def decode_component(value):
+        decoded = value
+        for _ in range(2):
+            next_value = unquote(decoded, errors="replace")
+            if next_value == decoded:
+                break
+            decoded = next_value
+        return decoded
+
+    path = decode_component(raw_path).replace("\\", "/")
+    query = decode_component(raw_query)
+    return (path or "/").strip().lower(), query.strip().lower()
+
+
+def _safe_path(path):
+    return (
+        path in _SAFE_EXACT_PATHS
+        or path in _SAFE_EXACT_WELL_KNOWN
+        or any(path.startswith(prefix) for prefix in _SAFE_PREFIXES)
+    )
+
+
+def target_assessment(uri, method=None):
+    """Classify the request target/method independently of client identity.
+
+    Returns a severity dictionary for a known malicious probe or an unexpected
+    route/method, and ``None`` for an allowed honeypot request.  The application
+    intentionally serves one document plus a small asset/ACME allowlist, so an
+    otherwise unknown route is worth review even when it misses a named exploit
+    signature; it is orange rather than red to preserve room for human typos.
+    """
+    path, query = _decoded_request_target(uri)
+    if not path:
+        return None
+    normalized_method = str(method or "").strip().upper()
+    has_traversal = ".." in path
+
+    for pattern, reason in _QUERY_PROBE_PATTERNS:
+        if pattern.search(query):
+            return {"level": "malicious", "reason": reason}
+    for pattern, reason in _PROBE_PATTERNS:
+        if pattern.search(path):
+            return {"level": "malicious", "reason": reason}
+    if has_traversal:
+        return {"level": "malicious",
+                "reason": "path-traversal attempt in the request URI"}
+    if normalized_method in _DANGEROUS_METHODS:
+        return {"level": "malicious",
+                "reason": f"unsupported high-risk HTTP method ({normalized_method})"}
+
+    if _safe_path(path):
+        allowed_methods = {"POST", "OPTIONS"} if path == "/__fpbeacon" else _READ_METHODS
+        if normalized_method and normalized_method not in allowed_methods:
+            return {"level": "suspicious",
+                    "reason": f"unsupported {normalized_method} request to {path}"}
+        return None
+
+    return {"level": "suspicious", "reason": f"unexpected honeypot route ({path})"}
+
+
+def probe_reason(uri, method=None):
     """Return a short reason if ``uri`` is a hostile scan target, else ``None``.
 
     Judges the request TARGET, independent of the client's claimed identity, so a
@@ -249,22 +442,9 @@ def probe_reason(uri):
     Legit honeypot paths (the served route, static assets, ACME) are allowlisted.
     Path traversal (``..``) is never allowlisted — it falls through to the patterns.
     """
-    if not uri:
-        return None
-    path = str(uri).split("?", 1)[0].split("#", 1)[0].strip().lower()
-    if not path:
-        return None
-    has_traversal = ".." in path
-    if not has_traversal:
-        if path in _SAFE_EXACT_PATHS or path in _SAFE_EXACT_WELL_KNOWN:
-            return None
-        if any(path.startswith(prefix) for prefix in _SAFE_PREFIXES):
-            return None
-    for pattern, reason in _PROBE_PATTERNS:
-        if pattern.search(path):
-            return reason
-    if has_traversal:
-        return "path-traversal attempt in the request URI"
+    assessment = target_assessment(uri, method)
+    if assessment and assessment["level"] == "malicious":
+        return assessment["reason"]
     return None
 
 
@@ -282,7 +462,8 @@ def severity_of(row):
         ``probe_reason``). The last one is judged from the target alone, so an
         honest-looking bot reaching for ``/.env`` is caught even when its identity
         is self-consistent. Certainly a bot.
-      * **suspicious** (orange) — a device roaming public networks under one
+      * **suspicious** (orange) — an unexpected route/method, or a device roaming
+        public networks under one
         identity (``net_roaming`` — proxy/VPN rotation, but equally a phone on
         Wi-Fi/LTE, so never red on its own) or a lesser contradiction
         (browser-UA-but-no-JS, a VM/software GPU, automation tells, synthetic
@@ -292,21 +473,25 @@ def severity_of(row):
     v = row.get("verdict") or {}
     if row.get("disguised"):
         return {"level": "malicious", "reason": "one device wearing multiple identities"}
-    probe = probe_reason(row.get("uri"))
-    if probe:
-        return {"level": "malicious", "reason": probe}
+    target = target_assessment(row.get("uri"), row.get("method"))
+    if target and target["level"] == "malicious":
+        return target
     if v.get("inconsistent"):
         return {"level": "malicious", "reason": "cross-layer contradiction (spoofed identity)"}
+    if target:
+        return target
     if row.get("net_roaming"):
         return {"level": "suspicious",
                 "reason": "one device seen from multiple public networks (roaming or proxy/VPN rotation)"}
     if v.get("score"):
-        if not row.get("fp_present"):
-            reason = "browser User-Agent but never ran JS"
-        elif v.get("vm_cohort"):
+        if v.get("vm_cohort"):
             reason = "VM / software-GPU renderer"
         elif v.get("automation"):
-            reason = "automation tells present"
+            reason = "automation/tooling signature present"
+        elif v.get("browser_no_js"):
+            reason = "browser User-Agent but never ran JS"
+        elif not row.get("fp_present"):
+            reason = "cross-layer inconsistency without a browser fingerprint"
         elif v.get("behavior_class") == "synthetic":
             reason = "synthetic (too-regular) input timing"
         else:
@@ -428,6 +613,75 @@ def _public_netblock_count(ips):
     return max(len(v4), len(v6))
 
 
+def _device_disguise_basis(device, *, min_identities, roam_min):
+    """Attach normalized counts and return this device's flag basis, if any."""
+    device["n_identities"] = _ua_identity_count(device.get("uas"))
+    device["n_net"] = _public_netblock_count(device.get("ips"))
+    if device["n_identities"] >= min_identities:
+        return "identities"
+    if device["n_net"] >= roam_min:
+        return "networks"
+    return None
+
+
+def disguise_bases(fp_ids, *, chunk_size=500):
+    """Return ``{fp_id: identities|networks}`` for every requested device.
+
+    The analytics table may display a device outside ``disguise_summary``'s
+    intentionally short top-N list.  Classifying only the IDs on the current
+    page keeps row annotation complete without loading every fingerprinted
+    device into application memory.  Queries are chunked and SQL literals are
+    escaped; a temporarily unavailable fingerprint store degrades to no flags.
+    """
+    values = [fp_ids] if isinstance(fp_ids, str) else (fp_ids or [])
+    normalized = sorted({str(value) for value in values if value})
+    if not normalized:
+        return {}
+    try:
+        safe_chunk_size = min(500, max(1, int(chunk_size)))
+    except (TypeError, ValueError):
+        safe_chunk_size = 500
+    min_identities = (
+        getattr(_cg_config, "DISGUISE_MIN_UAS", 2) if _cg_config else 2
+    )
+    roam_min = (
+        getattr(_cg_config, "DISGUISE_DEVICE_ROAM_MIN_NETBLOCKS", 4)
+        if _cg_config else 4
+    )
+    flags = {}
+    try:
+        for offset in range(0, len(normalized), safe_chunk_size):
+            chunk = normalized[offset:offset + safe_chunk_size]
+            literals = ", ".join(_sql_literal(value) for value in chunk)
+            result = _run_json_query(f"""
+                SELECT json_build_object(
+                    'devices', COALESCE(json_agg(row_to_json(d)), '[]'::json)
+                )
+                FROM (
+                    SELECT fp_id,
+                           jsonb_agg(DISTINCT user_agent)
+                               FILTER (WHERE user_agent IS NOT NULL) AS uas,
+                           jsonb_agg(DISTINCT client_ip)
+                               FILTER (WHERE client_ip IS NOT NULL) AS ips
+                    FROM browser_fingerprints
+                    WHERE fp_id IN ({literals})
+                    GROUP BY fp_id
+                ) d;
+            """)
+            for device in result.get("devices") or []:
+                fp_id = device.get("fp_id")
+                basis = _device_disguise_basis(
+                    device,
+                    min_identities=min_identities,
+                    roam_min=roam_min,
+                )
+                if fp_id and basis:
+                    flags[str(fp_id)] = basis
+    except (AttributeError, FingerprintError, TypeError, ValueError):
+        return {}
+    return flags
+
+
 def disguise_summary(limit=50, max_age=0):
     """Devices (keyed by fp_id) that wear more than one identity or roam networks.
 
@@ -486,14 +740,14 @@ def disguise_summary(limit=50, max_age=0):
         result = _run_json_query(sql)
         kept = []
         for dev in result.get("devices") or []:
-            dev["n_identities"] = _ua_identity_count(dev.get("uas"))
-            dev["n_net"] = _public_netblock_count(dev.get("ips"))
-            if dev["n_identities"] >= min_ua:
-                dev["basis"] = "identities"
-            elif dev["n_net"] >= roam_min:
-                dev["basis"] = "networks"
-            else:
+            basis = _device_disguise_basis(
+                dev,
+                min_identities=min_ua,
+                roam_min=roam_min,
+            )
+            if not basis:
                 continue
+            dev["basis"] = basis
             kept.append(dev)
         kept.sort(key=lambda d: (d["basis"] != "identities",
                                  -(d["n_identities"] + d["n_net"]), -(d["beacons"] or 0)))

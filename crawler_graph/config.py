@@ -83,8 +83,20 @@ VM_RENDERER_MARKERS = [
 # Automation-tell weighting (fixes "AUTO from a single weak tell"). A STRONG tell
 # is on its own conclusive (a real user never trips it); WEAK tells are each
 # individually true for legitimate privacy browsers / VMs / in-app WebViews, so we
-# require at least WEAK_AUTOMATION_MIN of them before calling a visitor automated.
+# require at least WEAK_AUTOMATION_MIN independent evidence families before calling
+# a visitor automated.
 STRONG_AUTOMATION_TELLS = {"webdriver", "cdc", "headlessua", "tostringtampered"}
+# Several weak booleans describe the same underlying browser surface and therefore
+# are not independent evidence.  In particular, mobile/privacy browsers commonly
+# expose both an empty plugin list and an empty MIME-type list; counting those as
+# two tells made an otherwise coherent Android browser look automated.  Likewise a
+# software renderer and zero hardware concurrency are often one VM/RDP condition.
+# ``analysis.consistency.automated_from_tells`` counts each family at most once and
+# counts ungrouped weak tells individually.
+WEAK_AUTOMATION_TELL_FAMILIES = (
+    frozenset({"noplugins", "nomimetypes"}),
+    frozenset({"swrenderer", "zerohardware"}),
+)
 WEAK_AUTOMATION_MIN = int(os.environ.get("INTEL_WEAK_AUTOMATION_MIN", "2"))
 
 # --- Identity-rotation / disguise detection ---------------------------------

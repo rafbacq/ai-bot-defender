@@ -269,7 +269,7 @@ async def test_auth_routes_and_guard_protect_existing_features(isolated_auth):
         ("/login", "Log in"),
         ("/request-access", "Request access"),
         ("/signup", "Create account"),
-        ("/admin/approve", "Admin approval"),
+        ("/admin/approve", "Admin panel"),
     ):
         assert f'href="{href}" class="main-nav__link">{label}</a>' in login_html
 

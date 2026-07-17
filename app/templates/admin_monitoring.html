@@ -1,0 +1,684 @@
+{% extends "base.html" %}
+{% block title %}Monitoring · Duke WATCH{% endblock %}
+
+{% block content %}
+<div class="admin-shell">
+    <div class="page-head">
+        <span class="eyebrow">Admin panel</span>
+        <h1>Monitoring</h1>
+        <p>Live honeypot pipeline health, per-container telemetry, host resources, alerts, and proxy traffic.</p>
+    </div>
+
+    {% include "_admin_nav.html" %}
+
+    <div class="monitor-healthbar" aria-live="polite">
+        <div>
+            <span class="monitor-healthbar__label">Stack status</span>
+            <strong id="monitor-status">Checking…</strong>
+            <span id="monitor-updated" class="monitor-healthbar__updated" aria-live="polite">Waiting for first update</span>
+        </div>
+        <div class="monitor-services" aria-label="Monitoring service health">
+            {% for service in ('Grafana', 'Prometheus', 'Loki', 'Alertmanager', 'Blackbox') %}
+            <span class="monitor-service" data-monitor-service="{{ service | lower }}">
+                <span class="monitor-service__dot"></span>{{ service }}
+            </span>
+            {% endfor %}
+        </div>
+    </div>
+
+    <div class="monitor-pipeline" role="list" aria-label="Honeypot request pipeline">
+        {% for key, label in (
+            ('edge', 'Edge'),
+            ('capture', 'Capture'),
+            ('storage', 'Storage'),
+            ('sites', 'Sites'),
+            ('app', 'App'),
+            ('monitoring', 'Monitoring')
+        ) %}
+        <div class="monitor-stage" data-monitor-stage="{{ key }}" role="listitem">
+            <span class="monitor-stage__dot" aria-hidden="true"></span>
+            <span>
+                <span class="monitor-stage__label">{{ label }}</span>
+                <span class="monitor-stage__detail" data-stage-detail>Waiting</span>
+            </span>
+        </div>
+        {% if not loop.last %}<span class="monitor-pipeline__arrow" aria-hidden="true">→</span>{% endif %}
+        {% endfor %}
+    </div>
+
+    {# Host resources only. Traffic volume belongs with capture integrity, as a
+       count over a real window: this traffic is ~89% idle minutes punctuated by
+       bursts of hundreds, so a per-minute tile read 0.0 nearly always. #}
+    <div class="monitor-kpis">
+        {% for key, label, suffix in (
+            ('host_cpu_percent', 'Host CPU', '%'),
+            ('host_memory_percent', 'Memory used', '%'),
+            ('root_disk_percent', 'Root disk used', '%'),
+            ('running_containers', 'Running containers', '')
+        ) %}
+        <div class="stat" data-monitor-tile="{{ key }}">
+            <div class="stat__value" data-monitor-kpi="{{ key }}" data-suffix="{{ suffix }}" aria-live="polite">—</div>
+            <div class="stat__label">{{ label }}</div>
+            {% if key in ('host_cpu_percent', 'host_memory_percent') %}
+            <svg class="stat__spark" data-monitor-spark="{{ key }}" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true" focusable="false"></svg>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+
+    <section class="card card--pad monitor-capture" aria-labelledby="monitor-capture-title">
+        <div class="monitor-section-head">
+            <div>
+                <h2 id="monitor-capture-title">Capture integrity</h2>
+                <p id="monitor-capture-headline" class="muted">Checking the visit collector…</p>
+                <p class="muted">Whether the honeypot is actually recording the research data it exists to record. The collector never blocks a response — it drops a visit rather than delay one, and swallows the error — so a silent capture failure looks exactly like a healthy stack. The corpus figures are read from the central log itself; <strong>Visits lost</strong> comes from the collector, which is the only thing that knows what never arrived.</p>
+            </div>
+            <span class="badge badge--neutral" data-monitor-capture-badge>Checking</span>
+        </div>
+        <div class="monitor-kpis monitor-kpis--inset">
+            {% for key, label, hint in (
+                ('requests_captured', 'Requests captured', 'Rows in the central all_visits log — the whole research corpus'),
+                ('last_24h', 'Last 24 hours', 'Requests captured in the last day; the trend is hour by hour'),
+                ('newest_age', 'Last request', 'How long since a crawler or scanner last reached a site'),
+                ('visits_lost', 'Visits lost', 'Mirror inserts that failed — research data that no longer exists anywhere')
+            ) %}
+            <div class="stat" data-monitor-tile="capture_{{ key }}" title="{{ hint }}">
+                <div class="stat__value" data-monitor-capture="{{ key }}" aria-live="polite">—</div>
+                <div class="stat__label">{{ label }}</div>
+                {% if key == 'last_24h' %}
+                <svg class="stat__spark" data-monitor-spark="capture_hourly" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true" focusable="false"></svg>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </section>
+
+    <section class="card card--pad monitor-containers" aria-labelledby="monitor-containers-title">
+        <div class="monitor-section-head">
+            <div>
+                <h2 id="monitor-containers-title">Pipeline containers</h2>
+                <p id="monitor-container-summary" class="muted">Checking Prometheus…</p>
+            </div>
+        </div>
+        <div class="table-wrap">
+            <table class="tbl">
+                <thead>
+                    <tr>
+                        <th>Container</th>
+                        <th>Role</th>
+                        <th>Status</th>
+                        <th title="Percent of one CPU core">CPU</th>
+                        <th>Memory</th>
+                        <th>Last seen</th>
+                    </tr>
+                </thead>
+                <tbody id="monitor-container-rows">
+                    <tr><td colspan="6" class="muted">Waiting for monitoring status…</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="card card--pad monitor-containers" aria-labelledby="monitor-probes-title">
+        <div class="monitor-section-head">
+            <div>
+                <h2 id="monitor-probes-title">Site serving-path probes</h2>
+                <p id="monitor-probe-summary" class="muted">Checking HTTP, HTTPS, and certificate health…</p>
+                <p class="muted">These checks run locally through nginx with each canonical Host and TLS name. Missing expected HTTP/HTTPS series are shown explicitly and alert after three minutes. The checks validate the proxy, certificate, site, database, and template, but do not prove that an off-host client can cross the Internet or cloud firewall.</p>
+            </div>
+        </div>
+        <div class="table-wrap">
+            <table class="tbl">
+                <thead>
+                    <tr><th>Site</th><th>Scheme</th><th>Status</th><th>HTTP</th><th>Certificate</th><th>Target</th></tr>
+                </thead>
+                <tbody id="monitor-probe-rows">
+                    <tr><td colspan="6" class="muted">Waiting for probe results…</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="card card--pad monitor-alerts" aria-labelledby="monitor-alerts-title">
+        <div class="monitor-section-head">
+            <div>
+                <h2 id="monitor-alerts-title">Firing alerts</h2>
+                <p id="monitor-alert-summary" class="muted">Checking Prometheus…</p>
+            </div>
+            <a class="btn btn--ghost btn--sm" href="{{ grafana_path }}alerting/list" target="_blank" rel="noopener">Open alerting ↗</a>
+        </div>
+        {# Delivery state belongs with the alerts it qualifies, not at the top of
+           the page: "no alerts firing" and "nobody would be told if they were"
+           are the same thought, and this is a standing configuration fact rather
+           than an incident competing for the first thing an operator reads. #}
+        <div id="monitor-delivery" class="notice notice--warn mb-4" role="status">
+            <div>
+                <div id="monitor-delivery-title" class="notice__title">Alert delivery: local only</div>
+                <p id="monitor-delivery-detail">Alertmanager groups alerts and supports silences, but the committed safe default sends no email, chat message, or page. Install a private receiver configuration to enable off-host delivery.</p>
+            </div>
+        </div>
+        <div class="table-wrap">
+            <table class="tbl">
+                <thead><tr><th>Alert</th><th>Severity</th><th>Summary</th><th>Active since</th></tr></thead>
+                <tbody id="monitor-alert-rows">
+                    <tr><td colspan="4" class="muted">Waiting for monitoring status…</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section id="monitor-offline" class="notice notice--warn monitor-offline" role="status" hidden>
+        <div>
+            <div class="notice__title">Monitoring stack unavailable</div>
+            <p>Start or repair the private stack on the host, then this page will reconnect automatically.</p>
+        </div>
+        <code>make monitoring</code>
+    </section>
+
+    {# An aggregate, deliberately not a list of requests: Crawler Analytics already
+       renders those, with fingerprints, verdicts, filters and export, so a second
+       row table here would be a strictly worse copy. What nothing else can show is
+       *what the proxy returned* — nginx has no metrics exporter, the blackbox probe
+       only exercises a synthetic health endpoint, and all_visits never sees traffic
+       the catch-all dropped. This collapses a day of access log into that answer. #}
+    <section class="card card--pad monitor-responses" aria-labelledby="monitor-responses-title">
+        <div class="monitor-section-head">
+            <div>
+                <h2 id="monitor-responses-title">What the proxy served · last 24 hours</h2>
+                <p id="monitor-response-summary" class="muted">Reading nginx's access log…</p>
+                <p class="muted">Every response nginx returned, by host — the only view of what real visitors actually got, as opposed to the synthetic health probe above. <strong>Served</strong> means a crawler received a canaried page. <strong>Not found</strong> is vulnerability probing. <strong>Refused</strong> is the catch-all dropping an unknown Host, plus rejected or abandoned requests. <strong>Errors</strong> is the only column that means this system is broken. This console's own requests are excluded.</p>
+            </div>
+            <a class="btn btn--ghost btn--sm" data-monitor-grafana-link href="{{ grafana_path }}d/abd-overview/?orgId=1" target="_blank" rel="noopener">Explore in Grafana ↗</a>
+        </div>
+        <div class="table-wrap">
+            <table class="tbl">
+                <thead>
+                    <tr>
+                        <th>Host requested</th>
+                        <th title="Requests nginx answered in the last 24 hours">Requests</th>
+                        <th title="2xx/3xx — a visitor received a page">Served</th>
+                        <th title="404 — a path that does not exist; almost always vulnerability probing">Not found</th>
+                        <th title="444 unknown-Host drops by the catch-all, plus other rejected or aborted requests">Refused</th>
+                        <th title="5xx — the honeypot itself failed">Errors</th>
+                    </tr>
+                </thead>
+                <tbody id="monitor-response-rows">
+                    <tr><td colspan="6" class="muted">Waiting for access-log data…</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    const POLL_MS = 15000;
+    const THRESHOLDS = {
+      host_cpu_percent: [75, 90],
+      host_memory_percent: [80, 90],
+      root_disk_percent: [80, 90],
+    };
+
+    const status = document.getElementById('monitor-status');
+    const updated = document.getElementById('monitor-updated');
+    const offline = document.getElementById('monitor-offline');
+    const containerRows = document.getElementById('monitor-container-rows');
+    const containerSummary = document.getElementById('monitor-container-summary');
+    const probeRows = document.getElementById('monitor-probe-rows');
+    const probeSummary = document.getElementById('monitor-probe-summary');
+    const alertRows = document.getElementById('monitor-alert-rows');
+    const alertSummary = document.getElementById('monitor-alert-summary');
+    const responseRows = document.getElementById('monitor-response-rows');
+    const responseSummary = document.getElementById('monitor-response-summary');
+    const captureHeadline = document.getElementById('monitor-capture-headline');
+    const captureBadge = document.querySelector('[data-monitor-capture-badge]');
+    const grafanaLink = document.querySelector('[data-monitor-grafana-link]');
+    const delivery = document.getElementById('monitor-delivery');
+    const deliveryTitle = document.getElementById('monitor-delivery-title');
+    const deliveryDetail = document.getElementById('monitor-delivery-detail');
+    let inFlight = false;
+    let timer = null;
+
+    function setStackState(ok, health) {
+      const states = Object.values(health || {}).map(Boolean);
+      const anyUp = states.some(Boolean);
+      offline.hidden = anyUp;
+      // Grafana is an optional deep-dive, not a dependency of this page: every
+      // panel here reads Prometheus/Loki directly. Hide the link when Grafana is
+      // down rather than offering a dead one.
+      if (grafanaLink) grafanaLink.hidden = !(health && health.grafana);
+      status.textContent = ok ? 'Online' : (anyUp ? 'Degraded' : 'Unavailable');
+      status.classList.toggle('is-online', !!ok);
+      status.classList.toggle('is-offline', !anyUp);
+    }
+
+    function renderHealth(health) {
+      document.querySelectorAll('[data-monitor-service]').forEach(function (chip) {
+        const ok = !!(health && health[chip.dataset.monitorService]);
+        chip.classList.toggle('is-online', ok);
+        chip.classList.toggle('is-offline', !ok);
+      });
+    }
+
+    function renderKpis(values) {
+      document.querySelectorAll('[data-monitor-kpi]').forEach(function (el) {
+        const key = el.dataset.monitorKpi;
+        const value = values ? values[key] : null;
+        const tile = document.querySelector('[data-monitor-tile="' + key + '"]');
+        if (tile) tile.classList.remove('stat--warn', 'stat--alert');
+        if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+          el.textContent = '—';
+          return;
+        }
+        const numeric = Number(value);
+        const shown = key === 'running_containers'
+          ? String(Math.round(numeric))
+          : numeric.toFixed(1);
+        el.textContent = shown + (el.dataset.suffix || '');
+        const threshold = THRESHOLDS[key];
+        if (tile && threshold) {
+          tile.classList.toggle('stat--warn', numeric >= threshold[0] && numeric < threshold[1]);
+          tile.classList.toggle('stat--alert', numeric >= threshold[1]);
+        }
+      });
+    }
+
+    function renderSpark(svg, points) {
+      svg.replaceChildren();
+      const clean = (Array.isArray(points) ? points : []).map(function (point) {
+        return [Number(point && point[0]), Number(point && point[1])];
+      }).filter(function (point) {
+        return Number.isFinite(point[0]) && Number.isFinite(point[1]);
+      });
+      if (clean.length < 2) return;
+
+      const values = clean.map(function (point) { return point[1]; });
+      const min = Math.min.apply(null, values);
+      const max = Math.max.apply(null, values);
+      const span = (max - min) || 1;
+      const firstTime = clean[0][0];
+      const timeSpan = (clean[clean.length - 1][0] - firstTime) || 1;
+      const coords = clean.map(function (point) {
+        const x = ((point[0] - firstTime) / timeSpan) * 100;
+        const y = 25 - (((point[1] - min) / span) * 22);
+        return [x, y];
+      });
+      const ns = 'http://www.w3.org/2000/svg';
+      const path = document.createElementNS(ns, 'path');
+      path.setAttribute('d', coords.map(function (point, index) {
+        return (index ? 'L ' : 'M ') + point[0].toFixed(2) + ',' + point[1].toFixed(2);
+      }).join(' '));
+      const last = coords[coords.length - 1];
+      const circle = document.createElementNS(ns, 'circle');
+      circle.setAttribute('cx', last[0].toFixed(2));
+      circle.setAttribute('cy', last[1].toFixed(2));
+      circle.setAttribute('r', '2');
+      svg.append(path, circle);
+    }
+
+    function renderSparks(series) {
+      document.querySelectorAll('[data-monitor-spark]').forEach(function (svg) {
+        renderSpark(svg, series ? series[svg.dataset.monitorSpark] : []);
+      });
+    }
+
+    function fmtBytes(value) {
+      if (value === null || value === undefined || value === '') return '—';
+      const bytes = Number(value);
+      if (!Number.isFinite(bytes) || bytes < 0) return '—';
+      const gib = 1024 * 1024 * 1024;
+      const mib = 1024 * 1024;
+      return bytes >= gib
+        ? (bytes / gib).toFixed(1) + ' GiB'
+        : (bytes / mib).toFixed(1) + ' MiB';
+    }
+
+    function fmtAge(value) {
+      if (value === null || value === undefined || value === '') return '—';
+      const seconds = Number(value);
+      if (!Number.isFinite(seconds) || seconds < 0) return '—';
+      return seconds < 60
+        ? Math.round(seconds) + 's ago'
+        : Math.round(seconds / 60) + 'm ago';
+    }
+
+    function cell(text, className) {
+      const td = document.createElement('td');
+      td.textContent = text || '—';
+      if (className) td.className = className;
+      return td;
+    }
+
+    function badgeCell(text, className) {
+      const td = document.createElement('td');
+      const badge = document.createElement('span');
+      badge.className = 'badge badge--xs ' + className;
+      badge.textContent = text;
+      td.appendChild(badge);
+      return td;
+    }
+
+    function renderContainers(rows, prometheusUp) {
+      containerRows.replaceChildren();
+      const items = Array.isArray(rows) ? rows : [];
+      if (!prometheusUp || items.length === 0) {
+        const tr = document.createElement('tr');
+        tr.appendChild(cell(
+          prometheusUp ? 'No expected containers found.' : 'Prometheus is unavailable.',
+          'muted'
+        ));
+        tr.firstChild.colSpan = 6;
+        containerRows.appendChild(tr);
+        containerSummary.textContent = prometheusUp
+          ? 'No deployed pipeline inventory is available.'
+          : 'Container data is unavailable until Prometheus recovers.';
+        return;
+      }
+
+      let up = 0;
+      items.forEach(function (item) {
+        const tr = document.createElement('tr');
+        tr.appendChild(cell(item.name, 'mono'));
+        tr.appendChild(badgeCell(item.label, 'badge--navy'));
+        const state = item.status === 'up' ? 'up' : (item.status === 'stale' ? 'stale' : 'down');
+        const stateClass = state === 'up'
+          ? 'badge--clean'
+          : (state === 'stale' ? 'badge--warn' : 'badge--alert');
+        tr.appendChild(badgeCell(state, stateClass));
+        const hasCpu = item.cpu_percent !== null && item.cpu_percent !== undefined && item.cpu_percent !== '';
+        const cpu = Number(item.cpu_percent);
+        tr.appendChild(cell(hasCpu && Number.isFinite(cpu) ? cpu.toFixed(1) + '%' : '—'));
+        tr.appendChild(cell(fmtBytes(item.memory_bytes)));
+        tr.appendChild(cell(fmtAge(item.last_seen_age_s)));
+        containerRows.appendChild(tr);
+        if (state === 'up') up += 1;
+      });
+      containerSummary.textContent = up + ' of ' + items.length + ' containers up.';
+    }
+
+    function renderPipeline(stages) {
+      const byKey = new Map((Array.isArray(stages) ? stages : []).map(function (stage) {
+        return [stage.key, stage];
+      }));
+      document.querySelectorAll('[data-monitor-stage]').forEach(function (chip) {
+        const stage = byKey.get(chip.dataset.monitorStage);
+        chip.classList.remove('is-up', 'is-degraded', 'is-down');
+        if (stage && ['up', 'degraded', 'down'].includes(stage.status)) {
+          chip.classList.add('is-' + stage.status);
+        }
+        const detail = chip.querySelector('[data-stage-detail]');
+        detail.textContent = stage && stage.detail ? stage.detail : 'Unknown';
+      });
+    }
+
+    function renderProbes(probes, prometheusUp) {
+      probeRows.replaceChildren();
+      const rows = Array.isArray(probes) ? probes : [];
+      if (!prometheusUp || rows.length === 0) {
+        const tr = document.createElement('tr');
+        tr.appendChild(cell(
+          prometheusUp ? 'No site probe targets have been published.' : 'Prometheus is unavailable.',
+          'muted'
+        ));
+        tr.firstChild.colSpan = 6;
+        probeRows.appendChild(tr);
+        probeSummary.textContent = prometheusUp
+          ? 'Deploy or reconcile a site to publish its HTTP and HTTPS targets.'
+          : 'Probe data is unavailable until Prometheus recovers.';
+        return;
+      }
+
+      let up = 0;
+      rows.forEach(function (probe) {
+        const tr = document.createElement('tr');
+        tr.appendChild(cell(probe.site));
+        tr.appendChild(badgeCell(probe.scheme, 'badge--navy'));
+        const isUp = probe.status === 'up';
+        const state = probe.status === 'missing' ? 'missing' : (isUp ? 'up' : 'down');
+        tr.appendChild(badgeCell(state, isUp ? 'badge--clean' : 'badge--alert'));
+        tr.appendChild(cell(probe.http_status === null || probe.http_status === undefined
+          ? '—' : String(probe.http_status)));
+        let certificate = '—';
+        const hasCertificate = probe.cert_days_remaining !== null
+          && probe.cert_days_remaining !== undefined
+          && probe.cert_days_remaining !== '';
+        const days = Number(probe.cert_days_remaining);
+        if (hasCertificate && Number.isFinite(days)) certificate = days.toFixed(1) + ' days';
+        // 30/14 mirrors Certbot's renewal window and the
+        // PublicCertificateExpiringSoon rule: amber while renewal should already
+        // be happening, red once it demonstrably has not.
+        tr.appendChild(cell(certificate, hasCertificate && Number.isFinite(days)
+          ? (days <= 14 ? 'cert-expiring' : (days <= 30 ? 'cert-due' : '')) : ''));
+        tr.appendChild(cell(probe.target, 'mono'));
+        probeRows.appendChild(tr);
+        if (isUp) up += 1;
+      });
+      const missing = rows.filter(function (probe) { return probe.status === 'missing'; }).length;
+      probeSummary.textContent = up + ' of ' + rows.length + ' HTTP/TLS probes passing' +
+        (missing ? '; ' + missing + ' expected series missing.' : '.');
+    }
+
+    function fmtCount(value) {
+      if (value === null || value === undefined || value === '') return '—';
+      const n = Number(value);
+      return Number.isFinite(n) ? n.toLocaleString() : '—';
+    }
+
+    // "Losing data" means right now; "Data lost earlier" means it stopped but
+    // those visits are gone for good. Collapsing the two would either cry wolf
+    // forever after one blip or quietly bury a real gap in the record.
+    const CAPTURE_VERDICTS = {
+      healthy:  ['Healthy', 'badge--clean'],
+      healed:   ['Data lost earlier', 'badge--warn'],
+      degraded: ['Degraded', 'badge--warn'],
+      failing:  ['Losing data', 'badge--alert'],
+      blind:    ['Not reporting', 'badge--warn'],
+    };
+
+    function renderCapture(capture) {
+      const data = capture || {};
+      const verdict = CAPTURE_VERDICTS[data.verdict] || CAPTURE_VERDICTS.blind;
+      captureBadge.textContent = verdict[0];
+      captureBadge.className = 'badge ' + verdict[1];
+      captureHeadline.textContent = data.headline
+        || 'Capture integrity is unknown.';
+
+      const tiles = {
+        requests_captured: fmtCount(data.requests_captured),
+        last_24h: fmtCount(data.last_24h),
+        newest_age: fmtAge(data.newest_age_s),
+        visits_lost: fmtCount(data.visits_lost),
+      };
+      Object.keys(tiles).forEach(function (key) {
+        const el = document.querySelector('[data-monitor-capture="' + key + '"]');
+        if (el) el.textContent = tiles[key];
+        const tile = document.querySelector('[data-monitor-tile="capture_' + key + '"]');
+        if (!tile) return;
+        tile.classList.remove('stat--warn', 'stat--alert');
+        // Any non-zero loss is an incident, not a threshold to tune: a dropped
+        // visit is research data that no longer exists anywhere. Red while it is
+        // still happening, amber once it has stopped — the counter is cumulative,
+        // so it rightly never returns to zero on its own.
+        if (key === 'visits_lost') {
+          if (Number(data.recent_visits_lost) > 0) tile.classList.add('stat--alert');
+          else if (Number(data.visits_lost) > 0) tile.classList.add('stat--warn');
+        }
+      });
+      renderSpark(
+        document.querySelector('[data-monitor-spark="capture_hourly"]'),
+        data.hourly
+      );
+    }
+
+    function countCell(value, className) {
+      const n = Number(value);
+      const td = cell(Number.isFinite(n) ? n.toLocaleString() : '—', className);
+      if (Number.isFinite(n) && n === 0) td.classList.add('muted');
+      return td;
+    }
+
+    function renderResponses(mix) {
+      responseRows.replaceChildren();
+      const data = mix || {};
+      const rows = Array.isArray(data.hosts) ? data.hosts : [];
+      const totals = data.totals || {};
+      if (!data.available || rows.length === 0) {
+        const tr = document.createElement('tr');
+        tr.appendChild(cell(
+          data.available
+            ? 'The proxy has served no traffic in the last 24 hours.'
+            : 'Loki is unavailable, so nginx access data cannot be read.',
+          'muted'
+        ));
+        tr.firstChild.colSpan = 6;
+        responseRows.appendChild(tr);
+        responseSummary.textContent = data.available
+          ? 'No honeypot or scanner traffic reached the proxy in the last 24 hours.'
+          : 'Response data is unavailable until Loki recovers.';
+        return;
+      }
+
+      rows.forEach(function (row) {
+        const tr = document.createElement('tr');
+        if (Number(row.errors) > 0) tr.className = 'row--malicious';
+        tr.appendChild(cell(row.host || '(no Host sent)', 'mono truncate'));
+        tr.appendChild(countCell(row.total));
+        tr.appendChild(countCell(row.served, 'response-served'));
+        tr.appendChild(countCell(row.not_found));
+        tr.appendChild(countCell(row.refused));
+        tr.appendChild(countCell(row.errors, Number(row.errors) > 0 ? 'response-errors' : ''));
+        responseRows.appendChild(tr);
+      });
+
+      if (data.hidden_hosts > 0) {
+        const tr = document.createElement('tr');
+        tr.appendChild(cell(
+          data.hidden_hosts + ' quieter host(s) not shown.', 'muted'
+        ));
+        tr.firstChild.colSpan = 6;
+        responseRows.appendChild(tr);
+      }
+
+      const total = Number(totals.total) || 0;
+      const served = Number(totals.served) || 0;
+      const errors = Number(totals.errors) || 0;
+      const probing = total ? Math.round((Number(totals.not_found) || 0) / total * 100) : 0;
+      responseSummary.textContent = total.toLocaleString() + ' requests across '
+        + (totals.hosts || rows.length) + ' hosts · ' + served.toLocaleString()
+        + ' served a honeypot page · ' + probing + '% was path probing · '
+        + (errors ? errors.toLocaleString() + ' SERVER ERRORS' : 'no server errors') + '.';
+    }
+
+    function renderNotifications(value) {
+      const external = !!(value && value.external_delivery);
+      const mode = value && value.mode ? String(value.mode) : 'local-only';
+      delivery.classList.toggle('notice--warn', !external);
+      deliveryTitle.textContent = external
+        ? 'Alert delivery: ' + mode
+        : 'Alert delivery: local only';
+      deliveryDetail.textContent = external
+        ? 'Alertmanager is configured for an operator-supplied external receiver.'
+        : 'Alertmanager groups alerts and supports silences, but the committed safe default sends no email, chat message, or page. Install a private receiver configuration to enable off-host delivery.';
+    }
+
+    function renderUpdated(timestamp) {
+      const value = Number(timestamp);
+      if (!Number.isFinite(value) || value <= 0) {
+        updated.textContent = 'Update unavailable';
+        return;
+      }
+      updated.textContent = 'Updated ' + new Date(value * 1000).toLocaleTimeString();
+    }
+
+    function renderAlerts(alerts, prometheusUp) {
+      alertRows.replaceChildren();
+      const rows = Array.isArray(alerts) ? alerts : [];
+      if (!prometheusUp || rows.length === 0) {
+        const tr = document.createElement('tr');
+        tr.appendChild(cell(
+          prometheusUp ? 'No firing alerts.' : 'Prometheus is unavailable.',
+          'muted'
+        ));
+        tr.firstChild.colSpan = 4;
+        alertRows.appendChild(tr);
+        alertSummary.textContent = prometheusUp
+          ? 'All configured alert rules are currently clear.'
+          : 'Alert data is unavailable until Prometheus recovers.';
+        return;
+      }
+      rows.forEach(function (alert) {
+        const tr = document.createElement('tr');
+        tr.appendChild(cell(alert.name));
+        tr.appendChild(cell(alert.severity));
+        tr.appendChild(cell(alert.summary || alert.description));
+        let active = alert.active_at || '';
+        if (active) {
+          const parsed = new Date(active);
+          if (!Number.isNaN(parsed.getTime())) active = parsed.toLocaleString();
+        }
+        tr.appendChild(cell(active));
+        alertRows.appendChild(tr);
+      });
+      alertSummary.textContent = rows.length + (rows.length === 1 ? ' alert is firing.' : ' alerts are firing.');
+    }
+
+    async function refreshMonitoring() {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const response = await fetch('/admin/monitoring/status', {
+          cache: 'no-store',
+          headers: {'Accept': 'application/json'},
+        });
+        if (!response.ok) throw new Error('Monitoring status request failed.');
+        const data = await response.json();
+        const promUp = !!(data.health && data.health.prometheus);
+        const lokiUp = !!(data.health && data.health.loki);
+        renderHealth(data.health || {});
+        renderKpis(data.kpis || {});
+        renderSparks(data.series || {});
+        renderCapture(data.capture || {});
+        renderContainers(data.containers || [], promUp);
+        renderPipeline(data.pipeline || []);
+        renderProbes(data.probes || [], promUp);
+        renderResponses(lokiUp ? data.response_mix : null);
+        renderNotifications(data.notifications || {});
+        renderUpdated(data.generated_at);
+        renderAlerts(data.alerts || [], promUp);
+        setStackState(data.ok, data.health || {});
+      } catch (_) {
+        renderHealth({});
+        renderKpis({});
+        renderSparks({});
+        renderCapture({});
+        renderContainers([], false);
+        renderPipeline([]);
+        renderProbes([], false);
+        renderResponses(null);
+        renderNotifications({mode: 'local-only', external_delivery: false});
+        renderUpdated(null);
+        renderAlerts([], false);
+        setStackState(false, {});
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    function scheduleNext() {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(async function () {
+        if (!document.hidden) await refreshMonitoring();
+        scheduleNext();
+      }, POLL_MS);
+    }
+
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) refreshMonitoring();
+    });
+    window.addEventListener('focus', refreshMonitoring);
+    refreshMonitoring().finally(scheduleNext);
+  })();
+</script>
+{% endblock %}

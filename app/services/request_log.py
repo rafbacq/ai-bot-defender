@@ -47,8 +47,12 @@ def _run_json_query(sql):
 # query below can disambiguate from the joined browser_fingerprints table `b`).
 # client_port is the additive column the collector adds (X-Client-Port) — it keys
 # the TCP-SYN join below to the request's own connection.
-_BASE_COLS = ("a.id, a.ts, a.site, a.client_ip, a.client_port, a.user_agent, "
-              "a.method, a.uri, a.headers")
+_BASE_COLS = (
+    "a.id, a.ts, a.site, a.client_ip, a.client_port, a.user_agent, "
+    "a.method, a.uri, a.headers, "
+    "to_jsonb(a) ->> 'request_id' AS request_id, "
+    "NULLIF(to_jsonb(a) ->> 'response_status', '')::int AS response_status"
+)
 
 
 def _conditions(site, method, search, *, include_fp):
@@ -62,7 +66,10 @@ def _conditions(site, method, search, *, include_fp):
         conditions.append(f"a.method = {_sql_literal(method)}")
     if search.strip():
         literal = _sql_literal(search.strip().lower())
-        fields = "a.site, a.client_ip, a.user_agent, a.method, a.uri, a.headers::text"
+        fields = (
+            "a.site, a.client_ip, a.user_agent, a.method, a.uri, a.headers::text, "
+            "to_jsonb(a) ->> 'response_status', to_jsonb(a) ->> 'request_id'"
+        )
         if include_fp:
             fields += ", b.fp_id, b.canvas_hash, b.webgl_renderer"
         conditions.append(f"POSITION({literal} IN LOWER(CONCAT_WS(' ', {fields}))) > 0")
@@ -132,11 +139,19 @@ def _enriched_sql(where_clause, page_size, offset, *, with_tcp):
     contradiction. The 5s forward slack absorbs Zeek-vs-collector clock skew.
     All are LATERAL and degrade gracefully when the fingerprint tables don't
     exist yet."""
-    tcp_select = "t.tcp_os, t.ja4t" if with_tcp else "NULL::text AS tcp_os, NULL::text AS ja4t"
+    tcp_select = (
+        "t.tcp_os, t.ja4t, t.tcp_match_exact"
+        if with_tcp else
+        "NULL::text AS tcp_os, NULL::text AS ja4t, FALSE AS tcp_match_exact"
+    )
     tcp_join = (
-        "LEFT JOIN LATERAL (SELECT os_guess AS tcp_os, ja4t FROM tcp_fingerprints tf "
-        "WHERE tf.src_ip = a.client_ip AND tf.ts <= a.ts + INTERVAL '5 seconds' "
-        "ORDER BY (tf.src_port = a.client_port) DESC NULLS LAST, tf.ts DESC LIMIT 1) t ON TRUE"
+        "LEFT JOIN LATERAL (SELECT os_guess AS tcp_os, ja4t, "
+        "COALESCE(tf.src_port = a.client_port, FALSE) AS tcp_match_exact "
+        "FROM tcp_fingerprints tf "
+        "WHERE tf.src_ip = a.client_ip "
+        "AND tf.ts BETWEEN a.ts - INTERVAL '5 minutes' AND a.ts + INTERVAL '5 seconds' "
+        "ORDER BY (tf.src_port = a.client_port) DESC NULLS LAST, "
+        "abs(extract(epoch FROM (tf.ts - a.ts))) ASC LIMIT 1) t ON TRUE"
         if with_tcp else ""
     )
     window = int(FP_JOIN_WINDOW_MIN)
@@ -259,13 +274,31 @@ def site_status_map():
 
 
 def requests_to_csv(rows):
-    """Serialize request rows to CSV text for download."""
+    """Serialize request rows to CSV without spreadsheet-formula execution.
+
+    User-Agent, URI, and several header-derived values are attacker controlled.
+    Spreadsheet applications may interpret cells beginning with ``=``, ``+``,
+    ``-``, or ``@`` (including after whitespace/control prefixes) as formulas.
+    A leading apostrophe makes those values literal when an operator opens the
+    export, while remaining explicit data for ordinary CSV readers.
+    """
+    def safe_cell(value):
+        if not isinstance(value, str):
+            return value
+        probe = value.lstrip(" \t\r\n\ufeff")
+        if probe.startswith(("=", "+", "-", "@")):
+            return "'" + value
+        return value
+
     output = StringIO()
-    fields = ["id", "ts", "site", "client_ip", "method", "uri", "user_agent", "headers"]
+    fields = [
+        "id", "ts", "site", "client_ip", "method", "response_status",
+        "uri", "user_agent", "request_id", "headers",
+    ]
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
     for row in rows:
-        csv_row = {field: row.get(field) for field in fields}
+        csv_row = {field: safe_cell(row.get(field)) for field in fields}
         csv_row["headers"] = json.dumps(csv_row["headers"], sort_keys=True)
         writer.writerow(csv_row)
     return output.getvalue()

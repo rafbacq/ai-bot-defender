@@ -37,21 +37,6 @@
     regexp: '^SCRAPER_VERSION = \d+\s*$'
     replace: 'SCRAPER_VERSION = int(os.environ.get("SCRAPER_VERSION", 1))'
 
-# --- Reverse proxy: render this site's nginx server block ------------------
-# conf_dir is bind-mounted into proxy-nginx at /etc/nginx/conf.d. Writing here
-# and reloading (handler below) routes <server_name> -> this site's container
-# without touching any other site.
-- name: Ensure nginx conf.d directory exists
-  ansible.builtin.file:
-    path: "{{ proxy.conf_dir }}"
-    state: directory
-    mode: "0755"
-  when: proxy.enabled | default(false) | bool
-
-- name: Render per-site nginx server block
-  ansible.builtin.template:
-    src: site.conf.j2
-    dest: "{{ proxy.conf_dir }}/{{ site_id }}.conf"
-    mode: "0644"
-  when: proxy.enabled | default(false) | bool
-  notify: Validate and reload nginx
+# Public nginx and Prometheus artifacts are intentionally absent here.  The
+# publish role writes them only after the deploy role confirms the web service
+# is running, so a cancelled configure/deploy cannot expose a dead upstream.

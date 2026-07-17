@@ -38,6 +38,15 @@ services:
     ports:
       - "127.0.0.1:{{ website.port }}:8080"
     restart: unless-stopped
+    # Deployment publication waits for this dependency-aware endpoint. Unlike
+    # GET /, it neither logs a visit nor assigns canaries, and it verifies the
+    # active Postgres connection plus Jinja template before nginx is exposed.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; raise SystemExit(0 if urllib.request.urlopen('http://127.0.0.1:8080/__abd_health', timeout=3).status == 204 else 1)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
     environment:
       DB_USER: {{ database.user }}
       DB_PASS: {{ database.password }}

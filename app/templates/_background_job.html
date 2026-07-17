@@ -10,10 +10,15 @@
             <span data-job-status>{{ background_job.status }}</span>
         </div>
         <div class="job-control__label" data-job-label>{{ background_job.label }}</div>
-        {% if not background_job.done %}<div class="muted" style="font-size:12px;margin-top:3px">Runs on the server. You may switch pages, close this tab, or reopen the app later.</div>{% endif %}
+        {% if not background_job.done %}<div class="muted" style="font-size:12px;margin-top:3px">Runs on the server. You may switch pages, close this tab, or reopen the app later.{% if not job_cancellable|default(true) %} This operation cannot be cancelled part-way — it finishes or reports what it could not do.{% endif %}</div>{% endif %}
         <div class="job-control__error" data-job-error {% if not background_job.error %}hidden{% endif %}>{{ background_job.error or '' }}</div>
     </div>
+    {# Some operations have no safe mid-flight stopping point (see the caller
+       that sets job_cancellable). Offering a button that cannot honestly stop
+       the work would report "cancelled" for work that actually completed. #}
+    {% if job_cancellable|default(true) %}
     <button type="button" class="btn btn--danger btn--sm" data-job-cancel
             {% if background_job.done %}hidden{% endif %}>Cancel job</button>
+    {% endif %}
 </div>
 {% endif %}

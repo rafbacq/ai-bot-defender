@@ -66,12 +66,18 @@ FEATURES: dict[str, tuple[str, str | None, str]] = {
                        "Site Configurator config read/write/merge + Ansible deploy shim"),
     "generator":      ("test_template_generator.py", None,
                        "Honeypot template generator install logic"),
+    "monitoring":     ("test_monitoring.py", None,
+                       "Admin-gated Grafana + native monitoring health, metrics, alerts & isolation"),
     "auth":           ("test_auth.py", None,
                        "Reviewed access, signup/login sessions, redirects & password storage"),
     "webapp":         ("test_web_app.py", None,
                        "FastAPI web application routes, pages, exports & redirects"),
     "contracts":      ("test_static_contracts.py", None,
                        "Cross-component static contracts (templates, nginx/Ansible wiring)"),
+    "deployment":     ("test_deployment_scripts.py", None,
+                       "Deployment/TLS shell scripts: published-route inventory, reload race, locking"),
+    "cancellation":   ("test_job_cancellation.py", None,
+                       "Background-job ownership, cancellation & interrupted-state handling"),
 }
 
 FILE_TO_FEATURE = {meta[0]: name for name, meta in FEATURES.items()}

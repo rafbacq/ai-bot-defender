@@ -74,13 +74,24 @@ services:
       # Optional org-wide TOTP enrollment force. False keeps MFA self-service;
       # already-enrolled users are challenged at login either way.
       REQUIRE_2FA: ${REQUIRE_2FA:-false}
+      # Read-only observability APIs on the isolated monitoring bridge. Grafana
+      # itself is publicly surfaced only through nginx's admin-session gate.
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://mon-prometheus:9090}
+      LOKI_URL: ${LOKI_URL:-http://mon-loki:3100}
+      GRAFANA_URL: ${GRAFANA_URL:-http://mon-grafana:3000/grafana/}
+      GRAFANA_PUBLIC_PATH: ${GRAFANA_PUBLIC_PATH:-/grafana/}
+      ALERTMANAGER_URL: ${ALERTMANAGER_URL:-http://mon-alertmanager:9093}
+      # Blackbox shares nginx's netns, so its private listener is reached on
+      # proxy-nginx's monitoring_bridge address rather than a host port.
+      BLACKBOX_URL: ${BLACKBOX_URL:-http://proxy-nginx:9115}
+      ALERT_DELIVERY_MODE: ${ALERT_DELIVERY_MODE:-local-only}
     working_dir: ${PWD}
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     volumes:
       - ${PWD}:${PWD}
       - /var/run/docker.sock:/var/run/docker.sock
       - hf-cache:/opt/hf-cache
-    networks: [default, proxy_net]
+    networks: [default, proxy_net, monitoring_bridge]
     # Pass the host NVIDIA GPU to the app so the Template Generator runs on the GPU.
     # Requires Docker GPU support (NVIDIA Container Toolkit / Docker Desktop WSL2).
     # If `up` fails because no GPU can be reserved, delete this `deploy:` block —
@@ -117,4 +128,6 @@ volumes:
 
 networks:
   proxy_net:
+    external: true
+  monitoring_bridge:
     external: true

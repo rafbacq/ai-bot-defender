@@ -21,11 +21,18 @@ server {
 {% endif %}
     # Browsers resolve *.localhost to loopback, so this branded alias gives
     # operators a usable local URL that still enters nginx and reaches all_visits.
-    # proxy.server_aliases (a list, optional; global in all.yml or per-site) adds
-    # extra names -- e.g. the instance's raw public IP so raw-IP scanners reach
-    # the honeypot instead of the catch-all. Requests arriving via any alias are
-    # still recorded under the canonical $site_name below.
-    server_name {{ proxy.server_name | default(site_id ~ '.' ~ proxy.base_domain) }}{% for alias in proxy.server_aliases | default([]) %} {{ alias }}{% endfor %} {{ site_id }}.{{ proxy.local_base_domain }};
+    # proxy.server_aliases is optional, but aliases must be unique to this site.
+    # Never place the shared raw public IP here: it is ambiguous across vhosts
+    # and belongs to nginx's unmatched 444 server/log. Requests arriving via a
+    # deliberate site-specific alias are recorded under canonical $site_name.
+    # During a trusted-certificate hostname transaction, the immediately prior
+    # canonical name remains a temporary alias. Certbot can therefore complete
+    # HTTP-01 for the old+new SAN union that makes rollback certificate-safe.
+    # The publication role removes these internal aliases after TLS commits.
+{% for alias in tls_transition_aliases | default([]) %}
+    # abd_tls_transition_name {{ alias }}
+{% endfor %}
+    server_name {{ proxy.server_name | default(site_id ~ '.' ~ proxy.base_domain) }}{% for alias in proxy.server_aliases | default([]) %} {{ alias }}{% endfor %}{% for alias in tls_transition_aliases | default([]) %} {{ alias }}{% endfor %} {{ site_id }}.{{ proxy.local_base_domain }};
     set $site_name {{ proxy.server_name | default(site_id ~ '.' ~ proxy.base_domain) }};
     access_log /var/log/nginx/dukecodeplus.access.log siteaccess;
 
@@ -39,6 +46,7 @@ server {
     # The variable upstream + http{} resolver means a reload never fails when the
     # collector is momentarily down (resolved at request time, like the mirror).
     location = /__fpbeacon {
+        access_log off;
         set $fp_upstream fp-collector;
         proxy_set_header Host $host;
         proxy_set_header X-Site $site_name;
@@ -51,11 +59,37 @@ server {
         proxy_pass http://$fp_upstream:8000$request_uri;
     }
 
+    # Private-to-the-stack synthetic health contract. Blackbox Exporter sends
+    # the canonical hostname as Host + TLS SNI while connecting through nginx's
+    # loopback interface, so this exercises vhost selection, certificate-name
+    # validation, Flask, Postgres, and Jinja without becoming research traffic.
+    # This exact path intentionally has neither mirror nor access_log: a probe
+    # must never create all_visits rows, mint canaries, or inflate Loki rates.
+    location = /__abd_health {
+        access_log off;
+        # Blackbox shares nginx's network namespace and always connects over
+        # loopback. Keep this telemetry-free dependency check unavailable to
+        # Internet clients; the normal public page remains unrestricted.
+        allow 127.0.0.1;
+        allow ::1;
+        deny all;
+        set $upstream {{ site_id }}-web;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 1s;
+        proxy_read_timeout 3s;
+        proxy_next_upstream off;
+        proxy_pass http://$upstream:8080$request_uri;
+    }
+
     # ACME (Let's Encrypt) HTTP-01 challenge files, written by the certbot
     # container into the shared webroot volume. Listed before `location /` so
     # challenge requests never reach the Flask backend and are never mirrored
     # into all_visits (the mirror lives only inside `location /`).
     location ^~ /.well-known/acme-challenge/ {
+        access_log off;
         root /var/www/certbot;
     }
 

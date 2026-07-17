@@ -25,19 +25,47 @@ expected_mode="container:$nginx_id"
 
 if [[ "$capture_mode" == "$expected_mode" ]]; then
     echo "tls-capture sync: already attached to current nginx"
-    exit 0
+else
+    echo "tls-capture sync: nginx was replaced; rebinding capture sidecar"
+    docker compose -f docker-compose.proxy.yml up -d --no-deps --force-recreate tls-capture
+
+    capture_mode=$(
+        docker inspect --format '{{.HostConfig.NetworkMode}}' proxy-tls-capture \
+            2>/dev/null || true
+    )
+    if [[ "$capture_mode" != "$expected_mode" ]]; then
+        echo "tls-capture sync: rebind failed (capture=$capture_mode)" >&2
+        exit 1
+    fi
+    echo "tls-capture sync: attached to current nginx"
 fi
 
-echo "tls-capture sync: nginx was replaced; rebinding capture sidecar"
-docker compose -f docker-compose.proxy.yml up -d --no-deps --force-recreate tls-capture
-
-capture_mode=$(
-    docker inspect --format '{{.HostConfig.NetworkMode}}' proxy-tls-capture \
-        2>/dev/null || true
-)
-if [[ "$capture_mode" != "$expected_mode" ]]; then
-    echo "tls-capture sync: rebind failed (capture=$capture_mode)" >&2
-    exit 1
+# Blackbox Exporter also shares nginx's namespace so its loopback probes exercise
+# the real vhosts without entering passive capture. It belongs to the optional
+# monitoring stack, so only reconcile it when its container already exists and
+# never make a healthy proxy startup depend on monitoring.
+if docker inspect mon-blackbox >/dev/null 2>&1; then
+    blackbox_mode=$(
+        docker inspect --format '{{.HostConfig.NetworkMode}}' mon-blackbox \
+            2>/dev/null || true
+    )
+    if [[ "$blackbox_mode" == "$expected_mode" ]]; then
+        echo "blackbox sync: already attached to current nginx"
+    else
+        echo "blackbox sync: nginx was replaced; rebinding endpoint prober"
+        if ! docker compose -f docker-compose.monitoring.yml up -d \
+                --no-deps --force-recreate blackbox; then
+            echo "blackbox sync: WARNING: rebind failed; proxy traffic is unaffected" >&2
+        else
+            blackbox_mode=$(
+                docker inspect --format '{{.HostConfig.NetworkMode}}' mon-blackbox \
+                    2>/dev/null || true
+            )
+            if [[ "$blackbox_mode" != "$expected_mode" ]]; then
+                echo "blackbox sync: WARNING: stale namespace remains ($blackbox_mode)" >&2
+            else
+                echo "blackbox sync: attached to current nginx"
+            fi
+        fi
+    fi
 fi
-
-echo "tls-capture sync: attached to current nginx"

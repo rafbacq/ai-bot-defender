@@ -1,0 +1,10 @@
+<nav class="admin-tabs" aria-label="Admin panel">
+    <a class="admin-tab{% if active_admin_tab == 'approve' %} is-active{% endif %}"
+       href="/admin/approve"{% if active_admin_tab == 'approve' %} aria-current="page"{% endif %}>
+        Access requests
+    </a>
+    <a class="admin-tab{% if active_admin_tab == 'monitoring' %} is-active{% endif %}"
+       href="/admin/monitoring"{% if active_admin_tab == 'monitoring' %} aria-current="page"{% endif %}>
+        Monitoring
+    </a>
+</nav>

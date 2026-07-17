@@ -60,16 +60,18 @@ services:
       - certbot_webroot:/var/www/certbot:ro
       - letsencrypt:/etc/letsencrypt:ro
       - nginx_logs:/var/log/nginx
-    # Wrap the stock entrypoint with a 6-hourly graceful reload so renewed
-    # Let's Encrypt certs are picked up without any cross-container signalling
-    # (certbot-renew shares no control channel with nginx). Reload is graceful:
-    # in-flight requests are never dropped, and a reload with unchanged config
-    # is a no-op.
+    # Two lightweight housekeeping loops: a 6-hourly graceful reload picks up
+    # renewed certificates, while a shared-volume marker asks nginx to reopen
+    # access logs after rename-based rotation (no copytruncate loss window).
+    environment:
+      # The collector uses this same interval plus a one-second quiet-drain
+      # margin before declaring the canonical log path genuinely missing.
+      NGINX_LOG_REOPEN_POLL_SECONDS: ${PROXY_LOG_REOPEN_POLL_SECONDS:-5}
     command:
       - /bin/sh
       - -c
-      - "(while :; do sleep 6h; nginx -s reload 2>/dev/null || true; done) & exec nginx -g 'daemon off;'"
-    networks: [default, proxy_net]
+      - "(while :; do sleep $${NGINX_LOG_REOPEN_POLL_SECONDS}; if [ -f /var/log/nginx/.reopen-required ]; then nginx -s reopen 2>/dev/null && rm -f /var/log/nginx/.reopen-required || true; fi; done) & (while :; do sleep 6h; nginx -s reload 2>/dev/null || true; done) & exec nginx -g 'daemon off;'"
+    networks: [default, proxy_net, monitoring_bridge]
     depends_on:
       certgen:
         condition: service_completed_successfully
@@ -86,7 +88,15 @@ services:
       DB_USER: logger
       DB_PASS: logger
       DB_NAME: site_logs
-    networks: [default]
+      ACCESS_LOG: /var/log/nginx/dukecodeplus.access.log
+      NGINX_LOG_REOPEN_POLL_SECONDS: ${PROXY_LOG_REOPEN_POLL_SECONDS:-5}
+    volumes:
+      # Read-only authoritative final-response log. The collector's background
+      # correlator cannot alter or rotate nginx evidence.
+      - nginx_logs:/var/log/nginx:ro
+    # monitoring_bridge exposes only the fixed-cardinality /metrics signal to
+    # Prometheus. The collector remains un-published and off the crawler path.
+    networks: [default, monitoring_bridge]
     depends_on:
       logdb:
         condition: service_healthy
@@ -161,7 +171,7 @@ services:
     restart: unless-stopped
 
   # Rotates the nginx access logs inside the nginx_logs volume (see
-  # proxy/logrotate.conf for the policy + why copytruncate). Runs hourly;
+  # proxy/logrotate.conf for the rename/reopen policy). Runs hourly;
   # rotation actually triggers daily or at 100MB, whichever comes first.
   logrotate:
     image: alpine:3.20
@@ -183,17 +193,20 @@ services:
   # issuance is scripts/setup-letsencrypt.sh, which runs this same service
   # one-shot with `docker compose run --entrypoint certbot`. nginx picks up a
   # renewed cert via its own 6-hourly reload loop (see the nginx service).
+  # The wrapper acquires configs/.publication.lock before touching the shared
+  # lineage, so scheduled renewal cannot race deployment/public-host rollback.
   # Harmless when no cert has been issued yet ("no renewals were attempted").
   certbot-renew:
     image: certbot/certbot
     container_name: proxy-certbot-renew
-    entrypoint:
-      - /bin/sh
-      - -c
-      - "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $$!; done"
+    entrypoint: ["/bin/sh", "/usr/local/bin/certbot-renew.sh"]
     volumes:
       - letsencrypt:/etc/letsencrypt
       - certbot_webroot:/var/www/certbot
+      # Writable only so this process can atomically own/release the same lock
+      # directory as host/app/Ansible publication transactions.
+      - ./configs:/project/configs
+      - ./proxy/certbot-renew.sh:/usr/local/bin/certbot-renew.sh:ro
     restart: unless-stopped
 
   logdb:
@@ -225,4 +238,6 @@ volumes:
 
 networks:
   proxy_net:
+    external: true
+  monitoring_bridge:
     external: true

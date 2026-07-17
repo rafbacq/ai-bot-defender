@@ -6,7 +6,11 @@ Routes:
     GET/POST /account/2fa/*     Set up, enable, or disable account TOTP
     GET/POST /signup            Create an account from a one-time approval
     GET  /request-access        Link to the external access-request form
+    GET  /admin                 Redirect to the access-request admin tab
     GET/POST /admin/approve     Review-approved email administration
+    GET  /admin/monitoring      Native monitoring overview + Grafana panels
+    GET  /admin/monitoring/status  Monitoring health, KPIs, and alerts (JSON)
+    GET  /admin/auth-check      Session-only nginx auth_request decision
     POST /admin/decline         Revoke/notify a declined access request
     POST /logout                Clear the signed login session
     GET  /                      Landing page (stats + navigation)
@@ -14,6 +18,9 @@ Routes:
     GET  /sites                 Site Configurator
     POST /sites/website-dir     Save the global website source path
     POST /sites/deploy          Deploy / re-apply a site via Ansible
+    POST /sites/start           Bring a taken-down site back up (existing config)
+    POST /sites/stop            Take a site down: withdraw its route, stop its stack
+    POST /sites/delete          Delete a site: withdraw, destroy the stack + data
     GET  /logs                  Crawler Analytics — requests + fingerprints + campaigns
     GET  /logs/fragment         Traffic-table rows for one page (AJAX Prev/Next paging)
     GET  /logs/export.csv       Download the current page of requests as CSV
@@ -41,11 +48,13 @@ import math
 import secrets
 from concurrent.futures import CancelledError
 from datetime import datetime
+from html import escape
 from urllib.parse import urlencode, urlsplit
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import (
     FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse,
+    Response,
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -54,8 +63,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from . import config
 from .services import (
     auth_service, fingerprint_service, graph_intel, keys_service, provenance_service,
-    job_catalog, querying_service, request_log, run_manager, selfplay_service, sites, stats,
-    task_service, template_gen, totp_service,
+    job_catalog, monitoring_service, querying_service, request_log, run_manager,
+    selfplay_service, sites, stats, task_service, template_gen, totp_service,
 )
 
 app = FastAPI(title="AI Bot Defender")
@@ -87,9 +96,13 @@ _PUBLIC_PATHS = frozenset({
     "/signup",
     "/request-access",
     "/logout",
+    "/admin",
     "/admin/login",
+    "/admin/auth-check",
     "/admin/approve",
     "/admin/decline",
+    "/admin/monitoring",
+    "/admin/monitoring/status",
 })
 _PUBLIC_PREFIXES = ("/static/",)
 
@@ -186,6 +199,14 @@ def _recent_task(request, *, kinds, max_age=7 * 24 * 60 * 60,
 
 def _admin_secret_matches(candidate: str) -> bool:
     return secrets.compare_digest(str(candidate or ""), config.ADMIN_SECRET)
+
+
+_ADMIN_DESTINATIONS = frozenset({"/admin/approve", "/admin/monitoring"})
+
+
+def _admin_destination(value) -> str:
+    """Allow only known admin tabs as post-unlock redirect destinations."""
+    return value if isinstance(value, str) and value in _ADMIN_DESTINATIONS else "/admin/approve"
 
 
 @app.middleware("http")
@@ -300,18 +321,26 @@ def api_stats():
 
 
 # --- Site Configurator -----------------------------------------------------
+# Every site lifecycle operation reports through the page's one job panel, so
+# the panel has to rediscover any of them — not just a deploy.
+_SITE_JOB_KINDS = frozenset({"site-deploy", "site-start", "site-stop", "site-delete"})
+
+
 @app.get("/sites", response_class=HTMLResponse)
 def sites_page(request: Request, deployed: str = "", ok: str = "", job: str = "",
-               cancelled: str = ""):
+               cancelled: str = "", action: str = ""):
     versions = sites.available_scraper_versions() or [1]
-    background_job = _page_task(request, job, kinds={"site-deploy"})
+    background_job = _page_task(request, job, kinds=_SITE_JOB_KINDS)
     recent = _recent_task(
-        request, kinds={"site-deploy"}, completed_only=True,
+        request, kinds=_SITE_JOB_KINDS, completed_only=True,
     )
     recent_result = (recent or {}).get("result") or {}
     if not deployed and recent_result.get("site_id"):
         deployed = recent_result["site_id"]
         ok = "1" if recent_result.get("ok") else "0"
+        # Restoring the banner by navigation rather than the redirect must not
+        # relabel a take-down as a deploy.
+        action = recent_result.get("action") or action
     deploy_output = recent_result.get("output") or _LAST_DEPLOY.get("output")
     deploy_site_id = recent_result.get("site_id") or _LAST_DEPLOY.get("site_id")
     return templates.TemplateResponse(
@@ -326,6 +355,7 @@ def sites_page(request: Request, deployed: str = "", ok: str = "", job: str = ""
             "suggested": sites.suggest_ports(),
             "deployed": deployed,
             "ok": ok,
+            "action": action or "deploy",
             "deploy_output": deploy_output,
             "deploy_site_id": deploy_site_id,
             "background_job": background_job,
@@ -426,6 +456,115 @@ def deploy(
     return RedirectResponse(f"/sites?job={job_id}", status_code=303)
 
 
+# --- Site lifecycle (start / take down / delete) ---------------------------
+# All three share the deploy job's exclusive key: each one takes the same
+# cross-process publication lock, so letting the UI queue two at once would only
+# produce a "publication busy" failure the operator has to interpret.
+def _site_lifecycle(request, site_id, *, kind, action, label, run):
+    """Start one background site-lifecycle operation and redirect to its job."""
+    site_id = (site_id or "").strip()
+    try:
+        sites._validate_site_id(site_id)
+    except ValueError as exc:
+        _LAST_DEPLOY.update(site_id=site_id, output=str(exc))
+        return RedirectResponse(f"/sites?ok=0&action={action}", status_code=303)
+
+    def done(ok):
+        return f"/sites?deployed={site_id}&ok={1 if ok else 0}&action={action}"
+
+    if request is None:  # direct call from the offline route tests
+        ok, output = run(site_id, None)
+        _LAST_DEPLOY.update(site_id=site_id, output=output)
+        return RedirectResponse(done(ok), status_code=303)
+
+    owner, _ = _job_identity(request)
+
+    def worker(task):
+        ok, output = run(site_id, task)
+        _LAST_DEPLOY.update(site_id=site_id, output=output)
+        return {
+            "ok": ok,
+            "label": (
+                f"{site_id} {label['done']}." if ok
+                else f"{label['verb'].capitalize()} of {site_id} failed."
+            ),
+            "error": None if ok else output[-1000:],
+            "redirect": done(ok),
+            "site_id": site_id,
+            "action": action,
+            "output": output,
+        }
+
+    try:
+        job_id = task_service.start(
+            kind, worker, owner=owner,
+            label=f"Queueing {label['verb']} of {site_id}…",
+            exclusive_key="site-deploy",
+            redirect=f"/sites?ok=0&action={action}",
+        )
+    except task_service.TaskBusy as exc:
+        if exc.job_id:
+            return RedirectResponse(f"/sites?job={exc.job_id}", status_code=303)
+        _LAST_DEPLOY.update(site_id=site_id, output=str(exc))
+        return RedirectResponse("/sites?ok=0", status_code=303)
+    return RedirectResponse(f"/sites?job={job_id}", status_code=303)
+
+
+@app.post("/sites/start")
+def start_site(site_id: str = Form(...), request: Request = None):
+    """Redeploy an already-configured site from its stored YAML.
+
+    Deliberately runs the same playbook as a deploy rather than a bare
+    ``compose start``: bringing a site back has to re-render its stack and
+    re-publish its route, TLS, and monitoring rules, which is exactly what the
+    playbook is for. No form values are written, so the site returns with the
+    configuration (and stored canaries) it was taken down with.
+    """
+    return _site_lifecycle(
+        request, site_id, kind="site-start", action="start",
+        label={"verb": "start", "done": "is live again"},
+        run=lambda sid, task: sites.deploy_site(sid, task=task),
+    )
+
+
+@app.post("/sites/stop")
+def stop_site(site_id: str = Form(...), request: Request = None):
+    return _site_lifecycle(
+        request, site_id, kind="site-stop", action="stop",
+        label={"verb": "take-down", "done": "is down"},
+        run=lambda sid, task: sites.stop_site(sid, task=task),
+    )
+
+
+@app.post("/sites/delete")
+def delete_site(site_id: str = Form(...), confirm: str = Form(""),
+                request: Request = None):
+    """Delete a site. ``confirm`` must echo the site id.
+
+    The typed confirmation is a server-side gate, not decoration: this is the
+    one site action that destroys the database volume, and the browser's
+    dialog cannot be relied on (a stale tab, a replayed form, or a scripted
+    POST all skip it).
+    """
+    site_id = (site_id or "").strip()
+    if confirm.strip() != site_id or not site_id:
+        _LAST_DEPLOY.update(
+            site_id=site_id,
+            output=(
+                f"Deletion of {site_id or 'the site'} was not confirmed, so "
+                "nothing was changed. Type the site id exactly to confirm."
+            ),
+        )
+        return RedirectResponse(
+            f"/sites?deployed={site_id}&ok=0&action=delete", status_code=303
+        )
+    return _site_lifecycle(
+        request, site_id, kind="site-delete", action="delete",
+        label={"verb": "deletion", "done": "is deleted"},
+        run=lambda sid, task: sites.delete_site(sid, task=task),
+    )
+
+
 # --- Crawler Analytics (requests + fingerprints + campaigns, one page) -------
 # Survives the post/redirect so a campaign-recompute error shows on the page.
 _LAST_INTEL = {}
@@ -441,13 +580,23 @@ def _annotate_rows(data, disguise):
     ``/logs`` page and the ``/logs/fragment`` AJAX paging endpoint so both render
     rows identically."""
     devices = [d for d in (disguise.get("devices") or []) if d.get("fp_id")]
-    disguised_ids = {d["fp_id"] for d in devices if d.get("basis") == "identities"}
-    roaming_ids = {d["fp_id"] for d in devices if d.get("basis") == "networks"}
+    bases = {str(d["fp_id"]): d.get("basis") for d in devices}
+    # The summary card deliberately displays only its top N devices.  Resolve
+    # every fp_id on this request page separately so device 51+ cannot lose its
+    # disguise flag merely because it fell outside that presentation limit.
+    page_ids = {
+        str(row["fp_id"])
+        for row in (data.get("rows") or [])
+        if row.get("fp_id")
+    }
+    if page_ids:
+        bases.update(fingerprint_service.disguise_bases(page_ids))
     for row in data.get("rows") or []:
         if row.get("fp_id"):
-            if row["fp_id"] in disguised_ids:
+            basis = bases.get(str(row["fp_id"]))
+            if basis == "identities":
                 row["disguised"] = True
-            elif row["fp_id"] in roaming_ids:
+            elif basis == "networks":
                 row["net_roaming"] = True
         row["severity"] = fingerprint_service.severity_of(row)
     return data
@@ -547,7 +696,8 @@ def logs_fragment(
         )
     except request_log.RequestLogError as exc:
         return HTMLResponse(
-            f'<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">{exc}</td></tr>'
+            f'<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">'
+            f'{escape(str(exc))}</td></tr>'
         )
     # The disguised-device set changes far slower than a human pages, so a briefly
     # cached copy keeps Prev/Next to a single psql round-trip.
@@ -1427,12 +1577,58 @@ def request_access_page(request: Request):
     )
 
 
+@app.get("/admin")
+def admin_root():
+    return RedirectResponse("/admin/approve", status_code=307)
+
+
+@app.get("/admin/auth-check")
+def admin_auth_check(request: Request):
+    """Return a redirect-free decision for nginx ``auth_request`` subrequests."""
+    return Response(status_code=204 if _is_admin(request) else 401)
+
+
+@app.get("/admin/monitoring", response_class=HTMLResponse)
+def admin_monitoring_page(request: Request):
+    """Render immediately; the browser loads bounded monitoring data later."""
+    if not _is_admin(request):
+        return templates.TemplateResponse(
+            request,
+            "admin_login.html",
+            {"error": "", "next": "/admin/monitoring"},
+        )
+    return templates.TemplateResponse(
+        request,
+        "admin_monitoring.html",
+        {
+            "active_admin_tab": "monitoring",
+            "grafana_path": config.GRAFANA_PUBLIC_PATH,
+        },
+    )
+
+
+@app.get("/admin/monitoring/status")
+def admin_monitoring_status(request: Request):
+    if not _is_admin(request):
+        return JSONResponse({"detail": "Not authorized."}, status_code=403)
+    return JSONResponse(
+        monitoring_service.overview(),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
 @app.get("/admin/approve", response_class=HTMLResponse)
 def admin_approve_page(request: Request):
     """Render the password form or the session-unlocked approval console."""
     if not _is_admin(request):
         return templates.TemplateResponse(
-            request, "admin_login.html", {"error": ""}
+            request,
+            "admin_login.html",
+            {"error": "", "next": "/admin/approve"},
         )
 
     flash = request.session.pop("admin_flash", {})
@@ -1444,28 +1640,37 @@ def admin_approve_page(request: Request):
             "message": flash.get("message", ""),
             "error": flash.get("error", ""),
             "signup_url": f"{config.APP_BASE_URL}/signup",
+            "active_admin_tab": "approve",
         },
     )
 
 
 @app.post("/admin/login")
-def admin_login(request: Request, admin_secret: str = Form(...)):
+def admin_login(
+    request: Request,
+    admin_secret: str = Form(...),
+    next: str = Form("", alias="next"),
+):
+    destination = _admin_destination(next)
     if not auth_service.admin_login_allowed(_request_ip(request)):
         return templates.TemplateResponse(
             request,
             "admin_login.html",
-            {"error": "Too many attempts — try again in a few minutes."},
+            {
+                "error": "Too many attempts — try again in a few minutes.",
+                "next": destination,
+            },
             status_code=429,
         )
     if not _admin_secret_matches(admin_secret):
         return templates.TemplateResponse(
             request,
             "admin_login.html",
-            {"error": "Invalid administrator password."},
+            {"error": "Invalid administrator password.", "next": destination},
             status_code=403,
         )
     request.session["is_admin"] = True
-    return RedirectResponse("/admin/approve", status_code=303)
+    return RedirectResponse(destination, status_code=303)
 
 
 @app.post("/admin/approve")

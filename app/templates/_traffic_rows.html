@@ -13,13 +13,14 @@
         <td class="mono nowrap ts" data-ts="{{ row.ts }}" title="{{ row.ts }}">{{ row.ts }}</td>
         <td>{{ row.site }}</td>
         <td><span class="badge badge--navy">{{ row.method }}</span></td>
+        <td class="mono nowrap" title="Final status recorded by nginx">{{ row.response_status if row.response_status is not none else '—' }}</td>
         <td class="mono truncate" title="{{ row.uri }}">{{ row.uri }}</td>
         <td class="mono">{{ row.client_ip }}</td>
         <td class="truncate" title="{{ row.user_agent }}">{{ row.user_agent }}</td>
         <td class="nowrap"><button type="button" class="btn btn--ghost btn--sm detail-toggle" data-detail-toggle aria-expanded="false">Detail</button></td>
     </tr>
     <tr class="detailrow" hidden>
-        <td colspan="7">
+        <td colspan="8">
             <div class="detailpanel">
                 <p style="margin:0 0 .6rem">
                     <span class="sev sev--{{ sev.level }}">
@@ -48,7 +49,7 @@
                         <div class="grid grid-cols-2 gap-x-5 gap-y-1 my-1">
                             {% set kv = [
                                 ('UA OS', v.claimed_os), ('JS platform', v.js_os),
-                                ('TCP OS', (v.tcp_os ~ ' · local hop') if (v.tcp_os and not v.tcp_os_trusted) else v.tcp_os),
+                                ('TCP OS', (v.tcp_os ~ ' · untrusted match') if (v.tcp_os and not v.tcp_os_trusted) else v.tcp_os),
                                 ('WebGL renderer', row.webgl_renderer), ('WebGL vendor', row.webgl_vendor),
                                 ('Canvas', row.canvas_hash), ('Audio', row.audio_hash),
                                 ('Font', row.font_hash), ('JA4T', row.ja4t), ('Phase', row.phase),
@@ -59,9 +60,9 @@
                         </div>
                         {% if v.tcp_os and not v.tcp_os_trusted %}
                         <p class="muted" style="font-size:11px;margin:.3rem 0 .3rem">
-                            The TCP/IP OS guess (<span class="mono">{{ v.tcp_os }}</span>) is the <strong>local NAT hop</strong>,
-                            not this visitor's machine — they reached the proxy through Docker's userland proxy, so it is
-                            <strong>not</strong> used to judge OS spoofing. (Real crawlers arrive from public IPs, where it counts.)
+                            The TCP/IP OS guess (<span class="mono">{{ v.tcp_os }}</span>) is <strong>not trusted for accusation</strong>.
+                            The source may be a local forwarding hop, or the SYN was matched only by shared IP rather than this
+                            request's exact source port. It remains visible as context but is not used to judge OS spoofing.
                         </p>
                         {% endif %}
                         {% if row.automation %}
@@ -74,18 +75,22 @@
                         {% endif %}
                         {% else %}
                         <p style="margin:0 0 .35rem"><strong>Device fingerprint</strong></p>
-                        {% if v.score %}
+                        {% if v.automation %}
+                        <p class="muted" style="margin:.1rem 0">This request's User-Agent identifies <strong>automation or scanner tooling</strong>. No browser fingerprint is expected from a non-browser client, so the automation identity—not missing JavaScript—is the signal.</p>
+                        {% elif v.browser_no_js %}
                         <p class="muted" style="margin:.1rem 0">This request used a <strong>browser User-Agent but never executed <span class="mono">fp.js</span></strong> — a headless or agentic crawler. That absence is itself a bot signal.</p>
+                        {% elif v.score %}
+                        <p class="muted" style="margin:.1rem 0">This request has a cross-layer inconsistency. It has no browser fingerprint, so only the available request and trusted network evidence were evaluated.</p>
+                        {% else %}
+                        <p class="muted" style="margin:.1rem 0">No browser fingerprint for this request — the client never ran <span class="mono">fp.js</span> (a non-JS / declared client).</p>
+                        {% endif %}
                         {% if v.contradictions %}
                         <ul style="margin:.2rem 0 .4rem 1.1rem;padding:0;list-style:disc">
                             {% for r in v.contradictions %}<li class="muted">{{ r }}</li>{% endfor %}
                         </ul>
                         {% endif %}
-                        {% else %}
-                        <p class="muted" style="margin:.1rem 0">No browser fingerprint for this request — the client never ran <span class="mono">fp.js</span> (a non-JS / declared client).</p>
-                        {% endif %}
                         {% if v.tcp_os %}
-                        <div class="truncate" style="margin-top:.35rem"><span class="muted">TCP OS:</span> <span class="mono">{{ v.tcp_os }}{% if not v.tcp_os_trusted %} · local hop{% endif %}</span></div>
+                        <div class="truncate" style="margin-top:.35rem"><span class="muted">TCP OS:</span> <span class="mono">{{ v.tcp_os }}{% if not v.tcp_os_trusted %} · untrusted match{% endif %}</span></div>
                         {% endif %}
                         {% endif %}
                     </div>
@@ -95,5 +100,5 @@
     </tr>
     {% endfor %}
 {% else %}
-    <tr><td colspan="7" class="muted" style="text-align:center;padding:32px">No requests match these filters.</td></tr>
+    <tr><td colspan="8" class="muted" style="text-align:center;padding:32px">No requests match these filters.</td></tr>
 {% endif %}

@@ -97,10 +97,68 @@ def test_request_log_csv_export_is_well_formed(monkeypatch):
         "method": "GET", "uri": "/", "user_agent": "Chrome", "headers": {"accept": "text/html"},
     }]
     csv_text = request_log.requests_to_csv(rows)
-    assert csv_text.splitlines()[0] == "id,ts,site,client_ip,method,uri,user_agent,headers"
+    assert csv_text.splitlines()[0] == (
+        "id,ts,site,client_ip,method,response_status,uri,user_agent,request_id,headers"
+    )
     parsed = list(csv.DictReader(StringIO(csv_text)))
     assert parsed[0]["client_ip"] == PUBLIC_IP
     assert parsed[0]["headers"] == '{"accept": "text/html"}'  # headers JSON-serialized
+
+
+def test_request_log_csv_export_neutralizes_formula_cells():
+    """Opening attacker-controlled request data in a spreadsheet stays inert."""
+    from app.services import request_log
+
+    dangerous_values = (
+        "=1+1",
+        " +SUM(1,1)",
+        "\t-CMD|' /C calc'!A0",
+        "\r@SUM(1+1)",
+        "\ufeff=HYPERLINK(\"https://attacker.invalid\")",
+    )
+    rows = []
+    for index, value in enumerate(dangerous_values, start=1):
+        rows.append({
+            "id": index,
+            "ts": "2026-07-16T00:00:00+00:00",
+            "site": "site-001",
+            "client_ip": "203.0.113.7",
+            "method": "GET",
+            "response_status": 404,
+            "uri": "/ordinary",
+            "user_agent": value,
+            "request_id": "a" * 32,
+            "headers": {"user-agent": "=still JSON, not a cell prefix"},
+        })
+
+    parsed = list(csv.DictReader(StringIO(request_log.requests_to_csv(rows))))
+    assert [row["user_agent"] for row in parsed] == [
+        "'" + value for value in dangerous_values
+    ]
+    assert all(row["uri"] == "/ordinary" for row in parsed)
+    assert all(row["response_status"] == "404" for row in parsed)
+    assert all(row["headers"].startswith("{") for row in parsed)
+
+
+def test_request_log_exposes_status_and_only_trusts_exact_bounded_tcp_matches(monkeypatch):
+    from app.services import logdb, request_log
+
+    calls = []
+    payload = {"total": 0, "last_24h": 0, "unique_sites": 0, "rows": []}
+    monkeypatch.setattr(logdb, "_container_id", None)
+    monkeypatch.setattr(
+        logdb.subprocess, "run",
+        lambda cmd, **kw: (calls.append(cmd), _completed(cmd, payload))[1],
+    )
+
+    request_log.fetch_requests()
+    sql = calls[-1][-1]
+    assert "response_status" in sql and "request_id" in sql
+    assert "to_jsonb(a) ->> 'response_status'" in sql
+    assert "tf.ts BETWEEN a.ts - INTERVAL '5 minutes'" in sql
+    assert "a.ts + INTERVAL '5 seconds'" in sql
+    assert "tf.src_port = a.client_port" in sql
+    assert "tcp_match_exact" in sql
 
 
 def test_request_log_surfaces_actionable_startup_guidance(monkeypatch):
@@ -204,6 +262,9 @@ def test_fingerprint_viewer_falls_back_without_tcp_table_and_scores_rows(monkeyp
 
     assert "b.site = 'site-001'" in seen_sql[0]      # site filter escaped into WHERE
     assert "tcp_fingerprints" in seen_sql[0]         # first attempt tried the TCP join
+    assert "tt.ts BETWEEN b.ts - INTERVAL '5 minutes'" in seen_sql[0]
+    assert "b.ts + INTERVAL '5 seconds'" in seen_sql[0]
+    assert "tcp_match_exact" in seen_sql[0]
     assert "LIMIT 10 OFFSET 0" in seen_sql[1]        # page size clamped to the 10 floor
     verdict = data["rows"][0]["verdict"]
     assert verdict["vm_cohort"] is True and verdict["automation"] is True
@@ -306,6 +367,59 @@ def test_disguise_summary_groups_by_device_and_flags_identity_rotation(monkeypat
     assert fingerprint_service.disguise_summary()["devices"] == []
 
 
+def test_disguise_bases_classifies_page_ids_beyond_summary_limit(monkeypatch):
+    """Row flags are resolved for the actual page, not only the top-50 card."""
+    from app import main
+    from app.services import fingerprint_service
+
+    chrome = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36"
+    )
+    firefox = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) "
+        "Gecko/20100101 Firefox/127.0"
+    )
+    calls = []
+
+    def fake_query(sql):
+        calls.append(sql)
+        return {"devices": [{
+            "fp_id": "device-051",
+            "uas": [chrome, firefox],
+            "ips": ["104.28.1.9"],
+        }]}
+
+    monkeypatch.setattr(fingerprint_service, "_run_json_query", fake_query)
+    assert fingerprint_service.disguise_bases(
+        ["device-051", "fp'quoted"], chunk_size=1,
+    ) == {"device-051": "identities"}
+    assert len(calls) == 2
+    assert any("fp''quoted" in sql for sql in calls), "fp_ids must be SQL escaped"
+
+    # The presentation summary contains 50 other devices, so the old code left
+    # device 51 green/orange. The page-scoped lookup must still make it red.
+    summary = {"devices": [
+        {"fp_id": f"device-{index:03d}", "basis": "identities"}
+        for index in range(1, 51)
+    ]}
+    data = {"rows": [{
+        "fp_id": "device-051",
+        "fp_present": True,
+        "verdict": {"score": 0, "inconsistent": False},
+        "method": "GET",
+        "uri": "/",
+    }]}
+    monkeypatch.setattr(
+        fingerprint_service,
+        "disguise_bases",
+        lambda fp_ids: {"device-051": "identities"},
+    )
+    main._annotate_rows(data, summary)
+    assert data["rows"][0]["disguised"] is True
+    assert data["rows"][0]["severity"]["level"] == "malicious"
+
+
 def test_severity_of_maps_the_verdict_to_the_three_row_tiers():
     """severity_of collapses a request's verdict into clean/suspicious/malicious for the
     row-color the /logs table now uses."""
@@ -319,7 +433,10 @@ def test_severity_of_maps_the_verdict_to_the_three_row_tiers():
     roam = fs.severity_of({"net_roaming": True, "fp_present": True, "verdict": {"score": 0}})
     assert roam["level"] == "suspicious" and "networks" in roam["reason"]
     # suspicious — a lesser contradiction (here: a browser UA that never ran JS).
-    susp = fs.severity_of({"fp_present": False, "verdict": {"score": 1}})
+    susp = fs.severity_of({
+        "fp_present": False,
+        "verdict": {"score": 1, "browser_no_js": True},
+    })
     assert susp["level"] == "suspicious" and "never ran JS" in susp["reason"]
     # suspicious — a VM/software renderer on a real beacon.
     assert fs.severity_of({"fp_present": True, "verdict": {"score": 2, "vm_cohort": True}})["level"] == "suspicious"
@@ -334,11 +451,15 @@ def test_probe_reason_flags_hostile_targets_but_not_legit_paths():
 
     # Secrets / config / VCS / IDE / backup exfiltration.
     for uri in (
-        "/.env", "/.env.production", "/.envrc", "/api/shared/.env",
+        "/.env", "/.env.production", "/.envrc", "/.env_copy", "/.env2",
+        "/.env~", "/api/shared/.env",
         "/.git/config", "/.git/HEAD", "/.aws/credentials", "/.ssh/id_rsa",
-        "/.vscode/sftp.json", "/.DS_Store", "/wp-config.php", "/config.json",
-        "/storage/logs/laravel.log", "/backup.zip", "/db.sql", "/actuator/env",
-        "/server-status", "/_profiler",
+        "/.vscode/sftp.json", "/.DS_Store", "/wp-config.php", "/wp-config.txt",
+        "/config.json", "/.netrc", "/.pypirc", "/.dev.vars", "/debug.log",
+        "/firebase-debug.log", "/storage/logs/laravel.log", "/backup.zip",
+        "/db.sql", "/Dockerfile", "/Procfile", "/serverless.yaml",
+        "/functions/.runtimeconfig.json", "/actuator/env", "/server-status",
+        "/_profiler",
     ):
         assert fs.probe_reason(uri) is not None, uri
 
@@ -356,19 +477,233 @@ def test_probe_reason_flags_hostile_targets_but_not_legit_paths():
     assert fs.probe_reason("/.well-known/../../.env") is not None
     assert fs.probe_reason("/static/../../etc/passwd") is not None
 
-    # Legit honeypot paths must stay clean (query strings and case ignored). The
-    # query is stripped before matching, so a benign `?name=`/`?v=` never reddens
-    # the root, and a bare `/query` (a real admin route, were this helper reused)
-    # is left for the identity engine rather than blanket-flagged.
+    # Legit honeypot paths must stay clean. Query-specific exploit signatures are
+    # inspected, but an ordinary `?name=`/`?v=` never reddens the root; and the
+    # compatibility helper only returns reasons for red findings, so a bare
+    # unexpected `/query` remains non-malicious here (target_assessment makes it
+    # orange in the request table).
     for uri in (
         "/", "/favicon.ico", "/robots.txt", "/js/fp.js", "/__fpbeacon",
-        "/css/site.css?v=1", "/static/css/app.css?v=123",
+        "/css/site.css?v=1",
         "/.well-known/acme-challenge/LbAY57zYhGIXkoeBsFYkMN",
-        "/.well-known/security.txt", "/sitemap.xml",
+        "/.well-known/security.txt", "/sitemap.xml", "/sitemap-index.xml",
+        "/sitemap_index.xml", "/apple-touch-icon.png",
+        "/apple-touch-icon-precomposed.png",
         "/?name=1.odns.m.dnsmeasure.top&type=A", "/query", "/query?name=x",
         None, "",
     ):
         assert fs.probe_reason(uri) is None, uri
+
+
+def test_target_assessment_catches_observed_probe_gaps_without_reddening_safe_queries():
+    """Regression fixtures from the live table cover query, VPN, API, debug,
+    config, and device reconnaissance that previously remained green."""
+    from app.services import fingerprint_service as fs
+
+    malicious = (
+        ("GET", "/?rest_route=/wp/v2/users/"),
+        ("POST", "/?%ADd+allow_url_include%3d1+%ADd+auto_prepend_file%3dphp://input"),
+        ("GET", "/+webvpn+/index.html"),
+        ("GET", "/+CSCOE+/logon.html"),
+        ("GET", "/remote/login"),
+        ("GET", "/dana-na"),
+        ("GET", "/sslvpnclient?launchplatform=mac"),
+        ("POST", "/global-protect/prelogin.esp?clientos=Windows"),
+        ("GET", "/containers/json"),
+        ("POST", "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo"),
+        ("GET", "/developmentserver/metadatauploader"),
+        ("POST", "/api/gql"),
+        ("GET", "/graphql"),
+        ("GET", "/ReportServer"),
+        ("GET", "/debug/default/view?panel=config"),
+        ("GET", "/@vite/env"),
+        ("GET", "/trace.axd"),
+        ("GET", "/telescope/requests"),
+        ("GET", "/s/x/_/;/META-INF/maven/com.atlassian.jira/pom.properties"),
+        ("GET", "/docker-compose.yml"),
+        ("GET", "/.bash_history"),
+        ("HEAD", "/.npmrc"),
+        ("GET", "/config/production.json"),
+        ("GET", "/_vti_pvt/service.pwd"),
+        ("POST", "/mcp"),
+        ("POST", "/onvif/device_service"),
+        ("GET", "/portal/redlion"),
+        ("GET", "/_cat/indices"),
+        ("GET", "/_environment"),
+        ("GET", "/webroot/index.php/_environment"),
+        ("GET", "/debug/pprof/cmdline"),
+        ("GET", "/app/kibana"),
+        ("GET", "/api/swagger.json"),
+        ("GET", "/swagger-ui.html"),
+        ("GET", "/v2/api-docs"),
+        ("GET", "/graphiql"),
+        ("GET", "/evox/about"),
+        ("GET", "/nmaplowercheck1784176961"),
+        ("GET", "/administrator/components/com_jce/jce.xml"),
+        ("GET", "/administrator/manifests/packages/pkg_jce.xml"),
+        ("GET", "/plugins/editors/jce/jce.xml"),
+        ("GET", "/wp-content/cache/breeze-extra/"),
+        ("TRACE", "/"),
+    )
+    for method, uri in malicious:
+        finding = fs.target_assessment(uri, method)
+        assert finding is not None and finding["level"] == "malicious", (method, uri, finding)
+
+    # Generic unknown routes and unsupported-but-not-inherently-hostile methods
+    # deserve review without being called certain attacks.
+    for method, uri in (
+        ("GET", "/admin"),
+        ("GET", "/login"),
+        ("GET", "/about"),
+        ("GET", "/pricing"),
+        ("GET", "/signup"),
+        ("GET", "/wiki"),
+        ("GET", "/api/config"),
+        ("GET", "/api/env"),
+        ("GET", "/version"),
+        ("GET", "/server"),
+        ("GET", "/css/support_parent.css"),
+        ("GET", "/static/css/app.css?v=123"),
+        ("POST", "/"),
+        ("POST", "/query"),
+    ):
+        finding = fs.target_assessment(uri, method)
+        assert finding is not None and finding["level"] == "suspicious", (method, uri, finding)
+
+    for method, uri in (
+        ("GET", "/"),
+        ("GET", "/?name=1.odns.m.dnsmeasure.top&type=A"),
+        ("HEAD", "/robots.txt"),
+        ("GET", "/apple-touch-icon.png"),
+        ("GET", "/sitemap_index.xml"),
+        ("GET", "/css/site.css?v=1"),
+        ("POST", "/__fpbeacon"),
+    ):
+        assert fs.target_assessment(uri, method) is None, (method, uri)
+
+    # Decode at most twice so encoded traversal cannot hide under a safe prefix;
+    # encoded query/fragment bytes remain path data and cannot hide a secret
+    # probe; malformed and very long benign input remains bounded/non-raising.
+    assert fs.target_assessment("/static/%252e%252e/.env", "GET")["level"] == "malicious"
+    for uri in (
+        "/%23/.env", "/%2523/.env", "/%3f/.env", "/%253f/.env",
+        "http://honeypot.invalid/%23/.env",
+    ):
+        assert fs.target_assessment(uri, "GET")["level"] == "malicious", uri
+    assert fs.target_assessment("/?next=%23/.env", "GET") is None
+    assert fs.target_assessment("/?note=%zz" + "x" * 20_000, "GET") is None
+
+
+def test_row_verdict_scopes_no_js_to_documents_and_exempts_declared_crawler_os_wrappers():
+    """Only the HTML document can emit fp.js; OAI's browser wrapper is not its kernel."""
+    from app.services import fingerprint_service as fs
+
+    chrome = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+    )
+    root = fs.verdict_for({
+        "client_ip": "104.28.1.9", "user_agent": chrome, "method": "GET", "uri": "/",
+    })
+    assert root["browser_no_js"] is True
+    assert root["score"] == 1 and any("never executed JS" in c for c in root["contradictions"])
+
+    for method, uri in (("GET", "/css/site.css"), ("GET", "/js/fp.js"),
+                        ("GET", "/favicon.ico"), ("GET", "/robots.txt"),
+                        ("HEAD", "/")):
+        verdict = fs.verdict_for({
+            "client_ip": "104.28.1.9", "user_agent": chrome, "method": method, "uri": uri,
+        })
+        assert verdict["browser_no_js"] is False, (method, uri, verdict)
+        assert verdict["score"] == 0, (method, uri, verdict)
+
+    oai_ua = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36; compatible; "
+        "OAI-SearchBot/1.3; +https://openai.com/searchbot"
+    )
+    row = {
+        "client_ip": "104.210.140.134", "user_agent": oai_ua,
+        "method": "GET", "uri": "/robots.txt", "tcp_os": "Linux",
+        "tcp_match_exact": True, "fp_present": False,
+    }
+    row["verdict"] = fs.verdict_for(row)
+    assert row["verdict"]["declared_crawler"] is True
+    assert row["verdict"]["inconsistent"] is False
+    assert fs.severity_of(row)["level"] == "clean"
+
+    # Declared identity never overrides malicious intent.
+    row.update(uri="/.env")
+    assert fs.severity_of(row)["level"] == "malicious"
+
+
+def test_transparent_scanner_user_agents_are_suspicious_automation():
+    """Honest tool/scanner UAs should not be green merely because they skip JS."""
+    from app.services import fingerprint_service as fs
+    from crawler_graph.ingest import known_crawlers
+
+    for ua in (
+        "curl/8.12.1", "Mozilla/5.0 zgrab/0.x", "l9scan/2.0",
+        "CensysInspect/1.1", "Nuclei - Open-source project",
+        "Hello from Palo Alto Networks, Cortex-Xpanse scan",
+        "Mozilla/5.0 (compatible; InternetMeasurement/1.0)",
+        "RecordedFuture Global Inventory Crawler", "CMS-Checker/1.0",
+        "CheckHost (https://check-host.net/)", "Scrapy/2.16.0",
+        "Mozilla/5.0 (compatible; FlowIQLabsBot/1.0)",
+        "Mozilla/5.0 (compatible; ModatScanner/1.2)",
+        "Shodan-Pull/1.0", "Mozilla/5.0 (compatible; Infrawatch/1.0)",
+        "Linux Gnu (cow)",
+        "Mozilla/5.0 Chrome/137.0 Safari/537.36 +https://forestengine.net/#opt-out",
+        "StabilityBot/1.0", "DifferentCrawler/2.0",
+    ):
+        assert known_crawlers.looks_automated(ua) is True, ua
+        row = {
+            "client_ip": "104.28.1.9", "user_agent": ua,
+            "method": "GET", "uri": "/", "fp_present": False,
+        }
+        row["verdict"] = fs.verdict_for(row)
+        assert row["verdict"]["automation"] is True, (ua, row["verdict"])
+        assert row["verdict"]["browser_no_js"] is False, (ua, row["verdict"])
+        severity = fs.severity_of(row)
+        assert severity["level"] == "suspicious", (ua, severity)
+        assert "automation" in severity["reason"]
+
+    # Product-token boundaries avoid ordinary names that merely contain a tool
+    # substring; the real scanner token remains detectable.
+    for ua in (
+        "OpenMap/1.0", "Human NmapleBrowser/1.0", "NotModatScannery/1.0",
+        "HumanShodan-Puller/1.0", "FlowIQLabsBotanist/1.0",
+    ):
+        assert known_crawlers.looks_automated(ua) is False, ua
+    assert known_crawlers.looks_automated("Nmap/7.95") is True
+    assert known_crawlers.looks_automated("GPTBot/1.4") is False
+
+
+def test_declared_crawler_names_require_product_boundaries():
+    """Impostor substrings cannot inherit the declared-crawler TCP exemption."""
+    from app.services import fingerprint_service as fs
+    from crawler_graph.ingest import known_crawlers
+
+    for ua in ("DefinitelyNotGPTBot", "myGooglebotImpersonator", "NotClaudeBot"):
+        assert known_crawlers.provider_for_ua(ua) is None, ua
+        browser_ua = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36 " + ua
+        )
+        verdict = fs.verdict_for({
+            "client_ip": "104.28.1.9", "user_agent": browser_ua,
+            "method": "GET", "uri": "/robots.txt", "tcp_os": "Linux",
+            "tcp_match_exact": True,
+        })
+        assert verdict["declared_crawler"] is False, (ua, verdict)
+        assert verdict["inconsistent"] is True, (ua, verdict)
+
+    for ua, provider in (
+        ("GPTBot/1.4", "OpenAI"),
+        ("Googlebot-Image/1.0", "Google"),
+        ("ClaudeBot/1.0", "Anthropic"),
+    ):
+        assert known_crawlers.provider_for_ua(ua) == provider
 
 
 def test_severity_of_marks_secrets_and_exploit_probes_malicious():

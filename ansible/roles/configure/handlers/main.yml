@@ -1,12 +1,18 @@
 ---
-# Reload (never restart) nginx so adding/changing a site never drops the others.
-# Validate first; failed_when:false because the proxy stack may not be up yet on
-# the very first deploy (start it with `make proxy`). Runs at end of play, after
-# the deploy role has brought the site's container up.
-- name: Validate and reload nginx
-  ansible.builtin.command: "docker exec {{ proxy.container }} {{ item }}"
-  loop:
-    - nginx -t
-    - nginx -s reload
+# Prometheus has no --web.enable-lifecycle flag: SIGHUP reloads its config and
+# rule-file globs without exposing the lifecycle/quit API on monitoring_bridge.
+# A stopped monitoring stack is allowed—the files load on its next start—but a
+# running Prometheus must acknowledge HUP or publication rolls back.
+- name: Inspect Prometheus before rule reload
+  ansible.builtin.command: >-
+    docker ps --quiet --filter name=^/{{ monitoring.prometheus_container }}$
+  register: prometheus_for_rule_reload
+  changed_when: false
+  listen: Reload prometheus rules
+
+- name: Reload prometheus rules
+  ansible.builtin.command: >-
+    docker kill --signal=HUP {{ monitoring.prometheus_container }}
   changed_when: true
-  failed_when: false
+  when: prometheus_for_rule_reload.stdout | trim | length > 0
+  listen: Reload prometheus rules

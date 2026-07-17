@@ -1,0 +1,229 @@
+# group_vars may have been discovered before the reservation play ran.
+# Reload it explicitly now that the shared lock is held, then read all
+# dependent site/route/port state under that same immutable snapshot.
+- name: Reload global deployment defaults under publication lock
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/group_vars/all.yml"
+
+- name: Require site_id
+  ansible.builtin.assert:
+    that:
+      - site_id is defined
+      - site_id is match('^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
+      - site_id != 'admin'
+    fail_msg: >-
+      Pass a lowercase DNS-label-safe site via -e site_id=<id> (e.g.
+      site-001); use 1-63 letters/digits with non-edge hyphens only. The
+      id 'admin' is reserved for the control plane.
+
+- name: Load per-site overrides from {{ site_config_path }}
+  ansible.builtin.include_vars:
+    file: "{{ site_config_path }}"
+    name: site_cfg
+
+- name: Merge site overrides over defaults
+  ansible.builtin.set_fact:
+    scraper_version: "{{ site_cfg.scraper_version | default(scraper_version) | int }}"
+    website: "{{ website | combine(site_cfg.website | default({})) }}"
+    database: "{{ database | combine(site_cfg.database | default({})) }}"
+    proxy: "{{ proxy | combine(site_cfg.proxy | default({})) }}"
+    # Generator-authored flavors ship their own category-typed varList; the
+    # app embeds it per site (configs/sites/<id>.yaml) so the rendered
+    # varLists/scraper<N>.txt matches the template. Absent, the global
+    # canary_tokens from all.yml apply unchanged.
+    canary_tokens: "{{ site_cfg.canary_tokens | default(canary_tokens) }}"
+
+- name: Require nginx's mounted publication directory
+  ansible.builtin.assert:
+    that:
+      - (proxy.conf_dir | realpath) == ((project_root ~ '/proxy/conf.d') | realpath)
+    fail_msg: >-
+      proxy.conf_dir must resolve to {{ project_root }}/proxy/conf.d because
+      docker-compose.proxy.yml mounts only that directory into nginx.
+      Publishing elsewhere would create a false Live route that nginx does
+      not serve.
+  when: proxy.enabled | default(false) | bool
+
+- name: Require proxy aliases to be a list
+  vars:
+    configured_aliases: "{{ proxy.server_aliases | default([]) }}"
+  ansible.builtin.assert:
+    that:
+      - configured_aliases is sequence
+      - configured_aliases is not string
+      - configured_aliases is not mapping
+    fail_msg: "proxy.server_aliases must be a YAML list, not a scalar or mapping."
+
+- name: Require proxy hostnames and alias entries to be strings
+  vars:
+    canonical_hostname: "{{ proxy.server_name | default(site_id ~ '.' ~ proxy.base_domain) }}"
+    configured_aliases: "{{ proxy.server_aliases | default([]) }}"
+  ansible.builtin.assert:
+    that:
+      - canonical_hostname is string
+      - proxy.local_base_domain is string
+      - configured_aliases | select('string') | list | length == configured_aliases | length
+    fail_msg: >-
+      proxy.server_name, proxy.local_base_domain, and every alias must be
+      YAML strings.
+
+- name: Validate canonical proxy hostname and aliases
+  vars:
+    canonical_hostname: "{{ proxy.server_name | default(site_id ~ '.' ~ proxy.base_domain) }}"
+    local_hostname: "{{ site_id }}.{{ proxy.local_base_domain }}"
+    reserved_admin_hostname: "admin.{{ proxy.base_domain }}"
+    dns_hostname_pattern: '^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
+    ipv4_literal_pattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
+    configured_aliases: "{{ proxy.server_aliases | default([]) }}"
+  ansible.builtin.assert:
+    that:
+      - canonical_hostname is match(dns_hostname_pattern)
+      - local_hostname is match(dns_hostname_pattern)
+      - canonical_hostname is not match(ipv4_literal_pattern)
+      - configured_aliases | select('match', dns_hostname_pattern) | list | length == configured_aliases | length
+      - configured_aliases | select('match', ipv4_literal_pattern) | list | length == 0
+      - canonical_hostname != reserved_admin_hostname
+      - configured_aliases | select('equalto', reserved_admin_hostname) | list | length == 0
+    fail_msg: >-
+      Canonical, local, and alias names must be lowercase DNS hostnames.
+      Raw IP literals are intentionally rejected: they belong to the
+      unmatched catch-all and cannot be attributed safely to one vhost.
+      The admin control-plane hostname is reserved and cannot be a site.
+
+- name: List other published site and admin route files
+  ansible.builtin.find:
+    paths:
+      - "{{ proxy.conf_dir }}"
+      - "{{ project_root }}/proxy/admin.d"
+    patterns: "*.conf"
+    file_type: file
+  register: other_route_files
+  when: proxy.enabled | default(false) | bool
+
+- name: Read other published nginx routes
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ other_route_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  register: other_routes_slurp
+  when:
+    - proxy.enabled | default(false) | bool
+    # ansible.builtin.find normalizes "ansible/../proxy" while
+    # proxy.conf_dir may retain it, so a raw-path comparison is unsafe.
+    - >-
+      not (
+        (item.path | basename) == (site_id ~ '.conf')
+        and (item.path | dirname | realpath) == (proxy.conf_dir | realpath)
+      )
+
+- name: Collect hostnames claimed by other published routes
+  ansible.builtin.set_fact:
+    other_published_proxy_names: >-
+      {{
+        (other_published_proxy_names | default([]))
+        + (
+          (
+            (
+              item.content
+              | b64decode
+              | regex_findall('(?m)^[ \t]*server_name[ \t]+([^;]+);')
+              | join(' ')
+            ).split()
+          )
+          | map('lower')
+          | list
+        )
+      }}
+  loop: "{{ other_routes_slurp.results | default([]) }}"
+  loop_control:
+    label: "{{ item.source | default('published route') | basename }}"
+  when:
+    - proxy.enabled | default(false) | bool
+    - item.content is defined
+
+- name: Reject hostnames already owned by another published vhost
+  vars:
+    canonical_hostname: "{{ proxy.server_name | default(site_id ~ '.' ~ proxy.base_domain) }}"
+    local_hostname: "{{ site_id }}.{{ proxy.local_base_domain }}"
+    configured_aliases: "{{ proxy.server_aliases | default([]) }}"
+    current_proxy_names: "{{ [canonical_hostname, local_hostname] + configured_aliases }}"
+    conflicting_proxy_names: >-
+      {{ current_proxy_names | intersect(other_published_proxy_names | default([])) }}
+  ansible.builtin.assert:
+    that:
+      - conflicting_proxy_names | length == 0
+    fail_msg: >-
+      Hostname(s) {{ conflicting_proxy_names | join(', ') }} already belong
+      to another published site or the admin control plane. Each name must
+      route to exactly one vhost so attribution and admin isolation remain
+      trustworthy.
+  when: proxy.enabled | default(false) | bool
+
+- name: Coerce genmode to bool
+  ansible.builtin.set_fact:
+    website: "{{ website | combine({'genmode': (website.genmode | string | lower == 'true')}) }}"
+
+- name: Sanity-check canary_tokens length
+  ansible.builtin.assert:
+    that: canary_tokens | length >= 10
+    fail_msg: "canary_tokens must define at least 10 expressions (one per var1..var10)."
+
+- name: List other site config files
+  ansible.builtin.find:
+    paths: "{{ project_root }}/configs/sites"
+    patterns: "*.yaml"
+    excludes: "{{ site_id }}.yaml"
+  register: other_site_files
+
+- name: Slurp other site configs
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ other_site_files.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  register: other_sites_slurp
+
+- name: Compute ports already claimed by other sites
+  ansible.builtin.set_fact:
+    used_web_ports: >-
+      {{
+        other_sites_slurp.results
+        | map(attribute='content')
+        | map('b64decode')
+        | map('from_yaml')
+        | map(attribute='website', default={})
+        | map(attribute='port', default=None)
+        | reject('none')
+        | map('int')
+        | list
+      }}
+    used_db_ports: >-
+      {{
+        other_sites_slurp.results
+        | map(attribute='content')
+        | map('b64decode')
+        | map('from_yaml')
+        | map(attribute='database', default={})
+        | map(attribute='host_port', default=None)
+        | reject('none')
+        | map('int')
+        | list
+      }}
+
+- name: Validate website.port is not used by another site
+  ansible.builtin.assert:
+    that: (website.port | int) not in used_web_ports
+    fail_msg: >-
+      website.port={{ website.port }} collides with another site config.
+      Already claimed: {{ used_web_ports }}. Pick a different port in the UI.
+
+- name: Validate database.host_port is not used by another site
+  ansible.builtin.assert:
+    that: (database.host_port | int) not in used_db_ports
+    fail_msg: >-
+      database.host_port={{ database.host_port }} collides with another site config.
+      Already claimed: {{ used_db_ports }}. Pick a different port in the UI.
+  # An external database (database.host set, e.g. an AWS RDS endpoint) renders
+  # no db container and binds no host port, so there is nothing to collide.
+  when: database.host is not defined

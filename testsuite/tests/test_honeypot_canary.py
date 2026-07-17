@@ -61,6 +61,144 @@ def _versions(repo_root):
     return sorted(out)
 
 
+def test_health_varlist_validation_is_side_effect_free_and_catches_bad_artifacts(
+    website_on_path, tmp_path,
+):
+    """Health validates all ten expressions/providers without generating data."""
+    from runtime_health import load_canary_expressions
+
+    class FakeWithoutGeneration:
+        def __init__(self):
+            self.calls = []
+
+        def city(self):
+            self.calls.append("called")
+            return "Disposable City"
+
+    fake = FakeWithoutGeneration()
+    varlist = tmp_path / "scraper99.txt"
+    varlist.write_text("\n".join(["fake.city()"] * 10) + "\n", encoding="utf-8")
+
+    assert load_canary_expressions(
+        varlist, fake, validate_runtime=True
+    ) == ("fake.city()",) * 10
+    assert fake.calls == [], "health must not advance the live Faker instance"
+
+    varlist.write_text("\n".join(["fake.city()"] * 9) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="must contain 10"):
+        load_canary_expressions(varlist, fake)
+
+    invalid = ["fake.city()"] * 10
+    invalid[4] = "fake.city("
+    varlist.write_text("\n".join(invalid) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="expression 5 is invalid"):
+        load_canary_expressions(varlist, fake)
+
+    unknown = ["fake.city()"] * 10
+    unknown[7] = "fake.provider_that_is_not_installed()"
+    varlist.write_text("\n".join(unknown) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown Faker provider"):
+        load_canary_expressions(varlist, fake)
+
+    runtime_invalid = ["fake.city()"] * 10
+    runtime_invalid[2] = "fake.city() + 1"
+    varlist.write_text("\n".join(runtime_invalid) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="expression 3 fails at runtime"):
+        load_canary_expressions(varlist, fake, validate_runtime=True)
+
+    unsafe = ["fake.city()"] * 10
+    unsafe[0] = "__import__('os').getcwd()"
+    varlist.write_text("\n".join(unsafe) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported"):
+        load_canary_expressions(varlist, fake, validate_runtime=True)
+
+
+def test_health_runtime_validation_preserves_real_faker_prng_state(
+    repo_root, website_on_path,
+):
+    from runtime_health import load_canary_expressions
+
+    fake = _make_faker()
+    before = fake.random.getstate()
+    load_canary_expressions(
+        repo_root / "website" / "varLists" / "scraper1.txt",
+        fake,
+        validate_runtime=True,
+    )
+    assert fake.random.getstate() == before
+
+
+def test_health_template_validation_renders_lazy_dependencies_in_both_branches(
+    website_on_path, tmp_path,
+):
+    """A missing include/macro dependency must fail health, even in a branch."""
+    from jinja2 import Environment, FileSystemLoader, TemplateNotFound
+    from runtime_health import validate_template_render
+
+    template_dir = tmp_path / "templates"
+    template_dir.mkdir()
+    (template_dir / "root.html").write_text(
+        "{% if seen_before %}{% include 'returning.html' %}"
+        "{% else %}{% include 'first.html' %}{% endif %} {{ var1 }}",
+        encoding="utf-8",
+    )
+    (template_dir / "first.html").write_text("first", encoding="utf-8")
+    environment = Environment(loader=FileSystemLoader(template_dir))
+
+    with pytest.raises(TemplateNotFound, match="returning.html"):
+        validate_template_render(
+            lambda name, **context: environment.get_template(name).render(**context),
+            "root.html",
+        )
+
+    (template_dir / "returning.html").write_text(
+        "{% macro badge(value) %}[{{ value }}]{% endmacro %}{{ badge(var10) }}",
+        encoding="utf-8",
+    )
+    validate_template_render(
+        lambda name, **context: environment.get_template(name).render(**context),
+        "root.html",
+    )
+
+
+def test_health_skips_varlist_only_when_generation_mode_is_disabled(
+    website_on_path, tmp_path,
+):
+    from runtime_health import validate_runtime_dependencies
+
+    rendered = []
+    missing_varlist = tmp_path / "missing.txt"
+    render = lambda name, **context: rendered.append((name, context)) or "ok"
+
+    validate_runtime_dependencies(
+        render, "scraper1.html", missing_varlist, object(), genmode=False
+    )
+    assert len(rendered) == 2
+
+    with pytest.raises(FileNotFoundError):
+        validate_runtime_dependencies(
+            render, "scraper1.html", missing_varlist, object(), genmode=True
+        )
+
+    fp_script = tmp_path / "fp.js"
+    with pytest.raises(ValueError, match="runtime asset"):
+        validate_runtime_dependencies(
+            render, "scraper1.html", missing_varlist, object(), genmode=False,
+            required_assets=(fp_script,),
+        )
+    fp_script.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="runtime asset"):
+        validate_runtime_dependencies(
+            render, "scraper1.html", missing_varlist, object(), genmode=False,
+            required_assets=(fp_script,),
+        )
+    fp_script.write_text("console.log('fp');", encoding="utf-8")
+    validate_runtime_dependencies(
+        render, "scraper1.html", missing_varlist, object(), genmode=False,
+        required_assets=(fp_script,),
+    )
+
+
 def test_every_scraper_varlist_yields_ten_nonempty_canaries(repo_root):
     """Each scraper flavor's varList evaluates to 10 non-empty canary values."""
     versions = _versions(repo_root)

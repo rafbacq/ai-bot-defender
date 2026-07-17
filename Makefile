@@ -1,13 +1,20 @@
 .PHONY: frontend-css app app-build app-down app-logs app-dev playbook stack-up stack-down up-all down-all \
-	ensure-net net-down proxy proxy-build proxy-down proxy-logs intel intel-selftest provenance \
+	ensure-net ensure-monitoring-net net-down proxy proxy-build proxy-down proxy-logs \
+	monitoring monitoring-down monitoring-logs intel intel-selftest provenance \
 	provenance-all test-suite selfplay-up selfplay-down selfplay-selftest \
 	selfplay-calibrate selfplay-train selfplay-coevolve selfplay-ingest set-public-host letsencrypt
 
 SITES := $(patsubst configs/sites/%.yaml,%,$(wildcard configs/sites/*.yaml))
 APP_COMPOSE := docker compose -f docker-compose.app.yml
 PROXY_COMPOSE := docker compose -f docker-compose.proxy.yml
+MONITORING_COMPOSE := docker compose -f docker-compose.monitoring.yml
 TRAINER_COMPOSE := docker compose -f docker-compose.app.yml --profile trainer
-ANSIBLE_PLAYBOOK := $(APP_COMPOSE) exec -T -w $(CURDIR)/ansible app ansible-playbook
+ANSIBLE_PLAYBOOK := $(APP_COMPOSE) exec -T \
+	-e ABD_PUBLICATION_LOCK_HELD=$(ABD_PUBLICATION_LOCK_HELD) \
+	-w $(CURDIR)/ansible app ansible-playbook
+# Extra Ansible arguments for maintenance scripts. Example:
+# PLAYBOOK_EXTRA="-e render_only=true -e skip_tls_sync=true"
+PLAYBOOK_EXTRA ?=
 FRONTEND_INPUTS := frontend/tailwind.input.css frontend/tailwind.config.js \
 	frontend/package.json frontend/package-lock.json $(wildcard app/templates/*.html)
 
@@ -51,17 +58,23 @@ PROXY_BUILD_INPUTS := proxy/collector proxy/fp-collector proxy/tls-capture proxy
 ensure-net:
 	docker network create proxy_net 2>/dev/null || true
 
+# Private bridge shared only by the app/proxy and the three queryable
+# observability services. Honeypot site stacks never attach to it.
+ensure-monitoring-net:
+	docker network create monitoring_bridge 2>/dev/null || true
+
 # Remove the shared network (full teardown). Safe no-op if it's already gone or
 # still in use -- nothing should be attached after the stacks are down.
 net-down:
 	docker network rm proxy_net 2>/dev/null || true
+	docker network rm monitoring_bridge 2>/dev/null || true
 
 # --- Unified web app (landing page + sites + logs + query console) ---------
 # Build the image only when it's missing or a build input changed; otherwise
 # just (re)start the container (code is picked up from the runtime bind mount,
 # so no rebuild is needed for code edits). Use `make app-build` to force a
 # rebuild after changing a requirements file / the Dockerfile.
-app: frontend-css ensure-net
+app: frontend-css ensure-net ensure-monitoring-net
 	@if ! docker image inspect $(APP_IMAGE) >/dev/null 2>&1; then \
 		echo "==> Building app image (first run -- the slow one; reused afterwards)"; \
 		$(APP_COMPOSE) build app && mkdir -p $(STAMP_DIR) && touch $(APP_STAMP); \
@@ -78,7 +91,7 @@ app: frontend-css ensure-net
 
 # Force a full rebuild of the app image, then start it. Run this after editing a
 # requirements file or the Dockerfile (the only changes a rebuild is needed for).
-app-build: frontend-css ensure-net
+app-build: frontend-css ensure-net ensure-monitoring-net
 	$(APP_COMPOSE) build app
 	@mkdir -p $(STAMP_DIR) && touch $(APP_STAMP)
 	$(APP_COMPOSE) up -d
@@ -100,7 +113,7 @@ app-dev:
 # Same rebuild-only-when-needed logic as `app`: build the proxy's service images
 # only when one is missing or a proxy source file changed, else just `up -d`.
 # `make proxy-build` forces a rebuild (use after editing a collector/shipper).
-proxy: ensure-net
+proxy: ensure-net ensure-monitoring-net
 	@missing=0; for img in $(PROXY_IMAGES); do docker image inspect $$img >/dev/null 2>&1 || missing=1; done; \
 	if [ $$missing -eq 1 ]; then \
 		echo "==> Building proxy images (first run or an image was removed)"; \
@@ -118,7 +131,7 @@ proxy: ensure-net
 	@echo "Reverse proxy:  http://localhost:80  +  https://localhost:443  (route sites by Host header / TLS SNI)"
 
 # Force a full rebuild of the proxy service images, then start the stack.
-proxy-build: ensure-net
+proxy-build: ensure-net ensure-monitoring-net
 	$(PROXY_COMPOSE) build
 	@mkdir -p $(STAMP_DIR) && touch $(PROXY_STAMP)
 	$(PROXY_COMPOSE) up -d
@@ -132,14 +145,35 @@ proxy-down:
 proxy-logs:
 	$(PROXY_COMPOSE) logs -f nginx
 
+# --- Self-hosted monitoring ------------------------------------------------
+# The external proxy_nginx_logs volume is intentionally not auto-created here:
+# `make proxy` owns it. This explicit check keeps a standalone first run from
+# failing later with an opaque Compose error.
+monitoring: ensure-monitoring-net
+	@docker volume inspect proxy_nginx_logs >/dev/null 2>&1 || \
+		(echo "proxy_nginx_logs is missing; run 'make proxy' once first"; exit 1)
+	$(MONITORING_COMPOSE) up -d
+	# Bind-mounted Prometheus config/rules need an explicit reload when the
+	# container itself was already running; file_sd targets refresh themselves.
+	docker kill --signal=HUP mon-prometheus
+	@bash scripts/sync-tls-capture-netns.sh
+	@echo
+	@echo "Monitoring:  http://localhost:3000/grafana/  (or Admin panel -> Monitoring)"
+
+monitoring-down:
+	$(MONITORING_COMPOSE) down
+
+monitoring-logs:
+	$(MONITORING_COMPOSE) logs -f
+
 # --- Public identity (cloud deployment) -------------------------------------
 # Sync every hostname-bearing config (all.yml, .env/certgen, TLS cert, each
 # rendered nginx block) to this machine's public address in one command.
 # HOST is optional: an IP (-> <ip>.sslip.io) or a real domain; when omitted the
 # EC2 public IP is auto-detected. Run after every IP change (stop/start
 # without an Elastic IP) or when a real domain is acquired.
-set-public-host:
-	@bash scripts/set-public-host.sh $(HOST)
+set-public-host: proxy app
+	@bash scripts/set-public-host.sh "$(HOST)"
 
 # Issue/refresh the publicly-trusted Let's Encrypt cert for every public
 # hostname (honeypot sites + admin control center) and wire nginx to it.
@@ -151,7 +185,7 @@ letsencrypt:
 # --- Site deployment -------------------------------------------------------
 playbook: app
 	@test -n "$(site_id)" || (echo "Usage: make playbook site_id=<id>"; exit 1)
-	$(ANSIBLE_PLAYBOOK) site.yml -e site_id=$(site_id)
+	$(ANSIBLE_PLAYBOOK) site.yml -e site_id=$(site_id) $(PLAYBOOK_EXTRA)
 
 stack-up: app
 	@for s in $(SITES); do \
@@ -187,7 +221,7 @@ intel-selftest: app
 # the same image) so long PPO/PSRO runs never compete with the FastAPI app.
 # Override args via SP_ARGS, e.g. `make selfplay-train SP_ARGS="--iterations 60"`.
 SP_ARGS ?=
-selfplay-up: ensure-net
+selfplay-up: ensure-net ensure-monitoring-net
 	$(TRAINER_COMPOSE) up -d --build trainer
 
 selfplay-selftest: selfplay-up
@@ -244,6 +278,7 @@ test-suite:
 # machine. Sub-makes run sequentially so ordering holds even under parallel make.
 up-all:
 	$(MAKE) proxy
+	-$(MAKE) monitoring
 	$(MAKE) stack-up
 	-$(MAKE) intel INTEL_ARGS="--no-asn --since-hours 168"
 	-$(MAKE) provenance-all
@@ -262,7 +297,8 @@ up-all:
 down-all:
 	-$(MAKE) app-down
 	-$(MAKE) stack-down
+	-$(MAKE) monitoring-down
 	-$(MAKE) proxy-down
 	-$(MAKE) net-down
 	@echo
-	@echo "==> AI Bot Defender is fully down (app, proxy, sites, and proxy_net removed)."
+	@echo "==> AI Bot Defender is fully down (app, monitoring, proxy, sites, and shared networks removed)."

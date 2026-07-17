@@ -252,6 +252,12 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
 .truncate { max-width: 240px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .nowrap { white-space: nowrap; }
+/* Per-row action buttons. Each button is its own POST form, so they need to be
+   laid out as a row rather than stacking as block-level forms. */
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.row-actions form { margin: 0; }
+.row-actions .btn { white-space: nowrap; }
+.row-actions .btn:disabled { opacity: .45; cursor: not-allowed; }
 /* Three-tier request severity — the WHOLE row is tinted so the verdict reads at a
  * glance (green = certainly fine, orange = needs verification, red = certainly a
  * bot), with a matching colored left rail for a color-blind-friendlier cue. The
@@ -325,6 +331,147 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .auth-decline { border-color: var(--copper); color: var(--copper); }
 .auth-decline:hover { border-color: var(--copper); color: var(--copper); }
 .auth-admin-help { margin-top: 14px; overflow-wrap: anywhere; }
+
+/* ---------- Admin panel + monitoring ---------- */
+.admin-shell { width: 100%; max-width: 1180px; margin: 0 auto; }
+.admin-tabs {
+  display: flex; gap: 4px; margin: -10px 0 24px; padding: 4px;
+  width: max-content; max-width: 100%; overflow-x: auto;
+  border: 1px solid var(--limestone); border-radius: 8px; background: var(--whisper);
+}
+.admin-tab {
+  display: inline-flex; align-items: center; min-height: 38px; padding: 7px 14px;
+  border-radius: 5px; color: var(--graphite); font-size: 13.5px; font-weight: 700;
+  text-decoration: none; white-space: nowrap;
+}
+.admin-tab:hover { color: var(--link); text-decoration: none; }
+.admin-tab.is-active { background: var(--navy); color: var(--white); }
+
+.monitor-healthbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 18px;
+  margin-bottom: 16px; padding: 13px 16px; border: 1px solid var(--limestone);
+  border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow-sm);
+}
+.monitor-healthbar__label {
+  display: block; color: var(--graphite); font-size: 11px; font-weight: 700;
+  letter-spacing: .05em; text-transform: uppercase;
+}
+.monitor-healthbar__updated {
+  display: block; margin-top: 2px; color: var(--graphite); font-size: 11.5px;
+}
+#monitor-status { color: var(--graphite); font-size: 15px; }
+#monitor-status.is-online { color: var(--magnolia); }
+#monitor-status.is-offline { color: var(--copper); }
+.monitor-services { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.monitor-service {
+  display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px;
+  border: 1px solid var(--limestone); border-radius: 999px; color: var(--graphite);
+  font-size: 11.5px; font-weight: 700;
+}
+.monitor-service__dot { width: 7px; height: 7px; border-radius: 50%; background: var(--granite); }
+.monitor-service.is-online { color: var(--magnolia); border-color: rgba(51, 152, 152, .45); }
+.monitor-service.is-online .monitor-service__dot { background: var(--eno); }
+.monitor-service.is-offline { color: var(--copper); border-color: rgba(200, 78, 0, .4); }
+.monitor-service.is-offline .monitor-service__dot { background: var(--copper); }
+
+.monitor-pipeline {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 16px; padding: 12px;
+  border: 1px solid var(--limestone); border-radius: var(--radius);
+  background: var(--surface); box-shadow: var(--shadow-sm);
+}
+.monitor-pipeline__arrow { flex: none; color: var(--granite); font-weight: 800; }
+.monitor-stage {
+  display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+  padding: 7px 9px; border: 1px solid var(--limestone); border-radius: 999px;
+  color: var(--graphite); background: var(--whisper);
+}
+.monitor-stage__dot {
+  flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--granite);
+}
+.monitor-stage__label { display: block; color: inherit; font-size: 12px; font-weight: 800; }
+.monitor-stage__detail { display: block; color: var(--graphite); font-size: 10.5px; line-height: 1.2; }
+.monitor-stage.is-up { color: var(--magnolia); border-color: rgba(51, 152, 152, .45); }
+.monitor-stage.is-up .monitor-stage__dot { background: var(--eno); }
+.monitor-stage.is-degraded { color: #9a6510; border-color: var(--persimmon); }
+.monitor-stage.is-degraded .monitor-stage__dot { background: var(--persimmon); }
+.monitor-stage.is-down { color: var(--copper); border-color: var(--copper); }
+.monitor-stage.is-down .monitor-stage__dot { background: var(--copper); }
+
+.monitor-kpis {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px; margin-bottom: 18px;
+}
+/* The capture tiles sit inside their own card, so they drop the outer card's
+   chrome and the trailing margin the top-level KPI strip needs. */
+.monitor-kpis--inset { margin-bottom: 0; }
+.monitor-kpis--inset .stat { background: var(--whisper); }
+.stat__spark {
+  display: block; width: 100%; height: 28px; margin-top: 10px; color: var(--link);
+}
+.stat__spark path {
+  fill: none; stroke: currentColor; stroke-width: 1.5; vector-effect: non-scaling-stroke;
+}
+.stat__spark circle { fill: currentColor; }
+.stat--warn .stat__value { color: #9a6510; }
+.stat--alert .stat__value { color: var(--copper); }
+.monitor-containers { margin-bottom: 18px; }
+.monitor-alerts { margin-bottom: 18px; }
+.monitor-section-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 18px; margin-bottom: 15px;
+}
+.monitor-section-head h2 { margin: 0; color: var(--heading); font-size: 18px; }
+.monitor-section-head p { margin: 3px 0 0; font-size: 13px; }
+.monitor-section-head__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+/* The explanatory paragraph is the flexible half; an action must not be squeezed
+   until its label wraps mid-phrase. */
+.monitor-section-head > .btn { flex: none; white-space: nowrap; align-self: flex-start; }
+.monitor-offline {
+  display: flex; align-items: center; justify-content: space-between; gap: 18px;
+  margin-bottom: 18px;
+}
+.monitor-offline[hidden] { display: none; }
+.monitor-offline p { margin: 2px 0 0; color: var(--graphite); font-size: 13px; }
+.monitor-offline code {
+  flex: none; padding: 7px 10px; border: 1px solid var(--limestone);
+  border-radius: 5px; background: var(--whisper); color: var(--iron); font-size: 12.5px;
+}
+.monitor-capture { margin-bottom: 18px; }
+/* The verdict badge is the first thing read; a two-word verdict must not wrap
+   into an unreadable stack next to the heading. */
+.monitor-capture .monitor-section-head .badge { white-space: nowrap; flex: none; }
+/* One shared certificate serves every vhost, so these all count down together —
+   colour them so the deadline reads at a glance without a separate tile. */
+.cert-due      { color: #9a6510; font-weight: 600; }
+.cert-expiring { color: var(--copper); font-weight: 700; }
+.monitor-responses .truncate { max-width: 320px; }
+/* Counts are read down the column and compared, so they need to line up. */
+.monitor-responses td + td { font-variant-numeric: tabular-nums; }
+.response-served { color: var(--magnolia); font-weight: 600; }
+.response-errors { color: var(--copper); font-weight: 700; }
+:root[data-theme="dark"] .monitor-service.is-online { color: #62c2ad; }
+:root[data-theme="dark"] .monitor-stage.is-up { color: #62c2ad; }
+
+@media (max-width: 1200px) {
+  .monitor-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 900px) {
+  .monitor-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 600px) {
+  .admin-tabs { width: 100%; }
+  .admin-tab { flex: 1; justify-content: center; }
+  .monitor-healthbar, .monitor-section-head, .monitor-offline {
+    align-items: stretch; flex-direction: column;
+  }
+  .monitor-pipeline { align-items: stretch; flex-direction: column; }
+  .monitor-pipeline__arrow { display: none; }
+  .monitor-stage { width: 100%; }
+  .monitor-kpis { grid-template-columns: minmax(0, 1fr); }
+  .monitor-section-head .btn { width: 100%; }
+}
 
 /* ---------- Manual LLM evaluation ----------
  * One target owns both halves of the workflow. The panels stay compact in the

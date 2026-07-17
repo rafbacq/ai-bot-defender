@@ -9,15 +9,18 @@
 #   - promtail      : ships every Docker container's stdout/stderr PLUS the
 #                     reverse proxy's JSON access logs (the honeypot request
 #                     stream + unmatched scanner noise) into loki
+#   - blackbox      : HTTP/TLS/SAN checks against every rendered site vhost
+#   - alertmanager  : groups + silences alerts (local-only receiver by default)
 #   - grafana       : dashboards + alerting over both datasources (replaces
 #                     Amazon Managed Grafana)
 #
-# Security posture (load-bearing): every published port here is bound to
-# 127.0.0.1 ONLY — nothing in this stack is reachable from the public network.
-# Reach Grafana through an SSH tunnel:   ssh -L 3000:localhost:3000 <host>
-# The stack is read-only over the honeypot path: it mounts the proxy's
-# nginx_logs volume ro and never joins proxy_net, so it can never sit in the
-# request path or affect crawler traffic.
+# Security posture (load-bearing): every published port here remains bound to
+# 127.0.0.1 ONLY. Prometheus, Loki, and Grafana additionally join the private
+# monitoring_bridge so the app can read health data and nginx can expose
+# Grafana only after its per-request admin-session gate. Honeypot sites never
+# join that bridge; monitoring never joins the honeypot-routing network; and
+# this stack still cannot sit in the crawler request path. The nginx_logs mount
+# remains read-only.
 #
 # GRAFANA_ADMIN_PASSWORD is read from the git-ignored project-root .env (the
 # same file the app's key manager writes), substituted by compose on `up`.
@@ -39,7 +42,40 @@ services:
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./monitoring/alerts.d:/etc/prometheus/alerts.d:ro
+      - ./monitoring/targets.d:/etc/prometheus/targets.d:ro
       - prom_data:/prometheus
+    networks: [default, monitoring_bridge]
+    restart: unless-stopped
+
+  # Shares nginx's network namespace so probes can connect to 127.0.0.1 while
+  # supplying each canonical vhost as Host + TLS SNI. This keeps synthetic TLS
+  # off Zeek's non-loopback capture and exposes :9115 only on nginx's private
+  # Docker networks, never on a host port. The proxy stack must already be up.
+  blackbox:
+    image: quay.io/prometheus/blackbox-exporter:v0.28.0
+    container_name: mon-blackbox
+    network_mode: "container:proxy-nginx"
+    command:
+      - --config.file=/etc/blackbox_exporter/blackbox.yml
+    volumes:
+      - ./monitoring/blackbox.yml:/etc/blackbox_exporter/blackbox.yml:ro
+    restart: unless-stopped
+
+  alertmanager:
+    image: quay.io/prometheus/alertmanager:v0.32.1
+    container_name: mon-alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      # Override with ALERTMANAGER_CONFIG=<git-ignored path> only after adding
+      # a real receiver. The committed default intentionally sends nowhere.
+      - ${ALERTMANAGER_CONFIG:-./monitoring/alertmanager.yml}:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    networks: [default, monitoring_bridge]
     restart: unless-stopped
 
   node-exporter:
@@ -83,6 +119,7 @@ services:
     volumes:
       - ./monitoring/loki-config.yml:/etc/loki/loki-config.yml:ro
       - loki_data:/loki
+    networks: [default, monitoring_bridge]
     restart: unless-stopped
 
   promtail:
@@ -109,6 +146,13 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin-change-me}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_SERVER_ROOT_URL: "https://admin.${PROXY_BASE_DOMAIN:-localhost}/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_COOKIE_SAMESITE: strict
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -116,6 +160,8 @@ services:
     depends_on:
       - prometheus
       - loki
+      - alertmanager
+    networks: [default, monitoring_bridge]
     restart: unless-stopped
 
 volumes:
@@ -123,8 +169,13 @@ volumes:
   loki_data:
   grafana_data:
   promtail_positions:
+  alertmanager_data:
   # The proxy stack's nginx log volume (created by docker-compose.proxy.yml,
   # compose project "proxy"). External so this stack only ever reads it.
   nginx_logs:
     external: true
     name: proxy_nginx_logs
+
+networks:
+  monitoring_bridge:
+    external: true

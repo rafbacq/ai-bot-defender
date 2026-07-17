@@ -1,106 +1,137 @@
 ---
+- name: Reserve the cross-process publication transaction
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    publication_lock_dir: "{{ playbook_dir }}/../configs/.publication.lock"
+    publication_lock_is_nested: >-
+      {{ lookup('ansible.builtin.env', 'ABD_PUBLICATION_LOCK_HELD') == '1' }}
+
+  tasks:
+    - name: Require site_id before reserving publication
+      ansible.builtin.assert:
+        that:
+          - site_id is defined
+          - site_id is match('^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
+          - site_id != 'admin'
+        fail_msg: >-
+          Pass a lowercase DNS-label-safe site via -e site_id=<id> (e.g.
+          site-001); use 1-63 letters/digits with non-edge hyphens only. The
+          id 'admin' is reserved for the control plane.
+
+    # This is a separate first play so the lock exists before the deployment
+    # play reloads global/per-site YAML or scans routes and ports. A competing
+    # public-host migration can therefore never slip between inventory reads
+    # and publication.
+    - name: Acquire cross-process publication lock
+      ansible.builtin.command:
+        argv:
+          - mkdir
+          - "{{ publication_lock_dir }}"
+      register: publication_lock_acquire
+      changed_when: publication_lock_acquire.rc == 0
+      failed_when: false
+      when:
+        - not (publication_lock_is_nested | bool)
+        - not ansible_check_mode
+
+    - name: Require exclusive publication ownership
+      ansible.builtin.assert:
+        that:
+          - publication_lock_acquire.rc | default(0) == 0
+        fail_msg: >-
+          Another site deployment, public-host migration, scheduled TLS
+          renewal, or certificate publication owns {{ publication_lock_dir }}.
+          Wait for it to finish. If no such process exists, inspect the retained
+          lock and rollback artifacts before removing it manually.
+      when:
+        - not (publication_lock_is_nested | bool)
+        - not ansible_check_mode
+
+    - name: Record publication lock owner
+      ansible.builtin.copy:
+        content: "site_id={{ site_id }}\n"
+        dest: "{{ publication_lock_dir }}/owner"
+        mode: "0644"
+      when:
+        - not (publication_lock_is_nested | bool)
+        - not ansible_check_mode
+        - publication_lock_acquire.rc | default(1) == 0
+
 - name: Configure and deploy a single AI Bot Defender site
   hosts: localhost
   gather_facts: true
 
   vars:
     site_config_path: "{{ project_root }}/configs/sites/{{ site_id | default('') }}.yaml"
+    publication_lock_dir: "{{ project_root }}/configs/.publication.lock"
+    publication_lock_is_nested: >-
+      {{ lookup('ansible.builtin.env', 'ABD_PUBLICATION_LOCK_HELD') == '1' }}
 
   pre_tasks:
-    - name: Require site_id
-      ansible.builtin.assert:
-        that:
-          - site_id is defined
-          - site_id | length > 0
-        fail_msg: "Pass the site to deploy via -e site_id=<id> (e.g. site-001)."
+    - name: Validate deployment inputs under publication lock
+      block:
+        - name: Run locked deployment validation
+          ansible.builtin.include_tasks: tasks/validate-site.yml
+      rescue:
+        - name: Release direct-play lock after validation failure
+          ansible.builtin.file:
+            path: "{{ publication_lock_dir }}"
+            state: absent
+          when:
+            - not (publication_lock_is_nested | bool)
+            - not ansible_check_mode
+            - publication_lock_acquire.rc | default(1) == 0
 
-    - name: Load per-site overrides from {{ site_config_path }}
-      ansible.builtin.include_vars:
-        file: "{{ site_config_path }}"
-        name: site_cfg
+        - name: Fail after releasing invalid deployment reservation
+          ansible.builtin.fail:
+            msg: >-
+              Deployment validation failed for {{ site_id }}:
+              {{ ansible_failed_result.msg | default('unknown validation error') }}
 
-    - name: Merge site overrides over defaults
-      ansible.builtin.set_fact:
-        scraper_version: "{{ site_cfg.scraper_version | default(scraper_version) | int }}"
-        website: "{{ website | combine(site_cfg.website | default({})) }}"
-        database: "{{ database | combine(site_cfg.database | default({})) }}"
-        proxy: "{{ proxy | combine(site_cfg.proxy | default({})) }}"
-        # Generator-authored flavors ship their own category-typed varList; the
-        # app embeds it per site (configs/sites/<id>.yaml) so the rendered
-        # varLists/scraper<N>.txt matches the template. Absent, the global
-        # canary_tokens from all.yml apply unchanged.
-        canary_tokens: "{{ site_cfg.canary_tokens | default(canary_tokens) }}"
+  tasks:
+    - name: Configure, deploy, and publish under one cross-process lock
+      block:
+        - name: Run local prerequisites
+          ansible.builtin.include_role:
+            name: prereqs
+          when: ansible_facts['os_family'] == 'Darwin'
 
-    - name: Coerce genmode to bool
-      ansible.builtin.set_fact:
-        website: "{{ website | combine({'genmode': (website.genmode | string | lower == 'true')}) }}"
+        - name: Render site configuration
+          ansible.builtin.include_role:
+            name: configure
 
-    - name: Sanity-check canary_tokens length
-      ansible.builtin.assert:
-        that: canary_tokens | length >= 10
-        fail_msg: "canary_tokens must define at least 10 expressions (one per var1..var10)."
+        - name: Start and health-gate site containers
+          ansible.builtin.include_role:
+            name: deploy
+          # Route-only certificate/hostname maintenance must not start
+          # YAML-only sites or recreate their containers.
+          when: not (render_only | default(false) | bool)
 
-    - name: List other site config files
-      ansible.builtin.find:
-        paths: "{{ project_root }}/configs/sites"
-        patterns: "*.yaml"
-        excludes: "{{ site_id }}.yaml"
-      register: other_site_files
+        # Publication is last: failed/cancelled startup never creates a public
+        # route or permanent missing-container alert.
+        - name: Publish route, TLS, and monitoring state
+          ansible.builtin.include_role:
+            name: publish
+      always:
+        - name: Release completed direct-play publication lock
+          ansible.builtin.file:
+            path: "{{ publication_lock_dir }}"
+            state: absent
+          when:
+            - not (publication_lock_is_nested | bool)
+            - not ansible_check_mode
+            - publication_lock_acquire.rc | default(1) == 0
+            - publication_rollback_failures | default([]) | length == 0
 
-    - name: Slurp other site configs
-      ansible.builtin.slurp:
-        src: "{{ item.path }}"
-      loop: "{{ other_site_files.files }}"
-      loop_control:
-        label: "{{ item.path | basename }}"
-      register: other_sites_slurp
-
-    - name: Compute ports already claimed by other sites
-      ansible.builtin.set_fact:
-        used_web_ports: >-
-          {{
-            other_sites_slurp.results
-            | map(attribute='content')
-            | map('b64decode')
-            | map('from_yaml')
-            | map(attribute='website', default={})
-            | map(attribute='port', default=None)
-            | reject('none')
-            | map('int')
-            | list
-          }}
-        used_db_ports: >-
-          {{
-            other_sites_slurp.results
-            | map(attribute='content')
-            | map('b64decode')
-            | map('from_yaml')
-            | map(attribute='database', default={})
-            | map(attribute='host_port', default=None)
-            | reject('none')
-            | map('int')
-            | list
-          }}
-
-    - name: Validate website.port is not used by another site
-      ansible.builtin.assert:
-        that: (website.port | int) not in used_web_ports
-        fail_msg: >-
-          website.port={{ website.port }} collides with another site config.
-          Already claimed: {{ used_web_ports }}. Pick a different port in the UI.
-
-    - name: Validate database.host_port is not used by another site
-      ansible.builtin.assert:
-        that: (database.host_port | int) not in used_db_ports
-        fail_msg: >-
-          database.host_port={{ database.host_port }} collides with another site config.
-          Already claimed: {{ used_db_ports }}. Pick a different port in the UI.
-      # An external database (database.host set, e.g. an AWS RDS endpoint) renders
-      # no db container and binds no host port, so there is nothing to collide.
-      when: database.host is not defined
-
-  roles:
-    - role: prereqs
-      when: ansible_facts['os_family'] == 'Darwin'
-    - configure
-    - deploy
+        - name: Report retained lock after incomplete rollback
+          ansible.builtin.debug:
+            msg: >-
+              Publication rollback was incomplete. The safety lock remains at
+              {{ publication_lock_dir }}; resolve the named rollback failures
+              before removing it manually.
+          when:
+            - not (publication_lock_is_nested | bool)
+            - not ansible_check_mode
+            - publication_rollback_failures | default([]) | length > 0

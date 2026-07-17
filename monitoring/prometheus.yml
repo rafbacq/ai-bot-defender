@@ -4,11 +4,17 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
-# Alert rules (host disk/memory/CPU, scrape-target down, critical containers
-# gone). No Alertmanager yet: firing alerts are visible in the Prometheus UI
-# (/alerts) and in Grafana's Alerting view via this datasource.
+# Alert rules (host resources, endpoint/TLS probes, scrape targets, critical
+# containers) are sent to the private Alertmanager.  Its committed receiver is
+# intentionally local-only until an operator supplies notification credentials.
 rule_files:
   - /etc/prometheus/alerts.yml
+  - /etc/prometheus/alerts.d/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
 
 scrape_configs:
   - job_name: prometheus
@@ -33,6 +39,8 @@ scrape_configs:
       - targets: ["loki:3100"]
 
   - job_name: grafana
+    # Grafana serves every HTTP route under its configured public sub-path.
+    metrics_path: /grafana/metrics
     static_configs:
       - targets: ["grafana:3000"]
 
@@ -41,3 +49,49 @@ scrape_configs:
   - job_name: promtail
     static_configs:
       - targets: ["promtail:9080"]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+
+  # Fixed-cardinality health for nginx final-status -> all_visits correlation.
+  # The collector is private on monitoring_bridge; /metrics does no DB work and
+  # is explicitly excluded from research collection.
+  - job_name: visit-collector
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["collector:8000"]
+
+  # Blackbox Exporter shares nginx's network namespace and therefore listens
+  # on nginx's private monitoring_bridge address.  It is never host-published.
+  - job_name: blackbox
+    static_configs:
+      - targets: ["proxy-nginx:9115"]
+
+  # Each generated file supplies two loopback targets for one canonical vhost:
+  #
+  # - targets: ["http://127.0.0.1/__abd_health"]
+  #   labels: {site: "site-001", hostname: "site-001.example", ...}
+  #
+  # `hostname` becomes both Host and TLS SNI. `instance` is rewritten to the
+  # public display URL while the real probe remains local and telemetry-safe.
+  - job_name: public-sites
+    scrape_interval: 1m
+    scrape_timeout: 12s
+    metrics_path: /probe
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets.d/*.yml"]
+        refresh_interval: 30s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [hostname]
+        target_label: __param_hostname
+      - source_labels: [module]
+        target_label: __param_module
+      - source_labels: [public_url]
+        target_label: instance
+      - target_label: __address__
+        replacement: proxy-nginx:9115
+      - regex: "module|public_url"
+        action: labeldrop

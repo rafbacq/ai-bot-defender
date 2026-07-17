@@ -2,8 +2,8 @@
 
 Two sources are supported:
 
-- A CSV file (the bundled ``jeniffer.csv`` / ``21.csv`` samples, or any export
-  with ``var1``..``var10`` columns).
+- A CSV file (the bundled ``jeniffer.csv`` sample, or any export with
+  ``var1``..``var10`` columns).
 - A live per-site honeypot database: the ``new_agents_vars`` table. Two access
   backends, selected by whether ``SITEDB_HOST`` is set (mirroring
   ``app/services/logdb.py`` and ``crawler_graph.ingest.db``, so every DB seam in

@@ -1,13 +1,8 @@
 # Prometheus alerting rules for the AI Bot Defender instance.
 #
-# There is no Alertmanager in this stack (nothing to page yet), so firing
-# alerts surface in two places:
-#   - Prometheus UI:  http://localhost:9090/alerts   (via the SSH tunnel)
-#   - Grafana:        Alerting -> Alert rules (the Prometheus datasource
-#                     exposes these), and the dashboard's alert list panel.
-# If/when a notification channel exists (email/Slack), add an alertmanager
-# service to docker-compose.monitoring.yml and point `alerting:` at it in
-# prometheus.yml -- these rules carry over unchanged.
+# Prometheus sends these alerts to the private Alertmanager. Its committed
+# receiver is local-only: alerts can be grouped and silenced in Grafana, but no
+# message leaves the host until an operator installs a real receiver config.
 groups:
   - name: host
     rules:
@@ -49,11 +44,119 @@ groups:
           summary: "Prometheus target {{ $labels.job }} is down"
           description: "{{ $labels.instance }} has failed scrapes for 5 minutes."
 
+      - alert: PublicSiteProbeFailed
+        expr: probe_success{job="public-sites"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.site }} {{ $labels.probe_scheme }} endpoint is unavailable"
+          description: "The synthetic check for {{ $labels.instance }} failed twice. This covers nginx vhost routing, the site upstream, and (for HTTPS) certificate hostname validation."
+
+      - alert: PublicCertificateExpiringSoon
+        expr: >
+          (
+            probe_ssl_earliest_cert_expiry{job="public-sites",probe_scheme="https"}
+            - time()
+          ) < 14 * 24 * 60 * 60
+          and on(instance, site, probe_scheme)
+          probe_success{job="public-sites",probe_scheme="https"} == 1
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.site }} TLS certificate expires within 14 days"
+          description: "The trusted certificate presented by {{ $labels.instance }} must be renewed before its expiry timestamp."
+
+      - alert: CollectorStatusSyncUnhealthy
+        expr: >
+          absent(abd_collector_status_sync_healthy{job="visit-collector"})
+          or abd_collector_status_sync_healthy{job="visit-collector"} == 0
+          or abd_collector_status_sync_thread_up{job="visit-collector"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Final-response status correlation is unhealthy"
+          description: "The off-path collector tailer is stopped or its latest access-log/DB poll failed. Honeypot responses still serve, but response_status evidence may be incomplete."
+
+      - alert: CollectorAccessLogMissing
+        expr: abd_collector_access_log_present{job="visit-collector"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Collector cannot read nginx's authoritative access log"
+          description: "The read-only access-log mount/path is missing, so final nginx statuses cannot be correlated to all_visits rows."
+
+      - alert: CollectorStatusSyncStalled
+        expr: >
+          time() - abd_collector_status_sync_last_success_unixtime_seconds{job="visit-collector"} > 120
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Final-response status correlation heartbeat stalled"
+          description: "No successful tailer poll has completed for more than two minutes, including quiet-traffic EOF polls."
+
+      - alert: CollectorStatusCorrelationMisses
+        expr: >
+          increase(abd_collector_status_records_missed_total{job="visit-collector"}[10m]) > 0
+          or
+          increase(abd_collector_status_startup_unresolved_total{job="visit-collector"}[10m]) > 0
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Final nginx statuses could not be matched to mirror rows"
+          description: "At least one live status or initially unmatched startup-race status exhausted the bounded 60-second retry window or queue capacity. The request row may have a null response_status."
+
+      - alert: CollectorStatusSyncErrors
+        expr: >
+          increase(abd_collector_status_sync_errors_total{job="visit-collector"}[10m]) > 2
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Final-response status correlation is repeatedly erroring"
+          description: "The tailer recovered between polls but failed at least three times in ten minutes. Inspect collector logs before intermittent evidence loss becomes sustained."
+
+      - alert: CollectorAccessRecordsUnusable
+        expr: >
+          increase(abd_collector_status_records_unusable_total{job="visit-collector"}[10m]) > 0
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Nginx access records are unusable for status correlation"
+          description: "At least one complete, non-telemetry access record was malformed or lacked a valid request_id/status in ten minutes. That row cannot receive a final status; check nginx log-format and collector parser drift."
+
+      - alert: CollectorStatusRecordStarvation
+        # increase() handles counter resets across collector restarts. Compare
+        # current-process inserts to live records plus only those startup-race
+        # rows that initially missed replay and later matched bounded retry.
+        expr: >
+          increase(abd_collector_mirror_rows_inserted_total{job="visit-collector"}[10m])
+          >
+          (
+            increase(abd_collector_status_records_seen_total{job="visit-collector"}[10m])
+            +
+            increase(abd_collector_status_startup_race_correlated_total{job="visit-collector"}[10m])
+          )
+        for: 3m
+        labels: {severity: critical}
+        annotations:
+          summary: "Mirrored rows are arriving but no valid final-status records appear"
+          description: "More mirror rows were inserted than can be accounted for by live nginx status records plus bounded startup-race matches. The collector may be following a stale/wrong log or nginx request_id wiring may have drifted; retry exhaustion is covered separately."
+
+      - alert: CollectorMirrorInsertFailures
+        expr: >
+          increase(abd_collector_mirror_insert_errors_total{job="visit-collector"}[10m]) > 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Mirrored request rows are being lost"
+          description: "The fire-and-forget collector failed to insert at least one all_visits row. Public pages still serve, but central request evidence is incomplete."
+
   - name: containers
     # cAdvisor only exports a series while the container exists, so a stopped
     # or crash-looping-to-dead container shows up as the metric going ABSENT
     # (after Prometheus's 5m staleness). One rule per request-path-critical
     # container; `for: 5m` rides out image rebuilds and compose recreates.
+    # Per-site rules are rendered into alerts.d/<site_id>.yml by the Ansible
+    # publish role so every routed honeypot follows the same inventory.
     rules:
       - alert: ReverseProxyDown
         expr: absent(container_last_seen{name="proxy-nginx"})
@@ -78,14 +181,6 @@ groups:
         annotations:
           summary: "Request-mirror collector is gone"
           description: "nginx's mirror has no receiver: honeypot pages still serve, but nothing lands in all_visits."
-
-      - alert: HoneypotSiteDown
-        expr: absent(container_last_seen{name="site-001-web-1"})
-        for: 5m
-        labels: {severity: critical}
-        annotations:
-          summary: "site-001 web container is gone"
-          description: "Visitors get 502 from the proxy; crawlers see a broken site."
 
       - alert: DashboardAppDown
         expr: absent(container_last_seen{name="ai-bot-defender-app"})

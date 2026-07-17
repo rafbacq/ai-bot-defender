@@ -34,6 +34,34 @@ TEMPLATE_DIR = APP_DIR / "templates"
 STATIC_DIR = APP_DIR / "static"
 
 
+# --- Self-hosted monitoring stack -----------------------------------------
+# Host-side development reaches the loopback-only published ports. The app
+# container overrides these with service names on the private
+# ``monitoring_bridge`` network (see docker-compose.app.yml).
+PROMETHEUS_URL = (
+    os.environ.get("PROMETHEUS_URL") or "http://127.0.0.1:9090"
+).rstrip("/")
+LOKI_URL = (os.environ.get("LOKI_URL") or "http://127.0.0.1:3100").rstrip("/")
+GRAFANA_URL = (
+    os.environ.get("GRAFANA_URL") or "http://127.0.0.1:3000/grafana/"
+).rstrip("/") + "/"
+GRAFANA_PUBLIC_PATH = (
+    os.environ.get("GRAFANA_PUBLIC_PATH") or "/grafana/"
+).rstrip("/") + "/"
+ALERTMANAGER_URL = (
+    os.environ.get("ALERTMANAGER_URL") or "http://127.0.0.1:9093"
+).rstrip("/")
+# Blackbox Exporter shares proxy-nginx's network namespace and is intentionally
+# not host-published. The app container sets this to http://proxy-nginx:9115;
+# the loopback fallback is useful only when a developer exposes it explicitly.
+BLACKBOX_URL = (
+    os.environ.get("BLACKBOX_URL") or "http://127.0.0.1:9115"
+).rstrip("/")
+ALERT_DELIVERY_MODE = (
+    os.environ.get("ALERT_DELIVERY_MODE") or "local-only"
+).strip().lower()
+
+
 # --- Authentication and access-request workflow ---------------------------
 # The Google Form remains the off-platform review queue. Once a request has
 # been reviewed, an administrator approves the same email address in the app;

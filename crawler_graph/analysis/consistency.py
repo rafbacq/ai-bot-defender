@@ -89,6 +89,12 @@ def tcp_os_is_trustworthy(rec):
     A routable public client address means source-preserving delivery, so the
     TCP layer is trusted. Override with ``INTEL_TRUST_PRIVATE_TCP=1`` for a
     genuine same-LAN / source-preserving-DNAT deployment."""
+    # Per-request/per-beacon views may retain a same-IP SYN fallback so operators
+    # can inspect it, but only an exact (client_ip, client_port) 4-tuple is strong
+    # enough to accuse that individual row.  Campaign aggregates do not carry this
+    # key, so an absent flag preserves their existing dominant-OS behavior.
+    if rec.get("tcp_match_exact") is False:
+        return False
     if config.TRUST_TCP_FROM_PRIVATE:
         return True
     ip = rec.get("client_ip")
@@ -98,8 +104,13 @@ def tcp_os_is_trustworthy(rec):
         addr = ipaddress.ip_address(str(ip).split("%")[0])
     except ValueError:
         return False
-    return not (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_unspecified or addr.is_reserved)
+    # ``is_global`` is deliberately stricter than negating the familiar local
+    # flags.  Python classifies RFC6598 shared carrier/Tailscale space
+    # (100.64.0.0/10) as neither private nor reserved, but it is still a NAT
+    # address and therefore cannot prove that the captured SYN came from the
+    # browser named in the request.  Only globally routable source addresses
+    # can make the TCP layer accusatory.
+    return addr.is_global
 
 
 def dominant_tcp_os(rec):
@@ -139,13 +150,22 @@ def automated_from_tells(tells):
     ``chromeMissing`` (in-app WebViews) and ``swRenderer``/``zeroHardware``
     (VMs/RDP/corp machines) are all legitimately true for real users. So a STRONG
     tell (``webdriver``/``cdc``/``headlessUA``/``toStringTampered`` — things a real
-    browser never trips) is conclusive on its own, while WEAK tells must appear in
-    combination (``>= WEAK_AUTOMATION_MIN``, default 2) before we call automation."""
+    browser never trips) is conclusive on its own, while WEAK tells must span at
+    least ``WEAK_AUTOMATION_MIN`` independent evidence families (default 2) before
+    we call automation."""
     keys = {str(k).lower() for k, v in (tells or {}).items() if v is True}
     if keys & config.STRONG_AUTOMATION_TELLS:
         return True
     weak = keys - config.STRONG_AUTOMATION_TELLS
-    return len(weak) >= config.WEAK_AUTOMATION_MIN
+    covered = set()
+    independent = 0
+    for family in config.WEAK_AUTOMATION_TELL_FAMILIES:
+        if weak & family:
+            independent += 1
+            covered.update(family)
+    # Weak tells outside a known correlated family remain independent.
+    independent += len(weak - covered)
+    return independent >= config.WEAK_AUTOMATION_MIN
 
 
 def _behavior_class(rec, automation):
@@ -174,7 +194,13 @@ def score_endpoint(rec):
     # it is the proxy host's kernel, so we observe it but do not let it accuse.
     tcp_trusted = tcp_os is not None and tcp_os_is_trustworthy(rec)
 
-    if tcp_trusted and ua_os and ua_os != tcp_os:
+    # Declared crawler UAs often wrap their bot token in a browser-compatible UA
+    # such as OAI-SearchBot's ``Macintosh ... Chrome`` string.  That compatibility
+    # wrapper does not claim the crawler host's kernel, so comparing it to the SYN
+    # produces a categorical false positive.  Provider/IP verification is a
+    # separate attribution concern; all non-UA signals below still apply.
+    declared_crawler = bool(rec.get("is_declared_crawler"))
+    if tcp_trusted and not declared_crawler and ua_os and ua_os != tcp_os:
         contradictions.append(
             f"User-Agent claims {ua_os} but the TCP/IP stack looks like {tcp_os} "
             "(kernel betrays a spoofed OS)")
@@ -199,7 +225,7 @@ def score_endpoint(rec):
     if automation:
         tells = ", ".join(sorted((rec.get("automation_tells") or {}).keys()))
         contradictions.append(
-            "automation tells present" + (f" ({tells})" if tells else " (automation User-Agent)"))
+            f"automation tells present ({tells})" if tells else "automation/tooling User-Agent present")
         score += weights["automation"]
 
     if rec.get("behavior_synthetic"):
@@ -207,8 +233,13 @@ def score_endpoint(rec):
             "behavioral biometrics look synthetically humanized (timing too regular)")
         score += weights["synthetic_behavior"]
 
-    if (rec.get("is_browser") and not rec.get("is_automated")
-            and not rec.get("has_browser_fingerprint") and rec.get("n_requests", 0) > 0):
+    browser_no_js = bool(
+        rec.get("is_browser")
+        and not rec.get("is_automated")
+        and not rec.get("has_browser_fingerprint")
+        and rec.get("n_requests", 0) > 0
+    )
+    if browser_no_js:
         contradictions.append(
             "browser User-Agent fetched the page but never executed JS "
             "(no fingerprint beacon — headless or privacy-hardened)")
@@ -220,11 +251,13 @@ def score_endpoint(rec):
         "inconsistent": score >= config.INCONSISTENCY_FLAG_SCORE,
         "vm_cohort": bool(vm),
         "automation": automation,
+        "browser_no_js": browser_no_js,
         "behavior_class": _behavior_class(rec, automation),
         "claimed_os": ua_os,
         "js_os": js_os,
         "tcp_os": tcp_os,
         "tcp_os_trusted": tcp_trusted,
+        "declared_crawler": declared_crawler,
     }
 
 

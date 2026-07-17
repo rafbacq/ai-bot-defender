@@ -6,7 +6,7 @@
     <div class="page-head">
         <span class="eyebrow">Argus Lab only</span>
         <h1>Access administration</h1>
-        <p>Unlock the approval console with the configured administrator password.</p>
+        <p>Unlock the admin panel with the configured administrator password.</p>
     </div>
 
     <section class="card card--pad auth-card">
@@ -17,12 +17,13 @@
         </div>
         {% endif %}
         <form method="post" action="/admin/login" class="auth-form">
+            <input type="hidden" name="next" value="{{ next | default('/admin/approve') }}">
             <label>
                 <span class="field-label">Administrator password</span>
                 <input class="input" type="password" name="admin_secret" required
                        autocomplete="current-password" autofocus>
             </label>
-            <button type="submit" class="btn btn--primary btn--block">Open approval console</button>
+            <button type="submit" class="btn btn--primary btn--block">Open console</button>
         </form>
         <p class="auth-links"><a href="/login">Return to account login</a>.</p>
     </section>

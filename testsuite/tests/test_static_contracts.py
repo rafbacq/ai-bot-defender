@@ -59,10 +59,22 @@ def test_deployment_templates_preserve_logging_routing_and_indirections(repo_roo
     assert "proxy_set_header X-Client-Port $remote_port;" in site_conf
     assert "mirror /_mirror;" in site_conf
     assert "include /etc/nginx/snippets/mirror.conf;" in site_conf
+    fp_block = site_conf.split("location = /__fpbeacon {", 1)[1].split("}", 1)[0]
+    health_block = site_conf.split("location = /__abd_health {", 1)[1].split("}", 1)[0]
+    acme_block = site_conf.split("location ^~ /.well-known/acme-challenge/ {", 1)[1].split("}", 1)[0]
+    assert "access_log off;" in fp_block
+    assert "access_log off;" in health_block
+    assert "access_log off;" in acme_block
     # The shared mirror target -> collector, carrying the 4-tuple join key.
     assert "set $collector collector;" in mirror
     assert "proxy_pass http://$collector:8000$request_uri;" in mirror
     assert "X-Client-Port $remote_port" in mirror
+    assert "X-Forwarded-Proto $scheme" in mirror
+    assert "X-Request-ID $request_id" in mirror
+    assert "access_log off;" in mirror
+    assert "proxy_pass_request_body off;" in mirror
+    assert 'proxy_set_header Content-Length "";' in mirror
+    assert '"request_id":"$request_id"' in nginx
     # scraper_version indirection + shared proxy network + web alias in the compose.
     assert "SCRAPER_VERSION" in compose
     assert "scraper{{ scraper_version }}-db" in compose
@@ -73,18 +85,52 @@ def test_deployment_templates_preserve_logging_routing_and_indirections(repo_roo
     assert "default_server" in nginx
 
 
-def test_proxy_start_rebinds_capture_after_nginx_is_replaced(repo_root):
-    """A replaced nginx container must not leave Zeek on its retired netns."""
+def test_proxy_start_rebinds_netns_sidecars_after_nginx_is_replaced(repo_root):
+    """A replaced nginx must not strand Zeek or the prober on its retired netns."""
     makefile = (repo_root / "Makefile").read_text(encoding="utf-8")
     sync = (repo_root / "scripts" / "sync-tls-capture-netns.sh").read_text(
         encoding="utf-8"
     )
 
-    assert makefile.count("bash scripts/sync-tls-capture-netns.sh") == 2
+    # Both proxy start paths and monitoring startup reconcile namespace-bound
+    # sidecars; the helper is idempotent when everything already matches.
+    assert makefile.count("bash scripts/sync-tls-capture-netns.sh") == 3
     assert "{{.HostConfig.NetworkMode}}" in sync
     assert 'expected_mode="container:$nginx_id"' in sync
     assert "--no-deps --force-recreate tls-capture" in sync
     assert "capture_mode\" != \"$expected_mode" in sync
+    assert "docker inspect mon-blackbox" in sync
+    assert "--no-deps --force-recreate blackbox" in sync
+    assert 'blackbox_mode" != "$expected_mode' in sync
+
+
+def test_nginx_log_rotation_preserves_authoritative_status_lines(repo_root):
+    logrotate = (repo_root / "proxy" / "logrotate.conf").read_text(encoding="utf-8")
+    compose = (repo_root / "docker-compose.proxy.yml").read_text(encoding="utf-8")
+    collector = (repo_root / "proxy" / "collector" / "app.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert not any(
+        line.strip() == "copytruncate" for line in logrotate.splitlines()
+    ), "rotation must rename/reopen rather than use the lossy directive"
+    assert "sharedscripts" in logrotate
+    assert ".reopen-required" in logrotate
+    assert "nginx -s reopen" in compose
+    assert ".reopen-required" in compose
+    shared_interval = (
+        "NGINX_LOG_REOPEN_POLL_SECONDS: "
+        "${PROXY_LOG_REOPEN_POLL_SECONDS:-5}"
+    )
+    assert compose.count(shared_interval) == 2
+    assert "sleep $${NGINX_LOG_REOPEN_POLL_SECONDS}" in compose
+    assert '"NGINX_LOG_REOPEN_POLL_SECONDS", 5.0' in collector
+    assert (
+        "NGINX_LOG_REOPEN_POLL_SECONDS + ROTATION_DRAIN_SECONDS" in collector
+    )
+    assert "handle.seek(0)" not in collector, (
+        "copytruncate recovery must swap to a fresh BufferedReader"
+    )
 
 
 def test_anti_spoof_xff_is_overwritten_not_appended(repo_root):
@@ -146,6 +192,9 @@ def test_analytics_filters_and_ajax_pager_keep_visible_page_state(repo_root):
     assert 'id="csv-export"' in analytics
     assert "summary.textContent = 'Page ' + page" in analytics
     assert "csv.href = '/logs/export.csv?' + urlForPage(page).search" in analytics
+    main = (repo_root / "app" / "main.py").read_text(encoding="utf-8")
+    assert 'colspan="8"' in main, "AJAX error rows must span the Status column too"
+    assert "escape(str(exc))" in main, "database errors must be HTML-escaped"
 
 
 def test_account_totp_code_posts_are_edge_rate_limited(repo_root):
@@ -235,7 +284,7 @@ def test_public_nav_exposes_every_account_access_destination(repo_root):
         "/login": "Log in",
         "/request-access": "Request access",
         "/signup": "Create account",
-        "/admin/approve": "Admin approval",
+        "/admin/approve": "Admin panel",
     }
     for href, label in links.items():
         anchor = f'href="{href}" class="main-nav__link">{label}</a>'

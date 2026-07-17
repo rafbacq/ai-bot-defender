@@ -70,7 +70,7 @@
                     <button type="submit" class="main-nav__link main-nav__button">Log out</button>
                 </form>
                 {% elif request.session.get('is_admin') %}
-                <a href="/admin/approve" class="main-nav__link">Admin approval</a>
+                <a href="/admin/approve" class="main-nav__link">Admin panel</a>
                 <span class="main-nav__user">Access admin</span>
                 <form method="post" action="/logout" class="main-nav__form">
                     <button type="submit" class="main-nav__link main-nav__button">Lock</button>
@@ -79,7 +79,7 @@
                 <a href="/login" class="main-nav__link">Log in</a>
                 <a href="/request-access" class="main-nav__link">Request access</a>
                 <a href="/signup" class="main-nav__link">Create account</a>
-                <a href="/admin/approve" class="main-nav__link">Admin approval</a>
+                <a href="/admin/approve" class="main-nav__link">Admin panel</a>
                 {% endif %}
             </nav>
         </div>

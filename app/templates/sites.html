@@ -9,26 +9,41 @@
 
 {% if cancelled %}
 <div class="notice notice--warn mb-5"><div class="notice__title">Deployment cancelled</div>
-    <p class="muted" style="margin:0">The Ansible process was stopped. A cancelled deployment is not rolled back; re-run it when you are ready to apply the full configuration.</p>
+    <p class="muted" style="margin:0">The Ansible process was stopped. A new public route is published only after its web service starts successfully; an existing published route is preserved during a failed re-apply. Re-run the deployment when ready.</p>
 </div>
 {% endif %}
 {% set job_done_url = '/sites' %}
 {% set job_cancelled_url = '/sites?cancelled=1' %}
+{# A take-down/delete is a publication transaction that has already begun
+   unwinding; there is nothing safe to stop it at. A deploy/start still runs
+   Ansible in its own process group and rolls back cleanly, so it keeps Cancel. #}
+{% set job_cancellable = not (background_job and background_job.kind in ('site-stop', 'site-delete')) %}
 {% include '_background_job.html' %}
 
 {% if deployed %}
+{# The result banner must name what actually happened. Reporting "Deployed" (and
+   offering "Open site") after a take-down or delete would describe the opposite
+   of the operation the operator just ran, and link to a hostname the catch-all
+   now answers with 444. Only actions that leave a site serving get the link. #}
+{% set outcomes = {
+    'deploy': ('Deployed', 'Deployment failed', true, 'Playbook output'),
+    'start':  ('Live again', 'Could not be started', true, 'Playbook output'),
+    'stop':   ('Taken down', 'Take-down failed', false, 'Details'),
+    'delete': ('Deleted', 'Deletion failed', false, 'Details'),
+} %}
+{% set outcome = outcomes.get(action, outcomes['deploy']) %}
 <div class="notice {{ 'notice--ok' if ok == '1' else 'notice--err' }} mb-6">
     <div class="flex items-center gap-2 mb-1">
-        <span class="badge {{ 'badge--clean' if ok == '1' else 'badge--alert' }}">{{ 'Deployed' if ok == '1' else 'Failed' }}</span>
+        <span class="badge {{ 'badge--clean' if ok == '1' else 'badge--alert' }}">{{ outcome[0] if ok == '1' else outcome[1] }}</span>
         <span class="font-semibold">{{ deployed }}</span>
         {# Link the canonical (publicly resolvable) hostname, not the *.localhost
            alias — the dashboard is often viewed through an SSH tunnel from a
            machine where the alias resolves to the wrong loopback. #}
-        {% if ok == '1' %}{% set dhost = (sites | selectattr('site_id', 'equalto', deployed) | map(attribute='hostname') | first) or deployed %}<a class="ml-1" href="http://{{ dhost }}/" target="_blank">Open site ↗</a>{% endif %}
+        {% if ok == '1' and outcome[2] %}{% set dhost = (sites | selectattr('site_id', 'equalto', deployed) | map(attribute='hostname') | first) or deployed %}<a class="ml-1" href="http://{{ dhost }}/" target="_blank">Open site ↗</a>{% endif %}
     </div>
     {% if deploy_output %}
-    <details class="mt-1">
-        <summary>Playbook output</summary>
+    <details class="mt-1" {% if ok != '1' %}open{% endif %}>
+        <summary>{{ outcome[3] }}</summary>
         <pre class="codeblock mt-2" style="max-height:280px">{{ deploy_output }}</pre>
     </details>
     {% endif %}
@@ -113,23 +128,69 @@
     <h2 class="section-title">Configured sites ({{ sites|length }})</h2>
     <div class="card">
         {% if sites %}
+        {# One site operation runs at a time (they share the publication lock),
+           so every row's actions are disabled while any of them is in flight. #}
+        {% set busy = 'disabled' if (background_job and not background_job.done) else '' %}
         <div class="table-wrap">
             <table class="tbl">
-                <thead><tr><th>Site</th><th>Hostname</th><th>Template</th><th>Web</th><th>DB</th><th>Status</th><th></th></tr></thead>
+                <thead><tr><th>Site</th><th>Hostname</th><th>Template</th><th>Web</th><th>DB</th><th>Status</th><th></th><th>Actions</th></tr></thead>
                 <tbody>
                 {% for s in sites %}
                     <tr>
                         <td class="font-semibold">{{ s.site_id }}</td>
-                        <td class="mono">{{ s.hostname }}</td>
+                        <td class="mono">
+                            {{ s.published_hostname or s.hostname }}
+                            {% if s.config_pending %}<div class="field-hint">configured: {{ s.hostname }}</div>{% endif %}
+                        </td>
                         <td>scraper{{ s.scraper_version }}</td>
                         <td class="mono">{{ s.website.port }}</td>
                         <td class="mono">{{ s.database.host_port }}</td>
                         <td>
-                            {% if s.hostname in active_routes %}<span class="badge badge--clean">Live</span>
-                            {% elif s.deployed %}<span class="badge badge--warn">Deployed</span>
+                            {% if s.state == 'live' %}<span class="badge badge--clean">Live</span>
+                            {% elif s.state == 'unhealthy' %}<span class="badge badge--alert">Unhealthy · route active</span>
+                            {% elif s.state == 'starting' %}<span class="badge badge--warn">Starting · not ready</span>
+                            {% elif s.state == 'health_unknown' %}<span class="badge badge--warn">Health unknown · route active</span>
+                            {% elif s.state == 'offline' %}<span class="badge badge--alert">Offline · route active</span>
+                            {% elif s.state == 'unrouted' %}<span class="badge badge--warn">Running · unrouted</span>
+                            {% elif s.state == 'stopped' %}<span class="badge badge--neutral">Stopped</span>
+                            {% elif s.state == 'unknown' %}<span class="badge badge--warn">Runtime unknown{% if s.routed %} · route configured{% endif %}</span>
                             {% else %}<span class="badge badge--neutral">Config only</span>{% endif %}
+                            {% if s.state == 'stopped' %}<div class="field-hint">not published · data kept</div>
+                            {% elif s.config_pending %}<div class="field-hint">pending re-apply</div>{% endif %}
                         </td>
-                        <td><a href="http://{{ s.hostname }}/" target="_blank" title="Local alias: http://{{ s.local_hostname }}/">Open ↗</a></td>
+                        <td>
+                            {% if s.routed %}<a href="http://{{ s.published_hostname }}/" target="_blank" title="Local alias: http://{{ s.local_hostname }}/">Open ↗</a>
+                            {% else %}<span class="muted">—</span>{% endif %}
+                        </td>
+                        <td>
+                            {# Runtime state is unknown when Docker cannot be inspected; offering
+                               actions there would be guessing at what they would do. #}
+                            {% if s.state == 'unknown' %}
+                            <span class="muted" title="Docker could not be inspected">—</span>
+                            {% else %}
+                            <div class="row-actions">
+                                {% if s.routed or s.web_running %}
+                                <form method="post" action="/sites/stop" data-confirm="Take {{ s.site_id }} down? Its public route is withdrawn and its containers stop. Stored visits and canaries are kept.">
+                                    <input type="hidden" name="site_id" value="{{ s.site_id }}">
+                                    <button type="submit" class="btn btn--ghost btn--sm" {{ busy }}
+                                            title="Withdraw the route and stop the containers; keep the config and data">Take down</button>
+                                </form>
+                                {% else %}
+                                <form method="post" action="/sites/start">
+                                    <input type="hidden" name="site_id" value="{{ s.site_id }}">
+                                    <button type="submit" class="btn btn--ghost btn--sm" {{ busy }}
+                                            title="Re-apply this site's stored configuration and republish its route">Bring up</button>
+                                </form>
+                                {% endif %}
+                                <form method="post" action="/sites/delete" data-delete="{{ s.site_id }}">
+                                    <input type="hidden" name="site_id" value="{{ s.site_id }}">
+                                    <input type="hidden" name="confirm" value="">
+                                    <button type="submit" class="btn btn--danger btn--sm" {{ busy }}
+                                            title="Withdraw the route, destroy the stack and its database volume, and remove the config">Delete</button>
+                                </form>
+                            </div>
+                            {% endif %}
+                        </td>
                     </tr>
                 {% endfor %}
                 </tbody>
@@ -155,5 +216,34 @@
     source.textContent = html;
   }
   if (sel) { sel.addEventListener('change', loadTemplate); loadTemplate(); }
+
+  // Take-down asks once; delete makes you type the site id, because it drops
+  // the database volume with that site's visits and canary assignments. The
+  // server re-checks the typed value — this dialog is convenience, not the gate.
+  document.querySelectorAll('form[data-confirm]').forEach(function (form) {
+    form.addEventListener('submit', function (event) {
+      if (!window.confirm(form.dataset.confirm)) event.preventDefault();
+    });
+  });
+
+  document.querySelectorAll('form[data-delete]').forEach(function (form) {
+    form.addEventListener('submit', function (event) {
+      const id = form.dataset.delete;
+      const typed = window.prompt(
+        'Delete ' + id + ' permanently?\n\n' +
+        'This withdraws its public route, destroys its containers AND its database ' +
+        'volume (every stored visit and canary assignment for this site), and removes ' +
+        'its configuration. Requests it already logged stay in Crawler Analytics as ' +
+        'historical traffic.\n\nType the site id to confirm:'
+      );
+      if (typed === null) { event.preventDefault(); return; }
+      if (typed.trim() !== id) {
+        event.preventDefault();
+        window.alert('That did not match "' + id + '". Nothing was deleted.');
+        return;
+      }
+      form.querySelector('input[name="confirm"]').value = typed.trim();
+    });
+  });
 </script>
 {% endblock %}

@@ -1,0 +1,462 @@
+---
+# Publication is deliberately a separate role that runs only after the deploy
+# role has confirmed the web container is healthy. Ordinary task failures are
+# rescued here; web-UI cancellation/SIGKILL is independently rolled back from
+# the parent app process's pre-deploy artifact snapshot.
+- name: Ensure nginx conf.d directory exists
+  ansible.builtin.file:
+    path: "{{ proxy.conf_dir }}"
+    state: directory
+    mode: "0755"
+  when: proxy.enabled | default(false) | bool
+
+- name: Check whether the reverse proxy is running
+  ansible.builtin.command:
+    cmd: "docker ps --quiet --filter name=^/{{ proxy.container }}$"
+  register: published_proxy
+  changed_when: false
+  failed_when: false
+  when: proxy.enabled | default(false) | bool
+
+- name: Inspect the previously published nginx route
+  ansible.builtin.stat:
+    path: "{{ proxy.conf_dir }}/{{ site_id }}.conf"
+  register: previous_route
+  when: proxy.enabled | default(false) | bool
+
+- name: Require an existing published route for render-only maintenance
+  ansible.builtin.assert:
+    that:
+      - previous_route.stat.exists | default(false)
+    fail_msg: >-
+      render_only=true is restricted to existing published routes. Deploy
+      {{ site_id }} normally before using route-only maintenance.
+  when:
+    - proxy.enabled | default(false) | bool
+    - render_only | default(false) | bool
+
+- name: Require the reverse proxy before route publication
+  ansible.builtin.assert:
+    that:
+      - published_proxy.stdout | default('') | trim | length > 0
+    fail_msg: >-
+      {{ proxy.container }} is not running, so the candidate route cannot be
+      validated safely. Start the proxy and re-run this deployment; no final
+      route was created or replaced.
+  when: proxy.enabled | default(false) | bool
+
+- name: Preserve the previously published nginx route
+  ansible.builtin.slurp:
+    src: "{{ proxy.conf_dir }}/{{ site_id }}.conf"
+  register: previous_route_content
+  when:
+    - proxy.enabled | default(false) | bool
+    - previous_route.stat.exists | default(false)
+
+- name: Derive certificate-safe hostname transition aliases
+  vars:
+    previous_route_text: >-
+      {{ previous_route_content.content | default('') | b64decode }}
+    previous_canonical_matches: >-
+      {{ previous_route_text
+         | regex_findall('(?m)^[ \t]*set[ \t]+[$]site_name[ \t]+([^;]+);') }}
+    desired_canonical_hostname: >-
+      {{ proxy.server_name | default(site_id ~ '.' ~ proxy.base_domain) }}
+  ansible.builtin.set_fact:
+    previous_canonical_hostname: >-
+      {{ previous_canonical_matches | first | default('') }}
+    candidate_tls_transition_aliases: >-
+      {{
+        [previous_canonical_matches | first]
+        if (
+          previous_canonical_matches | length > 0
+          and previous_canonical_matches | first != desired_canonical_hostname
+          and proxy.tls_fullchain is defined
+          and proxy.tls_key is defined
+          and (
+            not (skip_tls_sync | default(false) | bool)
+            or preserve_tls_transition_alias | default(false) | bool
+          )
+        )
+        else []
+      }}
+  when: proxy.enabled | default(false) | bool
+
+- name: Inspect previously published Prometheus rule
+  ansible.builtin.stat:
+    path: "{{ monitoring.rules_dir }}/{{ site_id }}.yml"
+  register: previous_alert_rule
+  when: monitoring.enabled | default(true) | bool
+
+- name: Preserve previously published Prometheus rule
+  ansible.builtin.slurp:
+    src: "{{ monitoring.rules_dir }}/{{ site_id }}.yml"
+  register: previous_alert_rule_content
+  when:
+    - monitoring.enabled | default(true) | bool
+    - previous_alert_rule.stat.exists | default(false)
+
+- name: Inspect previously published blackbox target
+  ansible.builtin.stat:
+    path: "{{ monitoring.targets_dir }}/{{ site_id }}.yml"
+  register: previous_probe_target
+  when:
+    - monitoring.enabled | default(true) | bool
+    - proxy.enabled | default(false) | bool
+
+- name: Preserve previously published blackbox target
+  ansible.builtin.slurp:
+    src: "{{ monitoring.targets_dir }}/{{ site_id }}.yml"
+  register: previous_probe_target_content
+  when:
+    - monitoring.enabled | default(true) | bool
+    - proxy.enabled | default(false) | bool
+    - previous_probe_target.stat.exists | default(false)
+
+- name: Render nginx route candidate outside the included glob
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/roles/configure/templates/site.conf.j2"
+    dest: "{{ proxy.conf_dir }}/.{{ site_id }}.candidate"
+    mode: "0644"
+  vars:
+    tls_transition_aliases: "{{ candidate_tls_transition_aliases | default([]) }}"
+  when: proxy.enabled | default(false) | bool
+
+# Candidate promotion and monitoring publication are one transaction. Rescue
+# restores every exact prior file (or removes brand-new artifacts), so a failed
+# direct Ansible run cannot leave a partial route/alert/target inventory.
+- name: Validate and activate site publication transaction
+  block:
+    - name: Atomically promote nginx route candidate
+      ansible.builtin.copy:
+        src: "{{ proxy.conf_dir }}/.{{ site_id }}.candidate"
+        dest: "{{ proxy.conf_dir }}/{{ site_id }}.conf"
+        remote_src: true
+        mode: "0644"
+      when: proxy.enabled | default(false) | bool
+
+    - name: Validate complete nginx configuration
+      ansible.builtin.command: "docker exec {{ proxy.container }} nginx -t"
+      changed_when: false
+      when: proxy.enabled | default(false) | bool
+
+    - name: Reload nginx with published route
+      ansible.builtin.command: "docker exec {{ proxy.container }} nginx -s reload"
+      changed_when: true
+      when: proxy.enabled | default(false) | bool
+
+    # HTTP-01 needs the candidate route loaded. Keeping TLS reconciliation in
+    # this transaction means ACME/verification failure restores the prior route
+    # instead of leaving a newly public hostname with a mismatched certificate.
+    - name: Reconcile trusted certificate with published site routes
+      ansible.builtin.command:
+        cmd: "{{ project_root }}/scripts/setup-letsencrypt.sh"
+        chdir: "{{ project_root }}"
+      environment:
+        # Preserve hostname A while candidate B is transactional. Rescue can
+        # restore A after a later failure without ever serving a mismatched cert.
+        TLS_RETAIN_EXISTING: "1"
+        ABD_PUBLICATION_LOCK_HELD: "1"
+        TLS_CERTBOT_CONTAINER: >-
+          {{ tls_certbot_container | default('abd-certbot-reconcile-' ~ site_id) }}
+      register: tls_reconcile
+      changed_when: "'certificate already covers every published hostname' not in tls_reconcile.stdout"
+      when:
+        - proxy.enabled | default(false) | bool
+        - proxy.tls_auto_expand | default(false) | bool
+        - proxy.tls_fullchain is defined
+        - proxy.tls_key is defined
+        - not (skip_tls_sync | default(false) | bool)
+
+    - name: Render committed nginx route without TLS transition aliases
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/roles/configure/templates/site.conf.j2"
+        dest: "{{ proxy.conf_dir }}/.{{ site_id }}.candidate"
+        mode: "0644"
+      vars:
+        tls_transition_aliases: []
+      when:
+        - proxy.enabled | default(false) | bool
+        - candidate_tls_transition_aliases | default([]) | length > 0
+        - not (preserve_tls_transition_alias | default(false) | bool)
+
+    - name: Atomically remove committed TLS transition aliases
+      ansible.builtin.copy:
+        src: "{{ proxy.conf_dir }}/.{{ site_id }}.candidate"
+        dest: "{{ proxy.conf_dir }}/{{ site_id }}.conf"
+        remote_src: true
+        mode: "0644"
+      when:
+        - proxy.enabled | default(false) | bool
+        - candidate_tls_transition_aliases | default([]) | length > 0
+        - not (preserve_tls_transition_alias | default(false) | bool)
+
+    - name: Validate nginx after removing TLS transition aliases
+      ansible.builtin.command: "docker exec {{ proxy.container }} nginx -t"
+      changed_when: false
+      when:
+        - proxy.enabled | default(false) | bool
+        - candidate_tls_transition_aliases | default([]) | length > 0
+        - not (preserve_tls_transition_alias | default(false) | bool)
+
+    - name: Reload nginx without TLS transition aliases
+      ansible.builtin.command: "docker exec {{ proxy.container }} nginx -s reload"
+      changed_when: true
+      when:
+        - proxy.enabled | default(false) | bool
+        - candidate_tls_transition_aliases | default([]) | length > 0
+        - not (preserve_tls_transition_alias | default(false) | bool)
+
+    # cAdvisor removes a stopped container's series, so Prometheus cannot
+    # discover the missing name generically. These final monitoring files are
+    # publication markers and are committed only after route/TLS succeeds.
+    - name: Ensure per-site Prometheus rules directory exists
+      ansible.builtin.file:
+        path: "{{ monitoring.rules_dir }}"
+        state: directory
+        mode: "0755"
+      when: monitoring.enabled | default(true) | bool
+
+    - name: Publish per-site Prometheus alert rules
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/roles/configure/templates/site-alerts.yml.j2"
+        dest: "{{ monitoring.rules_dir }}/{{ site_id }}.yml"
+        mode: "0644"
+      when: monitoring.enabled | default(true) | bool
+
+    - name: Ensure per-site blackbox target directory exists
+      ansible.builtin.file:
+        path: "{{ monitoring.targets_dir }}"
+        state: directory
+        mode: "0755"
+      when:
+        - monitoring.enabled | default(true) | bool
+        - proxy.enabled | default(false) | bool
+
+    - name: Publish per-site HTTP and HTTPS blackbox targets
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/roles/configure/templates/site-targets.yml.j2"
+        dest: "{{ monitoring.targets_dir }}/{{ site_id }}.yml"
+        mode: "0644"
+      when:
+        - monitoring.enabled | default(true) | bool
+        - proxy.enabled | default(false) | bool
+
+    # Prometheus rule updates require SIGHUP; file_sd target updates are
+    # discovered automatically. These are explicit block tasks—not handlers—so
+    # a failed HUP enters this transaction's rescue and restores every artifact.
+    - name: Inspect Prometheus before applying published rules
+      ansible.builtin.command: >-
+        docker ps --quiet --filter name=^/{{ monitoring.prometheus_container }}$
+      register: published_prometheus
+      changed_when: false
+      when: monitoring.enabled | default(true) | bool
+
+    - name: Apply published monitoring rules immediately
+      ansible.builtin.command: >-
+        docker kill --signal=HUP {{ monitoring.prometheus_container }}
+      changed_when: true
+      when:
+        - monitoring.enabled | default(true) | bool
+        - published_prometheus.stdout | default('') | trim | length > 0
+
+    # The union certificate is only a rollback bridge. This is deliberately
+    # after every route/monitoring commit step: even if retirement itself is
+    # unavailable, the union remains valid for the new route and rollback is
+    # no longer needed. A later reconciliation drops stale, unmarked SANs.
+    - name: Retire committed TLS transition SANs
+      ansible.builtin.command:
+        cmd: "{{ project_root }}/scripts/setup-letsencrypt.sh"
+        chdir: "{{ project_root }}"
+      environment:
+        ABD_PUBLICATION_LOCK_HELD: "1"
+        TLS_CERTBOT_CONTAINER: >-
+          {{ tls_certbot_container | default('abd-certbot-reconcile-' ~ site_id) }}
+      register: tls_exact_reconcile
+      changed_when: "'certificate already covers every published hostname' not in tls_exact_reconcile.stdout"
+      failed_when: false
+      when:
+        - proxy.enabled | default(false) | bool
+        - proxy.tls_auto_expand | default(false) | bool
+        - proxy.tls_fullchain is defined
+        - proxy.tls_key is defined
+        - candidate_tls_transition_aliases | default([]) | length > 0
+        - not (preserve_tls_transition_alias | default(false) | bool)
+        - not (skip_tls_sync | default(false) | bool)
+
+    - name: Report deferred TLS transition SAN retirement
+      ansible.builtin.debug:
+        msg: >-
+          The new hostname is published with a valid old+new union
+          certificate, but stale transition SAN retirement failed and will be
+          retried by the next TLS reconciliation. Detail:
+          {{ tls_exact_reconcile.stderr | default(tls_exact_reconcile.stdout) }}
+      when:
+        - tls_exact_reconcile is defined
+        - tls_exact_reconcile.rc | default(0) != 0
+  rescue:
+    - name: Restore previous nginx route after failed validation
+      ansible.builtin.copy:
+        content: "{{ previous_route_content.content | b64decode }}"
+        dest: "{{ proxy.conf_dir }}/{{ site_id }}.conf"
+        mode: "0644"
+      register: rollback_restore_route
+      ignore_errors: true
+      when:
+        - proxy.enabled | default(false) | bool
+        - previous_route.stat.exists | default(false)
+
+    - name: Remove failed new nginx route
+      ansible.builtin.file:
+        path: "{{ proxy.conf_dir }}/{{ site_id }}.conf"
+        state: absent
+      register: rollback_remove_route
+      ignore_errors: true
+      when:
+        - proxy.enabled | default(false) | bool
+        - not (previous_route.stat.exists | default(false))
+
+    - name: Restore previous Prometheus alert rule
+      ansible.builtin.copy:
+        content: "{{ previous_alert_rule_content.content | b64decode }}"
+        dest: "{{ monitoring.rules_dir }}/{{ site_id }}.yml"
+        mode: "0644"
+      register: rollback_restore_rule
+      ignore_errors: true
+      when:
+        - monitoring.enabled | default(true) | bool
+        - previous_alert_rule.stat.exists | default(false)
+
+    - name: Remove failed new Prometheus alert rule
+      ansible.builtin.file:
+        path: "{{ monitoring.rules_dir }}/{{ site_id }}.yml"
+        state: absent
+      register: rollback_remove_rule
+      ignore_errors: true
+      when:
+        - monitoring.enabled | default(true) | bool
+        - not (previous_alert_rule.stat.exists | default(false))
+
+    - name: Restore previous blackbox target
+      ansible.builtin.copy:
+        content: "{{ previous_probe_target_content.content | b64decode }}"
+        dest: "{{ monitoring.targets_dir }}/{{ site_id }}.yml"
+        mode: "0644"
+      register: rollback_restore_target
+      ignore_errors: true
+      when:
+        - monitoring.enabled | default(true) | bool
+        - proxy.enabled | default(false) | bool
+        - previous_probe_target.stat.exists | default(false)
+
+    - name: Remove failed new blackbox target
+      ansible.builtin.file:
+        path: "{{ monitoring.targets_dir }}/{{ site_id }}.yml"
+        state: absent
+      register: rollback_remove_target
+      ignore_errors: true
+      when:
+        - monitoring.enabled | default(true) | bool
+        - proxy.enabled | default(false) | bool
+        - not (previous_probe_target.stat.exists | default(false))
+
+    - name: Re-validate restored nginx configuration
+      ansible.builtin.command: "docker exec {{ proxy.container }} nginx -t"
+      register: rollback_validate_nginx
+      changed_when: false
+      ignore_errors: true
+      when: proxy.enabled | default(false) | bool
+
+    - name: Keep nginx on the restored route
+      ansible.builtin.command: "docker exec {{ proxy.container }} nginx -s reload"
+      register: rollback_reload_nginx
+      changed_when: true
+      ignore_errors: true
+      when: proxy.enabled | default(false) | bool
+
+    # A successful Certbot update may have replaced hostname A with B before a
+    # later monitoring failure. Once route A is restored, reconcile again so
+    # the shared certificate cannot remain mismatched with the rolled-back SNI.
+    - name: Reconcile trusted certificate with restored routes
+      ansible.builtin.command:
+        cmd: "{{ project_root }}/scripts/setup-letsencrypt.sh"
+        chdir: "{{ project_root }}"
+      register: rollback_reconcile_tls
+      changed_when: true
+      ignore_errors: true
+      environment:
+        ABD_PUBLICATION_LOCK_HELD: "1"
+        TLS_CERTBOT_CONTAINER: >-
+          {{ tls_certbot_container | default('abd-certbot-reconcile-' ~ site_id) }}
+      when:
+        - proxy.enabled | default(false) | bool
+        - proxy.tls_auto_expand | default(false) | bool
+        - proxy.tls_fullchain is defined
+        - proxy.tls_key is defined
+        - not (skip_tls_sync | default(false) | bool)
+
+    - name: Reload restored Prometheus rules
+      ansible.builtin.command: >-
+        docker kill --signal=HUP {{ monitoring.prometheus_container }}
+      register: rollback_reload_prometheus
+      changed_when: true
+      ignore_errors: true
+      when: monitoring.enabled | default(true) | bool
+
+    - name: Remove rejected nginx route candidate
+      ansible.builtin.file:
+        path: "{{ proxy.conf_dir }}/.{{ site_id }}.candidate"
+        state: absent
+      register: rollback_remove_candidate
+      ignore_errors: true
+      when: proxy.enabled | default(false) | bool
+
+    - name: Collect failed publication rollback steps
+      ansible.builtin.set_fact:
+        publication_rollback_failures: >-
+          {{
+            [
+              {'step': 'restore previous nginx route', 'result': rollback_restore_route},
+              {'step': 'remove failed new nginx route', 'result': rollback_remove_route},
+              {'step': 'restore previous Prometheus rule', 'result': rollback_restore_rule},
+              {'step': 'remove failed new Prometheus rule', 'result': rollback_remove_rule},
+              {'step': 'restore previous blackbox target', 'result': rollback_restore_target},
+              {'step': 'remove failed new blackbox target', 'result': rollback_remove_target},
+              {'step': 'validate restored nginx configuration', 'result': rollback_validate_nginx},
+              {'step': 'reload restored nginx configuration', 'result': rollback_reload_nginx},
+              {'step': 'reconcile restored trusted TLS', 'result': rollback_reconcile_tls},
+              {'step': 'reload restored Prometheus rules', 'result': rollback_reload_prometheus},
+              {'step': 'remove rejected route candidate', 'result': rollback_remove_candidate}
+            ]
+            | selectattr('result.failed', 'defined')
+            | selectattr('result.failed', 'equalto', true)
+            | map(attribute='step')
+            | list
+          }}
+
+    - name: Fail publication after restoring all artifacts
+      ansible.builtin.fail:
+        msg: >-
+          Route, trusted-TLS, or monitoring publication failed for {{ site_id }}.
+          Restoration of prior route/rule/target/TLS state was attempted.
+          Rollback failures: {{ publication_rollback_failures | join(', ')
+          if publication_rollback_failures | length > 0 else 'none' }}.
+          Any named rollback failure requires immediate operator attention.
+          Original cause:
+          {{ ansible_failed_result.msg | default('unknown') }}
+
+- name: Remove nginx route candidate
+  ansible.builtin.file:
+    path: "{{ proxy.conf_dir }}/.{{ site_id }}.candidate"
+    state: absent
+  when: proxy.enabled | default(false) | bool
+
+- name: Print published service URL
+  ansible.builtin.debug:
+    msg: >-
+      Site {{ site_id }} is published through the reverse proxy:
+      https://{{ proxy.server_name | default(site_id ~ '.' ~ proxy.base_domain) }}/
+      (local alias http://{{ site_id }}.{{ proxy.local_base_domain }}/,
+      direct debug port={{ website.port }}, genmode={{ website.genmode }},
+      scraper_version={{ scraper_version }}, db_port={{ database.host_port }})
+  when: proxy.enabled | default(false) | bool

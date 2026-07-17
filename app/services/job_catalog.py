@@ -19,6 +19,9 @@ from . import (
 
 _TASK_DESTINATIONS = {
     "site-deploy": ("Site deployment", "/sites?job={id}"),
+    "site-start": ("Site start", "/sites?job={id}"),
+    "site-stop": ("Site take-down", "/sites?job={id}"),
+    "site-delete": ("Site deletion", "/sites?job={id}"),
     "campaign-intelligence": ("Campaign analysis", "/logs?job={id}"),
     "manual-prompt": ("Prompt generation", "/query?job={id}#manual"),
     "membership-inference": ("Membership inference", "/query?job={id}#membership"),

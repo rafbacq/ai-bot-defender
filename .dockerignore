@@ -27,10 +27,9 @@ env
 # Node modules (untracked, unused by the image; ~235 MB)
 node_modules
 
-# Research corpora / datasets (not needed to build the image)
-wikipedia_towns_text
-cleaned_intros
-data
+# Documentation & machine-local notes (not needed to build the image)
+docs
+*.md
 
 # Template generator (heavy LoRA/model + scrape output; runs from the runtime
 # bind mount, never baked into the image)

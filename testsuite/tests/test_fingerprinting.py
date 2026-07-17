@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import pytest
 
+from .conftest import load_module_from_path
+
 PUBLIC_IP = "104.28.1.9"
 PRIVATE_IP = "10.0.0.9"
 WIN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
@@ -130,6 +132,62 @@ def test_consistency_flags_spoofed_os_only_for_public_clients():
     assert private["tcp_os_trusted"] is False
     assert private["inconsistent"] is False, "must not accuse a NAT/private client of OS spoofing"
 
+    carrier_nat = _score(
+        ua_top=WIN_UA,
+        js_platform="Win32",
+        tcp_os=["Linux"],
+        client_ip="100.64.0.1",
+    )
+    assert carrier_nat["tcp_os_trusted"] is False
+    assert carrier_nat["inconsistent"] is False, \
+        "RFC6598 carrier/Tailscale NAT cannot prove the browser's client kernel"
+
+
+def test_consistency_does_not_treat_declared_crawler_compat_ua_as_host_os():
+    """OAI-SearchBot's Macintosh/Chrome wrapper is crawler compatibility syntax,
+    not a claim that OpenAI's fetch host runs an Apple kernel."""
+    oai_ua = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36; compatible; "
+        "OAI-SearchBot/1.3; +https://openai.com/searchbot"
+    )
+    declared = _score(
+        ua_top=oai_ua,
+        tcp_os=["Linux"],
+        client_ip="104.210.140.134",
+        is_browser=False,
+        is_declared_crawler=True,
+        has_browser_fingerprint=False,
+    )
+    assert declared["declared_crawler"] is True
+    assert declared["tcp_os_trusted"] is True
+    assert declared["inconsistent"] is False
+    assert not any("User-Agent claims Apple" in c for c in declared["contradictions"])
+
+    # The exemption is scoped to declared crawlers; a normal Mac browser on the
+    # same exact Linux SYN remains a strong contradiction.
+    browser = _score(
+        ua_top=oai_ua.split("; compatible;", 1)[0],
+        tcp_os=["Linux"],
+        client_ip="104.210.140.134",
+        is_declared_crawler=False,
+    )
+    assert browser["inconsistent"] is True
+
+
+def test_consistency_does_not_trust_same_ip_tcp_fallback_for_a_row():
+    """A non-exact same-IP SYN remains visible but cannot accuse this request."""
+    verdict = _score(
+        ua_top=WIN_UA,
+        tcp_os=["Linux"],
+        client_ip=PUBLIC_IP,
+        tcp_match_exact=False,
+    )
+    assert verdict["tcp_os"] == "Linux"
+    assert verdict["tcp_os_trusted"] is False
+    assert verdict["inconsistent"] is False
+    assert not any("TCP/IP stack" in c for c in verdict["contradictions"])
+
 
 def test_consistency_flags_vm_renderer_automation_and_synthetic_behavior():
     """Software/VM renderer, automation tells, and humanized-but-synthetic behavior
@@ -150,6 +208,28 @@ def test_consistency_flags_vm_renderer_automation_and_synthetic_behavior():
     combined = _score(ua_top=WIN_UA, webgl_renderers=["llvmpipe"], automation_score=2,
                       automation_tells={"webdriver": True})
     assert combined["inconsistent"] is True
+
+
+def test_automation_requires_independent_weak_signal_families():
+    """Correlated mobile/privacy and VM booleans count once per surface."""
+    from crawler_graph.analysis import consistency
+
+    assert consistency.automated_from_tells({
+        "noPlugins": True,
+        "noMimeTypes": True,
+    }) is False
+    assert consistency.automated_from_tells({
+        "swRenderer": True,
+        "zeroHardware": True,
+    }) is False
+    # A second independent surface crosses the default two-family threshold.
+    assert consistency.automated_from_tells({
+        "noPlugins": True,
+        "noMimeTypes": True,
+        "languagesEmpty": True,
+    }) is True
+    # Strong automation evidence remains conclusive by itself.
+    assert consistency.automated_from_tells({"webdriver": True}) is True
 
 
 def test_consistency_flags_browser_that_never_ran_js():
@@ -175,6 +255,20 @@ def test_consistency_ignores_ambiguous_multi_os_tcp():
     rec = _score(ua_top=WIN_UA, tcp_os=["Linux", "Apple"], client_ip=PUBLIC_IP)
     assert rec["tcp_os"] is None
     assert not any("TCP/IP stack" in c for c in rec["contradictions"])
+
+
+def test_tcp_shipper_keeps_unrecognized_ttl64_shapes_unknown(repo_root):
+    """The crowded TTL-64 family must not default every incomplete/new SYN to Linux."""
+    pytest.importorskip("psycopg2")
+    shipper = load_module_from_path(
+        "proxy_tls_shipper_ambiguous",
+        repo_root / "proxy" / "tls-shipper" / "app.py",
+    )
+    assert shipper.infer_os(64, None, None, 1460) == "unknown"
+    assert shipper.infer_os(64, 12345, 3, 1460) == "unknown"
+    assert shipper.infer_os(64, 65535, 8, 1460) == "unknown"
+    assert shipper.infer_os(64, 65535, 6, 1460) == "Apple"
+    assert shipper.infer_os(63, 29200, 7, 1460) == "Linux"
 
 
 # --- The fingerprint viewer's per-row verdict (reuses the same engine) ------

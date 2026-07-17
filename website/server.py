@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request
+from flask import Flask, Response, render_template, request
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -8,6 +8,7 @@ import sys
 import hashlib
 from datetime import datetime
 import logging
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -24,6 +25,7 @@ fake.add_provider(FoodProvider)
 
 from ipwhois import IPWhois
 from user_agent_info import parse_user_agent
+from runtime_health import load_canary_expressions, validate_runtime_dependencies
 
 load_dotenv()
 
@@ -35,6 +37,11 @@ DB_USER = os.environ.get("DB_USER", "null")
 DB_PASS = os.environ.get("DB_PASS", "null")
 #SCRAPER_VERSION = 1 
 SCRAPER_VERSION = int(os.environ.get("SCRAPER_VERSION", 1)) #b/c now we have more scraper files/templates
+WEBSITE_DIR = Path(__file__).resolve().parent
+ACTIVE_TEMPLATE = f"scraper{SCRAPER_VERSION}.html"
+ACTIVE_VARLIST = WEBSITE_DIR / "varLists" / f"scraper{SCRAPER_VERSION}.txt"
+ACTIVE_FP_SCRIPT = WEBSITE_DIR / "static" / "js" / "fp.js"
+GENMODE = not (len(sys.argv) >= 2 and sys.argv[1] == "nogen")
 
 
 
@@ -147,8 +154,9 @@ def get_client_ip():
     return ip
 
 def set_vars(session, max_attempts=10000):
-    with open(f"varLists/scraper{SCRAPER_VERSION}.txt", 'r') as file:
-        var_list = [line.strip() for line in file.readlines()[:10]]
+    # The health endpoint uses this same loader, so a site is never published
+    # healthy with a varList that the first new visitor cannot evaluate.
+    var_list = load_canary_expressions(ACTIVE_VARLIST, fake)
 
     for i in range(max_attempts):
         vars = gen_vars(*var_list)
@@ -327,19 +335,60 @@ def update_page(session,genmode,full_ua = False):
 
     session.close()
 
-    return render_template(f"scraper{SCRAPER_VERSION}.html", user_agent=user_agent, seen_before = seen_before, var1 = var1, var2 = var2, var3 = var3, var4 = var4, var5 = var5, var6 = var6, var7 = var7, var8 = var8, var9 = var9, var10 = var10)
+    return render_template(ACTIVE_TEMPLATE, user_agent=user_agent, seen_before = seen_before, var1 = var1, var2 = var2, var3 = var3, var4 = var4, var5 = var5, var6 = var6, var7 = var7, var8 = var8, var9 = var9, var10 = var10)
+
+@app.route('/__abd_health', methods=['GET'])
+def healthcheck():
+    """Check the live site dependencies without creating research traffic.
+
+    The reverse proxy exposes this only through an exact-match location that
+    is neither mirrored nor access-logged.  Keep this handler independent of
+    ``update_page``: monitoring must never assign/persist canaries, perform ASN
+    lookups, or insert synthetic visits merely to establish site health.
+    """
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+            # LIMIT 0 is read-only but forces Postgres to resolve every column
+            # the request path reads or writes. This catches a stale partial
+            # migration (especially new_agents_vars.fp_id) before GET / fails.
+            connection.execute(text(
+                "SELECT id, browser_family, user_agent, browser_version, "
+                "os_family, os_version, device_family, is_mobile, is_tablet, "
+                "is_pc, asn, ip_netaddr, hashed_ip, timestamp "
+                "FROM new_visits LIMIT 0"
+            ))
+            connection.execute(text(
+                "SELECT id, browser_family, user_agent, view_count, "
+                "var1, var2, var3, var4, var5, var6, var7, var8, var9, var10, "
+                "asn, hashed_ip, last_visited, ip_netaddr, fp_id "
+                "FROM new_agents_vars LIMIT 0"
+            ))
+        # Validate Faker calls against a disposable generator clone (no live
+        # PRNG mutation or persisted assignment), then execute the real
+        # Flask/Jinja render path with inert values. Jinja resolves includes and
+        # imports lazily, so get_template() alone is not enough.
+        validate_runtime_dependencies(
+            render_template,
+            ACTIVE_TEMPLATE,
+            ACTIVE_VARLIST,
+            fake,
+            genmode=GENMODE,
+            required_assets=(ACTIVE_FP_SCRIPT,),
+        )
+    except Exception as exc:
+        logging.error("health check failed: %s", exc)
+        return Response(status=503, headers={"Cache-Control": "no-store"})
+    return Response(status=204, headers={"Cache-Control": "no-store"})
+
 
 @app.route('/', methods=['GET'])
 def index():
-    genmode = True
-    if len(sys.argv) >= 2 and sys.argv[1] == "nogen":
-        genmode = False
-
-    print(f"Genmode: {genmode}")
+    print(f"Genmode: {GENMODE}")
 
     session = Session()
 
-    return update_page(session,genmode)
+    return update_page(session,GENMODE)
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8080, debug=False)

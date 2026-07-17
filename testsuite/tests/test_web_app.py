@@ -176,8 +176,12 @@ def test_processing_pages_rediscover_live_jobs_without_the_original_query_url(
     """
     main, rendered = app_main
 
+    requested = []
+
     def latest_task(**kwargs):
-        kind = next(iter(kwargs.get("kinds") or ["unknown"]))
+        kinds = set(kwargs.get("kinds") or ["unknown"])
+        requested.append(kinds)
+        kind = sorted(kinds)[0]
         return {
             "id": f"job-{kind}", "kind": kind, "status": "running",
             "done": False, "ok": None, "label": f"{kind} is running",
@@ -187,7 +191,12 @@ def test_processing_pages_rediscover_live_jobs_without_the_original_query_url(
 
     monkeypatch.setattr(main.task_service, "latest", latest_task)
     main.sites_page(object())
-    assert rendered[-1][1]["background_job"]["kind"] == "site-deploy"
+    # Every site lifecycle operation reports through the one job panel, so the
+    # page must rediscover a take-down or delete, not only a deploy.
+    assert requested[-1] == {
+        "site-deploy", "site-start", "site-stop", "site-delete",
+    }
+    assert rendered[-1][1]["background_job"]["kind"] == "site-delete"
     main.logs_page(object())
     assert rendered[-1][1]["background_job"]["kind"] == "campaign-intelligence"
     main.query_page(object())
@@ -299,6 +308,76 @@ def test_deploy_validates_then_redirects(app_main, monkeypatch):
                      db_user="", db_password="", db_host_port="5440", reset_db="")
     assert ok.status_code == 303 and ok.headers["location"] == "/sites?deployed=site-x&ok=1"
     assert calls, "a valid deploy must write the site config"
+
+
+def test_site_lifecycle_routes_dispatch_to_the_right_service(app_main, monkeypatch):
+    """Start/stop/delete each call their own service and redirect to the result."""
+    main, _ = app_main
+    calls = []
+    monkeypatch.setattr(main.sites, "deploy_site",
+                        lambda sid, **k: calls.append(("start", sid)) or (True, "up"))
+    monkeypatch.setattr(main.sites, "stop_site",
+                        lambda sid, **k: calls.append(("stop", sid)) or (True, "down"))
+    monkeypatch.setattr(main.sites, "delete_site",
+                        lambda sid, **k: calls.append(("delete", sid)) or (True, "gone"))
+
+    # Each redirect carries the action, so the result banner names what actually
+    # happened instead of reporting every site operation as a deployment.
+    started = main.start_site(site_id="site-x")
+    assert started.status_code == 303
+    assert started.headers["location"] == "/sites?deployed=site-x&ok=1&action=start"
+
+    stopped = main.stop_site(site_id="site-x")
+    assert stopped.status_code == 303
+    assert stopped.headers["location"] == "/sites?deployed=site-x&ok=1&action=stop"
+
+    deleted = main.delete_site(site_id="site-x", confirm="site-x")
+    assert deleted.status_code == 303
+    assert deleted.headers["location"] == "/sites?deployed=site-x&ok=1&action=delete"
+
+    assert calls == [("start", "site-x"), ("stop", "site-x"), ("delete", "site-x")]
+
+
+def test_delete_requires_a_server_side_typed_confirmation(app_main, monkeypatch):
+    """The browser dialog is convenience; the server is the gate.
+
+    A stale tab, a replayed form, or a scripted POST all skip window.prompt, and
+    this is the one action that destroys a site's database volume.
+    """
+    main, _ = app_main
+    calls = []
+    monkeypatch.setattr(main.sites, "delete_site",
+                        lambda sid, **k: calls.append(sid) or (True, "gone"))
+
+    for confirm in ("", "site-y", "SITE-X", " "):
+        resp = main.delete_site(site_id="site-x", confirm=confirm)
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/sites?deployed=site-x&ok=0&action=delete"
+    assert calls == [], "an unconfirmed delete must never reach the service"
+
+    assert main.delete_site(site_id="site-x", confirm="site-x").status_code == 303
+    assert calls == ["site-x"]
+
+
+def test_site_lifecycle_routes_reject_unsafe_ids_before_any_work(app_main, monkeypatch):
+    """An id that fails validation never reaches Docker, Ansible, or the filesystem."""
+    main, _ = app_main
+    called = []
+    for name in ("deploy_site", "stop_site", "delete_site"):
+        monkeypatch.setattr(main.sites, name,
+                            lambda sid, **k: called.append(sid) or (True, ""))
+
+    for bad in ("../evil", "site-001;rm -rf /", "admin", ""):
+        for route, kwargs in (
+            (main.start_site, {}),
+            (main.stop_site, {}),
+            (main.delete_site, {"confirm": bad}),
+        ):
+            resp = route(site_id=bad, **kwargs)
+            assert resp.status_code == 303
+            assert resp.headers["location"].startswith("/sites?")
+            assert "ok=1" not in resp.headers["location"]
+    assert called == []
 
 
 def test_query_run_starts_a_background_run_and_redirects(app_main, monkeypatch):

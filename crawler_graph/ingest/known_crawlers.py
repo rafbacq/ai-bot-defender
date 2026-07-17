@@ -20,27 +20,30 @@ import re
 
 # Declared crawler User-Agents -> provider. Checked in order; first match wins.
 CRAWLER_UA_PATTERNS = [
-    (re.compile(r"GPTBot", re.I), "OpenAI"),
-    (re.compile(r"OAI-SearchBot", re.I), "OpenAI"),
-    (re.compile(r"ChatGPT-User", re.I), "OpenAI"),
-    (re.compile(r"ClaudeBot", re.I), "Anthropic"),
-    (re.compile(r"anthropic-ai", re.I), "Anthropic"),
-    (re.compile(r"Claude-User|Claude-Web|Claude-SearchBot", re.I), "Anthropic"),
-    (re.compile(r"PerplexityBot|Perplexity-User", re.I), "Perplexity"),
-    (re.compile(r"Google-Extended", re.I), "Google"),
-    (re.compile(r"Googlebot|Storebot-Google|Google-InspectionTool|GoogleOther", re.I), "Google"),
-    (re.compile(r"Bingbot|BingPreview|msnbot|adidxbot", re.I), "Microsoft/Bing"),
-    (re.compile(r"Applebot", re.I), "Apple"),
-    (re.compile(r"Amazonbot", re.I), "Amazon"),
-    (re.compile(r"Bytespider", re.I), "ByteDance"),
-    (re.compile(r"CCBot", re.I), "CommonCrawl"),
-    (re.compile(r"Meta-ExternalAgent|Meta-ExternalFetcher|facebookexternalhit|FacebookBot", re.I), "Meta"),
-    (re.compile(r"DuckAssistBot|DuckDuckBot", re.I), "DuckDuckGo"),
-    (re.compile(r"YouBot", re.I), "You.com"),
-    (re.compile(r"cohere-ai", re.I), "Cohere"),
-    (re.compile(r"Diffbot", re.I), "Diffbot"),
-    (re.compile(r"Timpibot", re.I), "Timpi"),
-    (re.compile(r"omgili|webzio", re.I), "Webz.io"),
+    # Product-name boundaries are security-significant: substring matching made
+    # names such as ``DefinitelyNotGPTBot`` look declared, which incorrectly
+    # granted them the declared-crawler UA-vs-TCP compatibility exemption.
+    (re.compile(r"\bGPTBot\b", re.I), "OpenAI"),
+    (re.compile(r"\bOAI-SearchBot\b", re.I), "OpenAI"),
+    (re.compile(r"\bChatGPT-User\b", re.I), "OpenAI"),
+    (re.compile(r"\bClaudeBot\b", re.I), "Anthropic"),
+    (re.compile(r"\banthropic-ai\b", re.I), "Anthropic"),
+    (re.compile(r"\b(?:Claude-User|Claude-Web|Claude-SearchBot)\b", re.I), "Anthropic"),
+    (re.compile(r"\b(?:PerplexityBot|Perplexity-User)\b", re.I), "Perplexity"),
+    (re.compile(r"\bGoogle-Extended\b", re.I), "Google"),
+    (re.compile(r"\b(?:Googlebot|Storebot-Google|Google-InspectionTool|GoogleOther)\b", re.I), "Google"),
+    (re.compile(r"\b(?:Bingbot|BingPreview|msnbot|adidxbot)\b", re.I), "Microsoft/Bing"),
+    (re.compile(r"\bApplebot\b", re.I), "Apple"),
+    (re.compile(r"\bAmazonbot\b", re.I), "Amazon"),
+    (re.compile(r"\bBytespider\b", re.I), "ByteDance"),
+    (re.compile(r"\bCCBot\b", re.I), "CommonCrawl"),
+    (re.compile(r"\b(?:Meta-ExternalAgent|Meta-ExternalFetcher|facebookexternalhit|FacebookBot)\b", re.I), "Meta"),
+    (re.compile(r"\b(?:DuckAssistBot|DuckDuckBot)\b", re.I), "DuckDuckGo"),
+    (re.compile(r"\bYouBot\b", re.I), "You.com"),
+    (re.compile(r"\bcohere-ai\b", re.I), "Cohere"),
+    (re.compile(r"\bDiffbot\b", re.I), "Diffbot"),
+    (re.compile(r"\bTimpibot\b", re.I), "Timpi"),
+    (re.compile(r"\b(?:omgili|webzio)\b", re.I), "Webz.io"),
 ]
 
 # A request that looks like a real browser engine *and* carries no declared bot
@@ -49,8 +52,15 @@ BROWSER_UA_RE = re.compile(r"Mozilla/5\.0.*(Chrome/|Safari/|Firefox/|Edg/|Gecko/
 
 # Hints that a browser-UA visitor is an automation/agent rather than a person.
 AGENT_UA_HINTS = re.compile(
-    r"(Headless|Electron|PhantomJS|puppeteer|playwright|python-requests|"
-    r"Go-http-client|node-fetch|axios|httpx|aiohttp|curl|wget|Java/|okhttp)", re.I)
+    r"(?:\b[A-Za-z0-9_-]*(?:Bot|Crawler|Scanner|Spider)\b|"
+    r"\b(?:Headless(?:Chrome)?|Electron|PhantomJS|puppeteer|playwright|"
+    r"python-requests|Go-http-client|node-fetch|axios|httpx|aiohttp|curl|wget|"
+    r"okhttp|zgrab|l9scan|CensysInspect|masscan|Nmap|Nikto|Nuclei|sqlmap|"
+    r"Scrapy|InternetMeasurement|CMS-Checker|CheckHost|FlowIQLabsBot|"
+    r"ModatScanner|Shodan-Pull|Infrawatch)\b|\bJava/|"
+    r"\b(?:Cortex[- ]Xpanse|Palo Alto Networks)\b|"
+    r"\bRecordedFuture(?:\s+Global\s+Inventory\s+Crawler)?\b|"
+    r"\bLinux\s+Gnu\s+\(cow\)|\bforestengine\.net\b)", re.I)
 
 
 def provider_for_ua(ua):
@@ -73,8 +83,12 @@ def is_browser_ua(ua):
 
 
 def looks_automated(ua):
-    """True if the UA betrays automation tooling (non-browser client libs)."""
-    return bool(ua and AGENT_UA_HINTS.search(ua))
+    """True if an undeclared UA betrays automation tooling or a bot product.
+
+    Declared crawlers are automated by definition, but that automation is honest
+    identity rather than suspicion. Their provider/range checks remain separate.
+    """
+    return bool(ua and not is_declared_crawler(ua) and AGENT_UA_HINTS.search(ua))
 
 
 # --- Version-insensitive claimed identity (disguise counting) ---------------

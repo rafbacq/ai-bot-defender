@@ -147,9 +147,9 @@ def infer_os(ttl, win, wscale, mss):
 
     The initial TTL (normalized up from the observed value: 64->unix-like,
     128->Windows, 255->network gear) is the strong family discriminator; for the
-    crowded 64 bucket (Linux/Android/macOS/iOS all start at 64) the SYN window
-    size + window scale separate Apple (window 65535, scale 6) from Linux/Android
-    (larger windows, scale 7-10). Returns a clean token the consistency engine
+    crowded 64 bucket (Linux/Android/macOS/iOS all start at 64), only explicit
+    window/scale shapes are classified; an unfamiliar shape stays unknown rather
+    than guessing from window scale alone. Returns a clean token the consistency engine
     matches against the User-Agent-claimed OS: Windows / Apple / Linux /
     Network/BSD / unknown.
     """
@@ -175,11 +175,13 @@ def infer_os(ttl, win, wscale, mss):
         ws = None
     if win == 65535 and ws in (5, 6):
         return "Apple"
-    if ws is not None and ws >= 7:
-        return "Linux"
     if win in (29200, 64240, 5840, 14600, 26883, 28960):
         return "Linux"
-    return "Linux"
+    # Linux, Android, macOS, and iOS all inhabit the TTL-64 bucket.  If the
+    # window/scale shape did not match one of the explicit signatures above, the
+    # evidence is genuinely ambiguous; defaulting it to Linux manufactured
+    # Apple-vs-Linux spoof accusations from incomplete or newer SYN shapes.
+    return "unknown"
 
 
 def build_ja4t(win, mss, wscale, sack_ok, df):

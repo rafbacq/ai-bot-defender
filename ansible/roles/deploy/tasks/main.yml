@@ -31,18 +31,25 @@
 
 - name: Build and (re)start containers for site {{ site_id }}
   ansible.builtin.command:
-    cmd: docker compose up -d --build
+    # --wait gates publication on both Postgres and the web healthcheck. A
+    # merely running Python process is not enough: the route must not go live
+    # until its DB query and active Jinja template both succeed.
+    cmd: docker compose up -d --build --wait --wait-timeout 90
     chdir: "{{ website_dir }}/sites/{{ site_id }}"
   register: compose_up
   changed_when: "'Creating' in compose_up.stderr or 'Recreate' in compose_up.stderr or 'Started' in compose_up.stderr or 'Building' in compose_up.stderr"
 
-- name: Show running containers for site {{ site_id }}
+- name: Confirm the web service is running for site {{ site_id }}
   ansible.builtin.command:
-    cmd: docker compose ps
+    cmd: docker compose ps --status running --services
     chdir: "{{ website_dir }}/sites/{{ site_id }}"
   register: compose_ps
   changed_when: false
 
-- name: Print service URL
-  ansible.builtin.debug:
-    msg: "Site {{ site_id }} is up through the reverse proxy: https://{{ proxy.server_name | default(site_id ~ '.' ~ proxy.base_domain) }}/  (local alias http://{{ site_id }}.{{ proxy.local_base_domain }}/, direct debug port={{ website.port }}, genmode={{ website.genmode }}, scraper_version={{ scraper_version }}, db_port={{ database.host_port }})"
+- name: Require the web service before publishing its route
+  ansible.builtin.assert:
+    that:
+      - "'web' in compose_ps.stdout_lines"
+    fail_msg: >-
+      docker compose returned without a running web service for {{ site_id }}.
+      Its nginx route and monitoring rules were not published.

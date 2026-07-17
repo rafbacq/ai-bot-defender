@@ -279,12 +279,10 @@ def test_selfplay_live_scoring_uses_the_same_cancellable_lifecycle(
 def test_authenticated_http_job_can_be_cancelled_only_by_its_launcher(monkeypatch):
     """Exercise Request injection, redirect/job id, JSON status, and POST cancel."""
     pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
-    from itsdangerous import TimestampSigner
-    import base64
     import json
+    from starlette.requests import Request
 
-    from app import config, main
+    from app import main
 
     started = threading.Event()
 
@@ -296,41 +294,52 @@ def test_authenticated_http_job_can_be_cancelled_only_by_its_launcher(monkeypatc
 
     monkeypatch.setattr(main.provenance_service, "membership_demo", slow_membership)
 
-    def session_cookie(username):
-        payload = base64.b64encode(json.dumps({"username": username}).encode())
-        return TimestampSigner(str(config.SECRET_KEY)).sign(payload).decode()
+    def request_for(username, path="/"):
+        return Request({
+            "type": "http", "http_version": "1.1", "method": "POST",
+            "scheme": "http", "path": path, "raw_path": path.encode(),
+            "query_string": b"", "headers": [], "client": ("test", 50000),
+            "server": ("testserver", 80), "session": {"username": username},
+        })
 
-    alice = TestClient(main.app)
-    alice.cookies.set("aibd_session", session_cookie("alice"))
-    response = alice.post(
-        "/provenance/membership-demo", data={"n": "24", "seed": "4"},
-        follow_redirects=False,
+    # Keep a direct assertion on FastAPI's dependency graph: this is what
+    # proves a real HTTP request injects Request instead of taking the legacy
+    # ``request is None`` direct-call branch. The route functions themselves
+    # are invoked below because AnyIO's worker-thread adapter is not compatible
+    # with this suite's Python 3.14 runner; production uses Python 3.11.
+    route = next(
+        route for route in main.app.routes
+        if getattr(route, "path", None) == "/provenance/membership-demo"
     )
+    assert route.dependant.request_param_name == "request"
+
+    alice = request_for("alice", "/provenance/membership-demo")
+    response = main.provenance_membership(n=24, seed="4", request=alice)
     assert response.status_code == 303
     job_id = parse_qs(urlsplit(response.headers["location"]).query)["job"][0]
     assert started.wait(5)
-    assert alice.get(f"/jobs/{job_id}/status").json()["status"] == "running"
+    status = json.loads(main.task_status(alice, job_id).body)
+    assert status["status"] == "running"
 
-    bob = TestClient(main.app)
-    bob.cookies.set("aibd_session", session_cookie("bob"))
-    assert bob.post(f"/jobs/{job_id}/cancel").status_code == 403
+    bob = request_for("bob", f"/jobs/{job_id}/cancel")
+    assert main.task_cancel(bob, job_id).status_code == 403
 
-    requested = alice.post(f"/jobs/{job_id}/cancel")
+    requested = main.task_cancel(alice, job_id)
     assert requested.status_code == 200
-    assert requested.json()["status"] == "cancelling"
-    final = _wait_status(lambda: alice.get(f"/jobs/{job_id}/status").json())
+    assert json.loads(requested.body)["status"] == "cancelling"
+    final = _wait_status(
+        lambda: json.loads(main.task_status(alice, job_id).body),
+    )
     assert final["done"] is True and final["status"] == "cancelled"
 
 
 def test_http_job_keeps_running_after_launching_client_closes(monkeypatch):
     """Closing a browser client does not cancel work; a new client rediscovers it."""
     pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
-    from itsdangerous import TimestampSigner
-    import base64
     import json
+    from starlette.requests import Request
 
-    from app import config, main
+    from app import main
 
     started = threading.Event()
     release = threading.Event()
@@ -346,36 +355,35 @@ def test_http_job_keeps_running_after_launching_client_closes(monkeypatch):
 
     monkeypatch.setattr(main.provenance_service, "membership_demo", slow_membership)
 
-    payload = base64.b64encode(json.dumps({"username": "alice"}).encode())
-    cookie = TimestampSigner(str(config.SECRET_KEY)).sign(payload).decode()
+    def request_for(path):
+        return Request({
+            "type": "http", "http_version": "1.1", "method": "POST",
+            "scheme": "http", "path": path, "raw_path": path.encode(),
+            "query_string": b"", "headers": [], "client": ("test", 50000),
+            "server": ("testserver", 80), "session": {"username": "alice"},
+        })
 
-    first = TestClient(main.app)
-    first.cookies.set("aibd_session", cookie)
-    response = first.post(
-        "/provenance/membership-demo", data={"n": "24", "seed": "8"},
-        follow_redirects=False,
-    )
+    first = request_for("/provenance/membership-demo")
+    response = main.provenance_membership(n=24, seed="8", request=first)
     assert response.status_code == 303
     job_id = parse_qs(urlsplit(response.headers["location"]).query)["job"][0]
     assert started.wait(5)
-    first.close()  # browser/tab exits; no cancellation request is sent
+    del first  # the launching request/browser is gone; no cancellation was sent
 
-    reopened = TestClient(main.app)
-    reopened.cookies.set("aibd_session", cookie)
-    active = reopened.get("/jobs/active")
+    reopened = request_for("/jobs/active")
+    active = main.active_jobs(reopened)
     assert active.status_code == 200
-    listed = active.json()["jobs"]
+    listed = json.loads(active.body)["jobs"]
     assert any(job["id"] == job_id and job["status"] == "running" for job in listed)
 
     release.set()
     final = _wait_status(
-        lambda: reopened.get(f"/jobs/{job_id}/status").json(),
+        lambda: json.loads(main.task_status(reopened, job_id).body),
         terminal=("completed",),
     )
     assert final["done"] is True and final["ok"] is True
     result = main.task_service.result(job_id, requester="alice")
     assert result["membership"]["is_member"] is True
-    reopened.close()
 
 
 def test_cancelled_campaign_render_keeps_last_complete_artifact_set(

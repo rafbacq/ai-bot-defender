@@ -1,4 +1,4 @@
-# `querying/` — LLM querying pipeline
+# `querying/` — legacy querying pipeline + provenance layer
 
 ## Purpose
 
@@ -12,12 +12,13 @@ LangChain, printed to stdout, and persisted nothing). It is an importable
 package and runnable as a CLI.
 
 > **Status:** the web app's `/query` detection UI now runs on the vendored
-> **`auto_query/`** engine (see the root `CLAUDE.md`), driven by
-> `app/services/auto_query_adapter.py`. This package remains load-bearing for
-> the **provenance/membership layer** (Direction 6b), the **run store**
-> (`store.py` — auto_query runs persist through it, as a superset of the run
-> record described below) and the **ground-truth loaders** (`ground_truth.py`)
-> the adapter reuses, plus this CLI. Do not delete or repurpose those seams.
+> **`auto_query/`** engine (see `docs/ARCHITECTURE.md` at the repository root),
+> driven by `app/services/auto_query_adapter.py`. This package remains
+> load-bearing for the **provenance/membership layer** (Direction 6b), the
+> **run store** (`store.py` — auto_query runs persist through it, as a superset
+> of the run record described below) and the **ground-truth loaders**
+> (`ground_truth.py`) the adapter reuses, plus this CLI. Do not delete or
+> repurpose those seams.
 
 > Authorized testing only — run against systems, models, pages, and datasets you
 > are permitted to test.
@@ -94,8 +95,7 @@ The **extractor** is a separate role (`QUERY_EXTRACTOR_PROVIDER` = `mock` / `ope
 | `provenance.py` | Crawl-to-train latency / ingestion-window analyzer + CLI (`python -m querying.provenance`). |
 | `membership.py` | Min-K%/Min-K%++ membership inference: served vs. never-served watermark controls → p-value (backends: mock / hf / openai). |
 | `rag_disambiguation.py` | Training-memorization vs. live-retrieval experiment (browsing off/on + `all_visits` correlation) + CLI. |
-| `jeniffer.csv`, `21.csv`, `21.xlsx` | Bundled sample ground-truth datasets. |
-| `create_csv.py` | Regenerates `21.csv` from `21.xlsx` (import has a side effect — don't import it). |
+| `jeniffer.csv` | Bundled sample ground-truth dataset (the `--url` demo default). |
 
 ## Dependencies
 
