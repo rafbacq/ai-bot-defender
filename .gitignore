@@ -96,6 +96,7 @@ package-lock.json
 botdefenderjunethirty.txt
 EC2_DEPLOYMENT_NOTES.md
 CLAUDE.md
+AGENTS.md
 
 # Playwright MCP scratch output (screenshots, snapshots) — never project content.
 .playwright-mcp/
