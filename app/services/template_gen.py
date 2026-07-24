@@ -13,13 +13,17 @@ tokens, not town-shaped ones). It also dedups titles/content against a registry
 (a local JSONL by default; a central registry API when TEMPLATE_GEN_REGISTRY_URL
 is set) so two runs — or two institutions — never publish the same fake facts.
 
-The model path (Qwen3-1.7B + LoRA) needs torch / transformers / peft, which live in
-the template_generator's *own* Python environment — deliberately NOT baked into the
-app image (see CLAUDE.md: the ML stack is heavy and kept separate). So generation
-shells out to a configurable interpreter (``TEMPLATE_GEN_PYTHON``, default
-``python3``), mirroring how ``sites.py`` shells out to ``ansible-playbook`` /
-``docker compose``. When that interpreter lacks the ML stack the run fails with an
-actionable message instead of crashing the app.
+The model path (Qwen3-1.7B + LoRA) needs torch / transformers / peft. Those are
+baked into the app image, so generation runs as an in-container subprocess under a
+configurable interpreter (``TEMPLATE_GEN_PYTHON``, default ``python3``), mirroring
+how ``sites.py`` shells out to ``ansible-playbook`` / ``docker compose``. When that
+interpreter lacks the ML stack the run fails with an actionable message instead of
+crashing the app.
+
+Loading those weights costs 40-90s and peaks around 10-11 GiB, *per process* — so
+a process per template made every template re-pay the whole load. Runs therefore go
+through a **warm worker** that keeps the model resident between templates (see the
+"Warm model worker" section below); a one-shot subprocess remains the fallback.
 
 Install step: the ``.html`` goes to ``website/templates/scraper<N>.html`` and the
 varList both to ``website/varLists/scraper<N>.txt`` (so a standalone ``server.py``
@@ -386,29 +390,313 @@ def generate(type_id, timeout=None):
     return ok, output, installed
 
 
-def _build_cmd(type_id, out_dir):
-    """The ``generate_templates.py`` invocation shared by the blocking
-    (``generate``) and streaming (``start_generation``) run paths: category
-    selection plus the dedup-registry flags read from the environment.
+def _build_argv(type_id, out_dir):
+    """The generator arguments shared by every run path: category selection plus
+    the dedup-registry flags read from the environment.
 
-    ``-u`` keeps the child's stdout unbuffered so a timed-out or streamed run
-    yields its progress log line-by-line instead of in one final flush.
+    Kept separate from the interpreter/script prefix because the warm worker is
+    handed exactly this argv and parses it with ``generate_templates.py``'s own
+    parser — so a warm run and a one-shot run take provably identical options.
     """
-    cmd = [current_interpreter(), "-u", "generate_templates.py", "--out", str(out_dir)]
+    argv = ["--out", str(out_dir)]
     if type_id != ALL_TYPE_ID:
-        cmd += ["--category", type_id]
+        argv += ["--category", type_id]
     # Dedup registry: default is the generator's local JSONL
     # (template_generator/template_registry.jsonl). Point at the shared
     # cross-institution registry API by env, or skip checks entirely offline.
     if os.environ.get("TEMPLATE_GEN_REGISTRY_URL"):
-        cmd += ["--registry-url", os.environ["TEMPLATE_GEN_REGISTRY_URL"]]
+        argv += ["--registry-url", os.environ["TEMPLATE_GEN_REGISTRY_URL"]]
         if os.environ.get("TEMPLATE_GEN_REGISTRY_API_KEY"):
-            cmd += ["--registry-api-key", os.environ["TEMPLATE_GEN_REGISTRY_API_KEY"]]
+            argv += ["--registry-api-key", os.environ["TEMPLATE_GEN_REGISTRY_API_KEY"]]
     if os.environ.get("TEMPLATE_GEN_INSTITUTION_ID"):
-        cmd += ["--institution-id", os.environ["TEMPLATE_GEN_INSTITUTION_ID"]]
+        argv += ["--institution-id", os.environ["TEMPLATE_GEN_INSTITUTION_ID"]]
     if os.environ.get("TEMPLATE_GEN_SKIP_REGISTRY") == "1":
-        cmd += ["--skip-registry-check"]
-    return cmd
+        argv += ["--skip-registry-check"]
+    return argv
+
+
+def _build_cmd(type_id, out_dir):
+    """The one-shot invocation: interpreter + script + the shared arguments.
+
+    ``-u`` keeps the child's stdout unbuffered so a timed-out or streamed run
+    yields its progress log line-by-line instead of in one final flush.
+    """
+    return [current_interpreter(), "-u", "generate_templates.py"] + _build_argv(
+        type_id, out_dir)
+
+
+# --- Warm model worker -----------------------------------------------------
+# Loading Qwen3-1.7B + the LoRA adapter costs 40-90s on CPU and peaks around
+# 10-11 GiB of allocation, per *process* — so running one process per
+# template made every single template re-pay the whole load before writing a
+# word. The worker (template_generator/generation_worker.py) is the same
+# generator kept resident: it loads the weights on its first run and reuses them
+# for every run after it, so only the first template of a session waits.
+#
+# It is a plain child process spoken to over stdin/stdout — the same pipe a
+# one-shot run already streams — so the live progress bar, the log tail, the
+# cancel path and the watchdog below work identically either way. When the
+# worker cannot be used (no ML stack, missing script, a crash) the run silently
+# falls back to the original one-shot subprocess: warming can never be the
+# reason a generation fails.
+#
+# The weights are ~7 GiB resident, which is a lot to hold on a box that also
+# runs the honeypot stack, so an unused worker releases them after
+# TEMPLATE_GEN_WARM_TTL seconds (default 30 min; 0 = hold indefinitely).
+# TEMPLATE_GEN_WARM=0 disables warming; TEMPLATE_GEN_PRELOAD=1 loads the model
+# at app startup so even the session's first template skips the wait.
+_DONE_PREFIX = "@@GENDONE@@"          # the worker's terminal line per request
+_WORKER_SCRIPT = "generation_worker.py"
+_WORKER_LOCK = threading.RLock()      # guards the handle below
+_WORKER = {"proc": None, "idle_timer": None}
+# One request at a time, held for a whole run: two writers on the worker's stdin
+# would interleave, and each would read the other's terminal line as its own.
+# It is also what keeps the idle timer from retiring a worker a run just took.
+# Lock order everywhere: _WORKER_IO first, then _WORKER_LOCK.
+_WORKER_IO = threading.Lock()
+_HANDSHAKE_TIMEOUT = 120.0            # only bounds a wedged interpreter
+# A preload gets a shorter budget than a generation on purpose: a run that
+# starts during one *waits* for it (see _open_run_session), so this is also the
+# longest a user-triggered generation can sit behind a background preload.
+_PRELOAD_TIMEOUT = 600.0
+_DEFAULT_WARM_TTL = 1800.0
+_FALSEY = {"0", "false", "no", "off"}
+
+
+def _env_flag(name, default):
+    """Read a boolean knob. **Blank counts as unset**, not as false — the keys
+    ship in `.env.example` with empty values, and a copied-but-unedited file
+    must not silently turn warming off."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        raw = default
+    return raw.strip().lower() not in _FALSEY
+
+
+def warm_enabled():
+    """Whether runs may reuse a resident model (``TEMPLATE_GEN_WARM``)."""
+    return _env_flag("TEMPLATE_GEN_WARM", "1")
+
+
+def preload_enabled():
+    """Whether to load the model at app startup (``TEMPLATE_GEN_PRELOAD``).
+
+    Off by default: the weights are ~7 GiB resident, which is a lot to hold on a
+    machine that may never be asked to author a template. Turn it on when the
+    first generation's wait matters more than the idle memory.
+    """
+    return warm_enabled() and _env_flag("TEMPLATE_GEN_PRELOAD", "0")
+
+
+def warm_idle_ttl():
+    """Seconds an unused worker holds the weights before releasing the memory
+    (``TEMPLATE_GEN_WARM_TTL``; 0 or negative = hold them indefinitely)."""
+    raw = os.environ.get("TEMPLATE_GEN_WARM_TTL")
+    if raw is None or not raw.strip():
+        return _DEFAULT_WARM_TTL
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_WARM_TTL
+
+
+def _worker_script_path():
+    return config.TEMPLATE_GENERATOR_DIR / _WORKER_SCRIPT
+
+
+def _disarm_idle_timer():
+    timer = _WORKER["idle_timer"]
+    _WORKER["idle_timer"] = None
+    if timer is not None:
+        timer.cancel()
+
+
+def _arm_idle_timer():
+    ttl = warm_idle_ttl()
+    if ttl <= 0:
+        return
+    timer = threading.Timer(ttl, _idle_expired)
+    timer.daemon = True
+    _WORKER["idle_timer"] = timer
+    timer.start()
+
+
+def _idle_expired():
+    """The worker sat unused for a whole TTL — give the memory back.
+
+    Claiming _WORKER_IO (never waiting for it) is what makes this safe: a run
+    that starts while this timer is firing holds that lock, so the shutdown
+    stands down and the run re-arms the timer when it finishes. Merely *testing*
+    the lock would leave a window in which a run could claim the worker and then
+    be killed mid-generation by a timer that had already decided it was idle.
+    """
+    with _WORKER_LOCK:
+        _WORKER["idle_timer"] = None
+    if not _WORKER_IO.acquire(blocking=False):
+        return
+    try:
+        shutdown_worker()
+    finally:
+        _WORKER_IO.release()
+
+
+def _read_until_done(proc, timeout, collect=None):
+    """Read worker output up to its terminal ``@@GENDONE@@`` line.
+
+    Returns the parsed payload, or None when the worker died or hung first (a
+    worker that missed its deadline is killed — it can no longer be trusted to
+    be idle). ``collect`` receives every ordinary output line.
+    """
+    killer = threading.Timer(timeout, lambda: _terminate_generation(proc))
+    killer.daemon = True
+    killer.start()
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            if line.startswith(_DONE_PREFIX):
+                try:
+                    payload = json.loads(line[len(_DONE_PREFIX):])
+                except ValueError:
+                    return None
+                return payload if isinstance(payload, dict) else None
+            if collect is not None:
+                collect(line)
+        return None                       # EOF: the worker exited mid-request
+    finally:
+        killer.cancel()
+
+
+def _worker_request(proc, request, timeout):
+    """Send one short control request (ping / load) and wait for its result."""
+    try:
+        proc.stdin.write(json.dumps(request) + "\n")
+        proc.stdin.flush()
+    except (OSError, ValueError) as exc:
+        return None, f"could not reach the worker: {exc}"
+    log = []
+    payload = _read_until_done(proc, timeout, collect=log.append)
+    if payload is None:
+        return None, "\n".join(log[-20:]).strip() or "the worker stopped without answering"
+    return payload, str(payload.get("error") or "")
+
+
+def _spawn_worker():
+    """Start a worker and confirm it answers. Returns ``(proc, "")`` or
+    ``(None, reason)`` — the reason is logged on the run that fell back."""
+    script = _worker_script_path()
+    if not script.exists():
+        return None, f"{_WORKER_SCRIPT} not found at {script}"
+    env = {**os.environ, "TEMPLATE_GEN_PROGRESS": "1", "PYTHONUNBUFFERED": "1"}
+    try:
+        proc = subprocess.Popen(
+            [current_interpreter(), "-u", _WORKER_SCRIPT],
+            cwd=str(config.TEMPLATE_GENERATOR_DIR), env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        return None, f"could not start '{current_interpreter()}': {exc}"
+    payload, detail = _worker_request(proc, {"cmd": "ping"}, _HANDSHAKE_TIMEOUT)
+    if not (payload and payload.get("ok")):
+        _terminate_generation(proc)
+        return None, detail or "the worker did not answer its handshake"
+    return proc, ""
+
+
+def _ensure_worker():
+    """The live worker, starting one if needed. ``(proc, "")`` or ``(None, why)``."""
+    with _WORKER_LOCK:
+        _disarm_idle_timer()
+        proc = _WORKER["proc"]
+        if proc is not None and proc.poll() is None:
+            return proc, ""
+        _WORKER["proc"] = None
+        proc, why = _spawn_worker()
+        _WORKER["proc"] = proc
+        return proc, why
+
+
+def _forget_worker(proc):
+    """Drop a worker that can no longer be trusted (crashed, killed, wedged)."""
+    with _WORKER_LOCK:
+        if _WORKER["proc"] is proc:
+            _disarm_idle_timer()
+            _WORKER["proc"] = None
+    _terminate_generation(proc)
+
+
+def shutdown_worker():
+    """Stop the warm worker and release the model's memory. True if one ran.
+
+    This is unconditional — it stops the worker even if a generation is using
+    it, which is what the app's shutdown hook wants. Callers that must not
+    disturb a run (the idle timer) hold ``_WORKER_IO`` first.
+    """
+    with _WORKER_LOCK:
+        _disarm_idle_timer()
+        proc = _WORKER["proc"]
+        _WORKER["proc"] = None
+    if proc is None or proc.poll() is not None:
+        return False
+    try:
+        proc.stdin.write(json.dumps({"cmd": "shutdown"}) + "\n")
+        proc.stdin.flush()
+    except (OSError, ValueError):
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        _terminate_generation(proc)
+    return True
+
+
+def preload_worker():
+    """Load the model into the warm worker now, so even the first generation of
+    the session skips the load.
+
+    Called from the app's startup hook when ``TEMPLATE_GEN_PRELOAD`` is set.
+    Never raises and never blocks a generation: if a run already holds the
+    worker there is nothing to preload, and any failure just leaves generation
+    on its normal (cold) path.
+    """
+    if not warm_enabled():
+        return False, "warm model reuse is disabled (TEMPLATE_GEN_WARM=0)"
+    if not _WORKER_IO.acquire(blocking=False):
+        return False, "the generator is already running"
+    try:
+        proc, why = _ensure_worker()
+        if proc is None:
+            return False, why
+        # argv=[] is the parser's defaults — the same model/adapter/dtype every
+        # generation asks for, so the run that follows finds the bundle warm.
+        payload, detail = _worker_request(
+            proc, {"cmd": "load", "argv": []}, _PRELOAD_TIMEOUT)
+        if not (payload and payload.get("ok")):
+            _forget_worker(proc)
+            return False, detail or "the model could not be loaded"
+        with _WORKER_LOCK:
+            if _WORKER["proc"] is proc:
+                _arm_idle_timer()
+        return True, "model loaded and resident"
+    except Exception as exc:              # a preload must never break startup
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        _WORKER_IO.release()
+
+
+def warm_status():
+    """Whether a model is currently held in memory (for status/diagnostics)."""
+    with _WORKER_LOCK:
+        proc = _WORKER["proc"]
+        alive = proc is not None and proc.poll() is None
+        return {
+            "enabled": warm_enabled(),
+            "loaded": alive,
+            "pid": proc.pid if alive else None,
+            "busy": _WORKER_IO.locked(),
+            "idle_ttl": warm_idle_ttl(),
+        }
 
 
 def _ml_stack_hint(output):
@@ -798,30 +1086,143 @@ def _run_generation_job(job_id, type_id, gen_dir, timeout):
                     + traceback.format_exc(), [])
 
 
-def _stream_generation_job(job_id, type_id, gen_dir, timeout):
-    """Stream the generator subprocess, drive live progress, and install output."""
-    out_dir = Path(tempfile.mkdtemp(prefix="tplgen_"))
-    cmd = _build_cmd(type_id, out_dir)
+class _RunSession:
+    """One generator run, seen as a stream of the generator's stdout lines.
+
+    Either a request to the warm worker (``warm``) or a one-shot subprocess —
+    the streaming loop, progress parser, watchdog and cancel path below are
+    identical for both, because both are just that pipe.
+    """
+
+    def __init__(self, proc, warm, notes=(), holds_io=False):
+        self.proc = proc
+        self.warm = warm
+        self.notes = list(notes)      # shown at the top of this run's log
+        self.holds_io = holds_io      # this session owns _WORKER_IO
+        self.done = None              # the warm worker's terminal payload
+
+    def lines(self):
+        """Yield the run's output lines, ending when the run does."""
+        for raw in self.proc.stdout:
+            line = raw.rstrip("\n")
+            if self.warm and line.startswith(_DONE_PREFIX):
+                try:
+                    self.done = json.loads(line[len(_DONE_PREFIX):])
+                except ValueError:
+                    self.done = {"ok": False, "error": "unreadable worker result"}
+                return
+            yield line
+        if not self.warm:
+            self.proc.wait()
+
+    def succeeded(self):
+        if self.warm:
+            return bool(self.done and self.done.get("ok"))
+        return self.proc.returncode == 0
+
+    def failure_note(self):
+        """Why a warm run failed, when the reason isn't already in the log."""
+        if not self.warm:
+            return ""
+        if self.done is None:
+            return ("[warm] the resident model worker stopped before this run "
+                    "finished; the next run starts a fresh one.")
+        error = str(self.done.get("error") or "").strip()
+        return f"[warm] {error}" if error else ""
+
+
+def _open_run_session(type_id, gen_dir, out_dir):
+    """Start this run on the warm worker, falling back to a one-shot process.
+
+    Returns ``(session, None)``, or ``(None, message)`` when neither path could
+    be started (the message is what the failed job shows).
+    """
+    argv = _build_argv(type_id, out_dir)
+    notes = []
+
+    if warm_enabled():
+        handed_off = False
+        # Waiting here is deliberate. The only other holder is a startup preload
+        # (bounded by _PRELOAD_TIMEOUT), and waiting for it means this run finds
+        # the model already loaded. Falling back instead would start a *second*
+        # ~11 GiB load beside the one in flight — enough to OOM the box.
+        _WORKER_IO.acquire()
+        try:
+            proc, why = _ensure_worker()
+            if proc is not None:
+                try:
+                    proc.stdin.write(json.dumps({"cmd": "generate", "argv": argv}) + "\n")
+                    proc.stdin.flush()
+                    handed_off = True
+                    return _RunSession(proc, True, holds_io=True), None
+                except (OSError, ValueError) as exc:
+                    _forget_worker(proc)
+                    why = f"could not send the run to the worker: {exc}"
+            notes.append(f"[warm] resident model unavailable ({why}); running a "
+                         "one-shot generator for this template instead.")
+        finally:
+            if not handed_off:
+                _WORKER_IO.release()
+
     # Ask the generator to emit @@GENPROGRESS@@ milestone lines and keep its
     # stdout unbuffered so they arrive live rather than in one final flush.
     env = {**os.environ, "TEMPLATE_GEN_PROGRESS": "1", "PYTHONUNBUFFERED": "1"}
-    _update_job(job_id, stage="loading", label="Launching the generator…", percent=1)
-
     try:
         proc = subprocess.Popen(
-            cmd, cwd=str(gen_dir), env=env,
+            _build_cmd(type_id, out_dir), cwd=str(gen_dir), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, start_new_session=True,
         )
     except FileNotFoundError:
-        shutil.rmtree(out_dir, ignore_errors=True)
-        _finish_job(job_id, False, (
+        return None, (
             f"Python interpreter '{current_interpreter()}' not found. Template "
             "generation needs the template_generator environment (torch + "
             "transformers + peft). Set the TEMPLATE_GEN_PYTHON env var to a Python "
             "that has those installed — see template_generator/README.md."
-        ), [])
+        )
+    return _RunSession(proc, False, notes), None
+
+
+def _release_session(session):
+    """Hand the run's process back.
+
+    A one-shot child has already exited. The warm worker keeps its weights and
+    starts the idle countdown — unless this run ended it (cancel, timeout, or a
+    crash), in which case it is dropped and the next run starts a fresh one.
+    """
+    try:
+        if session.warm:
+            if session.done is None or session.proc.poll() is not None:
+                _forget_worker(session.proc)
+            else:
+                with _WORKER_LOCK:
+                    if _WORKER["proc"] is session.proc:
+                        _arm_idle_timer()
+    finally:
+        if session.holds_io:
+            session.holds_io = False
+            _WORKER_IO.release()
+
+
+def _stream_generation_job(job_id, type_id, gen_dir, timeout):
+    """Stream the generator run, drive live progress, and install its output."""
+    out_dir = Path(tempfile.mkdtemp(prefix="tplgen_"))
+    _update_job(job_id, stage="loading", label="Launching the generator…", percent=1)
+
+    session, failure = _open_run_session(type_id, gen_dir, out_dir)
+    if session is None:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        _finish_job(job_id, False, failure, [])
         return
+    try:
+        _drive_generation_job(job_id, session, out_dir, timeout)
+    finally:
+        _release_session(session)
+
+
+def _drive_generation_job(job_id, session, out_dir, timeout):
+    """Consume one open run: live progress, cancellation, install, finalize."""
+    proc = session.proc
 
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
@@ -850,11 +1251,10 @@ def _stream_generation_job(job_id, type_id, gen_dir, timeout):
     watchdog = threading.Timer(timeout, _kill)
     watchdog.start()
 
-    lines = []
+    lines = list(session.notes)
     last_push = 0.0
     try:
-        for raw in proc.stdout:
-            line = raw.rstrip("\n")
+        for line in session.lines():
             now = time.time()
             if line.startswith(_PROGRESS_PREFIX):
                 fields = _parse_progress_line(line)
@@ -869,17 +1269,23 @@ def _stream_generation_job(job_id, type_id, gen_dir, timeout):
             if now - last_push > 0.4:
                 _update_job(job_id, output="\n".join(lines[-_MAX_LOG_LINES:]))
                 last_push = now
-        proc.wait()
     finally:
         watchdog.cancel()
 
-    output = "\n".join(lines)
-    ok = proc.returncode == 0 and not timed_out["hit"]
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
         cancelled = bool(job and job["_cancel_event"].is_set())
         if job is not None:
             job["_process"] = None
+
+    ok = session.succeeded() and not timed_out["hit"]
+    # A cancel or a timeout killed the worker on purpose; only explain a warm
+    # run that failed on its own (the two branches below say the rest).
+    if not ok and not cancelled and not timed_out["hit"]:
+        note = session.failure_note()
+        if note:
+            lines.append(note)
+    output = "\n".join(lines)
 
     if cancelled:
         shutil.rmtree(out_dir, ignore_errors=True)

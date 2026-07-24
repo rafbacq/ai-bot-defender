@@ -206,7 +206,7 @@
                             <p style="margin:.2rem 0"><strong>Declared:</strong> {{ c.declared_providers|join(', ') or '—' }}
                                {% if c.gnn_provider %} · <strong>GNN:</strong> {{ c.gnn_provider }}{% endif %}</p>
                             <p style="margin:.2rem 0"><strong>Sites:</strong> {{ c.sites|join(', ') or '—' }}</p>
-                            {% if c.ja4 %}<p class="mono" style="margin:.2rem 0;word-break:break-all"><strong>JA4:</strong> {{ c.ja4|join(', ') }}</p>{% endif %}
+                            {% if c.ja4 %}<p class="mono" style="margin:.2rem 0;word-break:break-all"><strong>JA4:</strong> {% for j in c.ja4 %}<button type="button" class="sig-chip mono" data-sig="ja4" data-sig-value="{{ j }}" aria-haspopup="dialog" aria-label="Explain this JA4 TLS fingerprint">{{ j }}</button>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
                             <p style="margin:.2rem 0"><strong>Top UAs:</strong></p>
                             <pre class="codeblock" style="max-height:160px">{% for ua in c.top_user_agents %}{{ ua }}
 {% endfor %}</pre>

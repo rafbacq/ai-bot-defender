@@ -1,0 +1,10 @@
+fake.first_name() + ' ' + fake.last_name()
+fake.last_name()
+fake.word().capitalize()
+fake.last_name()
+fake.word().capitalize()
+fake.city()
+'The ' + fake.word().capitalize() + ' Text'
+fake.last_name() + ' Sanctuary'
+'Order of the ' + fake.word().capitalize()
+fake.last_name() + ' Monastery'

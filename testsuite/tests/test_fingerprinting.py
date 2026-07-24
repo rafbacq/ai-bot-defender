@@ -270,6 +270,15 @@ def test_tcp_shipper_keeps_unrecognized_ttl64_shapes_unknown(repo_root):
     assert shipper.infer_os(64, 65535, 6, 1460) == "Apple"
     assert shipper.infer_os(63, 29200, 7, 1460) == "Linux"
 
+    # With the SYN option order captured, a recognized order resolves the bucket
+    # even for windows the legacy heuristic never listed; an unrecognized order
+    # (or none at all) stays "unknown" so no false OS-spoof accusation is minted.
+    assert shipper.infer_os(64, 62727, 7, 1460, [2, 4, 8, 1, 3]) == "Linux"
+    assert shipper.infer_os(64, 65535, 6, 1432, [2, 1, 3, 1, 1, 8, 4]) == "Apple"
+    assert shipper.infer_os(64, 65535, 7, 1460, [2, 1, 3, 4, 8]) == "unknown"
+    assert shipper.infer_os(64, 62727, 7, 1460, None) == "unknown"
+    assert shipper.infer_os(64, 40000, 9, 1460, []) == "unknown"  # empty options match nothing
+
 
 # --- The fingerprint viewer's per-row verdict (reuses the same engine) ------
 def test_fingerprint_service_verdict_matches_the_engine_for_a_public_row():

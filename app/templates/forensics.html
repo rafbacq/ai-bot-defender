@@ -38,8 +38,6 @@
 {% endmacro %}
 <div class="page-head">
     <h1>LLM Forensics</h1>
-    <p>Probe target models for your honeypot’s canary tokens — detect leaks, date when each model
-       ingested the page, and prove membership statistically without regurgitation.</p>
 </div>
 
 {% if prov_error %}
@@ -264,8 +262,6 @@
     <div class="manual-workflow__head">
         <div>
             <h2 class="section-title">Manual evaluation</h2>
-            <p>Evaluate chatbots that cannot be queried through an API. Generate one retrieval prompt,
-               run it in each chatbot, then paste the answers here for the same forensic analysis.</p>
         </div>
         <span class="badge badge--neutral">No API required</span>
     </div>
@@ -298,7 +294,6 @@
         <div class="manual-target__copy">
             <span class="manual-target__eyebrow">Evaluation target</span>
             <strong>Use one honeypot for scraping and analysis</strong>
-            <span>The prompt and every pasted answer stay tied to this selection.</span>
         </div>
         <form method="post" action="/query/prompt" class="manual-target__form" id="manual-prompt-form">
             <input type="hidden" name="mode" value="local">

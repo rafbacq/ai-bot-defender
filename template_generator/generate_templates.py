@@ -3759,7 +3759,42 @@ def _emit_progress(percent, stage, label, **extra):
     print(_PROGRESS_PREFIX + json.dumps(payload), flush=True)
 
 
-def run_generate(args):
+# ---------------------------------------------------------------------------
+# Warm model bundle.
+#
+# Loading Qwen3-1.7B + the LoRA adapter costs 40-90s on CPU and peaks around
+# 10-11 GiB of allocation -- once per *process*. The CLI pays that once and exits, but the
+# web app used to spawn a fresh process per template, so every single template
+# re-paid it. Keeping the load in its own function lets a long-lived worker
+# (generation_worker.py, driven by app/services/template_gen.py) load the
+# weights once and reuse them for every later request.
+#
+# run_generate(args) with no bundle loads exactly as before, so the CLI path is
+# byte-for-byte unchanged.
+# ---------------------------------------------------------------------------
+class ModelBundle:
+    """A loaded tokenizer + model, reusable across generation runs."""
+
+    def __init__(self, model, tok, device, prefix, key):
+        self.model = model
+        self.tok = tok
+        self.device = device
+        self.prefix = prefix          # few-shot preamble (empty when using LoRA)
+        self.key = key                # what it was loaded from; see bundle_key()
+        self.runs = 0                 # generations served so far (0 = just loaded)
+
+
+def bundle_key(args) -> tuple:
+    """The arguments a loaded bundle depends on.
+
+    A request whose key differs needs a fresh load; everything else (category,
+    output dir, sampling knobs, registry flags) reuses the resident weights.
+    """
+    return (str(args.model), str(args.adapter), bool(args.base_only), str(args.dtype))
+
+
+def load_model_bundle(args) -> ModelBundle:
+    """Load the tokenizer, base model and LoRA adapter onto the best device."""
     _emit_progress(2, "loading", "Loading the model…")
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -3796,6 +3831,26 @@ def run_generate(args):
     _emit_progress(12, "loading", "Model ready.")
 
     prefix = "" if use_adapter else few_shot_prefix()
+    return ModelBundle(model, tok, device, prefix, bundle_key(args))
+
+
+def run_generate(args, bundle=None):
+    """Generate one template per selected category.
+
+    ``bundle`` is an already-loaded :class:`ModelBundle` (the warm-worker path);
+    when it is None the weights are loaded here, exactly as the CLI always did.
+    """
+    if bundle is None:
+        bundle = load_model_bundle(args)
+    elif bundle.runs:
+        # Only a bundle that already served a run is a genuine reuse. The worker
+        # hands over the bundle it just loaded too, and claiming "no reload"
+        # right after a minute-long load would be a lie in the run's own log.
+        print(f"device={bundle.device} | model already resident (no reload)", flush=True)
+        _emit_progress(12, "loading", "Model already loaded — reusing the weights.")
+    bundle.runs += 1
+    model, tok, device, prefix = bundle.model, bundle.tok, bundle.device, bundle.prefix
+
     args.out.mkdir(parents=True, exist_ok=True)
 
     if args.category:
@@ -3976,7 +4031,13 @@ def run_generate(args):
                    written=written)
 
 
-def main():
+def build_parser():
+    """The CLI parser.
+
+    Exposed separately so the warm worker (generation_worker.py) parses a
+    request's argv with *this* parser -- a warm run and a one-shot CLI run then
+    take provably identical arguments and defaults.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
@@ -4023,14 +4084,21 @@ def main():
     ap.add_argument("--register-only", action="store_true",
                     help="register existing raw_*.txt in --out without regenerating "
                          "(migration helper; no model needed)")
-    args = ap.parse_args()
+    return ap
 
+
+def dispatch(args, bundle=None):
+    """Run the action ``args`` selects — shared by the CLI and the warm worker."""
     if args.register_only:
         run_register_only(args)
     elif args.reprocess:
         run_reprocess(args)
     else:
-        run_generate(args)
+        run_generate(args, bundle=bundle)
+
+
+def main():
+    dispatch(build_parser().parse_args())
 
 
 if __name__ == "__main__":

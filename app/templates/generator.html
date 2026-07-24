@@ -4,9 +4,6 @@
 {% block content %}
 <div class="page-head">
     <h1>Template Generator</h1>
-    <p>Author a new honeypot page with the fine-tuned model, or hand-edit the text of an
-       existing one. Each template lives in <span class="mono">website/templates/</span> as a
-       <span class="mono">scraper&lt;N&gt;.html</span> flavor — ready to pick when you deploy a site.</p>
 </div>
 
 {% if cancelled %}
@@ -118,21 +115,6 @@
                 {% endfor %}
             </select>
             <p id="type-desc" class="field-hint mt-1"></p>
-        </div>
-        <div class="sm:col-span-2 muted" style="font-size:0.85rem">
-            One template per category per run. Each page ships with its own
-            category-typed varList (10 Faker canary expressions), applied as a
-            per-site <span class="mono">canary_tokens</span> override when you deploy it.
-            Titles and content are checked against the dedup registry so repeat runs
-            never produce the same fake facts.
-        </div>
-        <div class="sm:col-span-2 muted" style="font-size:0.85rem">
-            Generation runs the fine-tuned model (Qwen3-1.7B + LoRA) and can take a few
-            minutes ("All categories" much longer). It needs the
-            <span class="mono">template_generator</span> Python
-            environment (torch + transformers + peft); the app runs it with
-            <span class="mono">{{ interpreter }}</span>
-            (override via the <span class="mono">TEMPLATE_GEN_PYTHON</span> env var).
         </div>
         <div class="sm:col-span-2">
             <button type="submit" class="btn btn--primary">Generate &amp; store</button>

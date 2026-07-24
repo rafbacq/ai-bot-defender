@@ -142,6 +142,136 @@ time.sleep(60)
     assert not list(paths["templates"].glob("scraper*.html"))
 
 
+# A torch-free generator whose "generation" blocks, exposing the warm worker to
+# a cancel mid-run. Usable both as the worker's module and as a one-shot script.
+SLOW_WARM_GENERATOR = '''\
+import argparse, json, time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+# "quick" returns immediately; every other category blocks, so a run can be
+# caught mid-generation and cancelled.
+CATEGORIES = {"towns": {"subject": "town"}, "quick": {"subject": "quick page"}}
+
+
+class ModelBundle:
+    def __init__(self, key):
+        self.key = key
+
+
+def bundle_key(args):
+    return (str(args.model), str(args.adapter), bool(args.base_only), str(args.dtype))
+
+
+def load_model_bundle(args):
+    return ModelBundle(bundle_key(args))
+
+
+def build_parser():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="m")
+    ap.add_argument("--adapter", type=Path, default=HERE / "adapter")
+    ap.add_argument("--base-only", action="store_true")
+    ap.add_argument("--reprocess", action="store_true")
+    ap.add_argument("--register-only", action="store_true")
+    ap.add_argument("--dtype", default="auto")
+    ap.add_argument("--out", type=Path, default=HERE / "out")
+    ap.add_argument("--category", default=None)
+    ap.add_argument("--institution-id", default="local")
+    ap.add_argument("--registry", type=Path, default=HERE / "registry.jsonl")
+    ap.add_argument("--registry-url", default=None)
+    ap.add_argument("--registry-api-key", default=None)
+    ap.add_argument("--skip-registry-check", action="store_true")
+    return ap
+
+
+def run_generate(args, bundle=None):
+    if bundle is None:
+        bundle = load_model_bundle(args)
+    print("@@GENPROGRESS@@" + json.dumps(
+        {"percent": 20, "stage": "generating", "label": "drafting"}), flush=True)
+    if (args.category or "") == "quick":
+        args.out.mkdir(parents=True, exist_ok=True)
+        (args.out / "scraper_gen_quick.html").write_text(
+            "<html><head></head><body>{{ var1 }}</body></html>", encoding="utf-8")
+        (args.out / "scraper_gen_quick.txt").write_text(
+            "\\n".join(["fake.city()"] * 10) + "\\n", encoding="utf-8")
+        return
+    time.sleep(60)
+
+
+def dispatch(args, bundle=None):
+    run_generate(args, bundle=bundle)
+
+
+def main():
+    dispatch(build_parser().parse_args())
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def test_template_generation_cancel_stops_the_warm_worker_and_recovers(
+    isolated_app_config, monkeypatch,
+):
+    """Cancelling a run served by the resident model must stop it exactly like a
+    one-shot run — and the next generation must still work.
+
+    Cancel kills the worker (the only way to interrupt a model mid-generation),
+    so the weights go with it; the service must notice the dead worker and start
+    a fresh one rather than wedging every later run.
+    """
+    import shutil
+    from pathlib import Path
+
+    from app.services import template_gen
+
+    paths = isolated_app_config
+    shutil.copyfile(
+        Path(__file__).resolve().parents[2] / "template_generator" / "generation_worker.py",
+        paths["generator"] / "generation_worker.py",
+    )
+    (paths["generator"] / "generate_templates.py").write_text(
+        SLOW_WARM_GENERATOR, encoding="utf-8")
+    monkeypatch.setenv("TEMPLATE_GEN_PYTHON", sys.executable)
+    monkeypatch.setenv("TEMPLATE_GEN_WARM", "1")
+    monkeypatch.setenv("TEMPLATE_GEN_WARM_TTL", "30")
+
+    try:
+        job_id = template_gen.start_generation("towns", owner="alice")
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if template_gen.generation_status(job_id)["percent"] >= 20:
+                break
+            time.sleep(0.02)
+        assert template_gen.warm_status()["loaded"] is True
+
+        with pytest.raises(template_gen.GenerationForbidden):
+            template_gen.cancel_generation(job_id, requester="bob")
+        template_gen.cancel_generation(job_id, requester="alice")
+
+        final = _wait_status(lambda: template_gen.generation_status(job_id))
+        assert final["done"] is True and final["status"] == "cancelled"
+        assert final["installed"] == []
+        assert not list(paths["templates"].glob("scraper*.html"))
+        # The killed worker is dropped, not left behind as a wedged handle.
+        assert template_gen.warm_status()["loaded"] is False
+        assert template_gen.warm_status()["busy"] is False
+
+        # A cancel must not poison the generator: the next run starts a fresh
+        # worker and completes normally.
+        next_id = template_gen.start_generation("quick", owner="alice")
+        after = _wait_status(
+            lambda: template_gen.generation_status(next_id), terminal=("ok", "failed"),
+        )
+        assert after["status"] == "ok", after["output"]
+        assert [i["filename"] for i in after["installed"]] == ["scraper1.html"]
+    finally:
+        template_gen.shutdown_worker()
+
+
 def test_detection_run_cooperatively_cancels_and_rejects_other_owner(monkeypatch):
     pytest.importorskip("fastapi")
     from app.services import auto_query_adapter, run_manager

@@ -1,0 +1,329 @@
+{# Signature explainer dialog — shared across the request Detail panel, the
+   Disguised-devices panel, and Campaign Intelligence. A single native <dialog>
+   per page; clicking any [data-sig] chip opens it with the REAL captured stats for
+   that signature (values, device attributes, parsed fields, derived flags) up top,
+   then a short plain-language explanation. Delegated on `document` so it survives
+   the AJAX tbody swap. All injected text goes through textContent — values are
+   attacker-influenced. #}
+<dialog class="sig-dialog" id="sig-dialog" aria-labelledby="sig-dialog-title" data-type="">
+  <form method="dialog" class="sig-dialog__surface">
+    <div class="sig-dialog__head">
+      <div>
+        <span class="sig-dialog__eyebrow" id="sig-dialog-kicker"></span>
+        <h3 id="sig-dialog-title"></h3>
+        <p class="sig-dialog__tagline" id="sig-dialog-tagline"></p>
+      </div>
+      <button class="sig-dialog__close" value="cancel" aria-label="Close signature explainer">×</button>
+    </div>
+    <div class="sig-dialog__body">
+      <div class="sig-dialog__valuerow">
+        <code class="sig-dialog__value mono" id="sig-dialog-value"></code>
+        <button type="button" class="btn btn--ghost btn--sm" id="sig-dialog-copy" aria-live="polite">Copy</button>
+      </div>
+      {# Captured facts — the real stats, rendered prominently right under the value. #}
+      <div id="sig-dialog-facts"></div>
+      <section class="sig-dialog__sec"><h4>What is this?</h4><p id="sig-dialog-what"></p></section>
+      <section class="sig-dialog__sec"><h4>How it was captured</h4><p id="sig-dialog-how"></p></section>
+      <section class="sig-dialog__sec"><h4>How to read it</h4><p id="sig-dialog-read"></p></section>
+    </div>
+  </form>
+</dialog>
+
+<script>
+(function () {
+  var dlg = document.getElementById('sig-dialog');
+  if (!dlg) return;
+
+  var INFO = {
+    canvas: {
+      kicker: 'Browser fingerprint', title: 'Canvas fingerprint',
+      tagline: 'How this device draws a fixed image, boiled down to one hash.',
+      what: 'A hash of how the browser renders one fixed scene — text, an emoji, and a gradient — onto an off-screen canvas. The exact pixels depend on the GPU, graphics driver, and font rasterizer, so it is stable for one machine but differs across machines.',
+      how: 'fp.js draws the scene, reads the pixels back with toDataURL(), and hashes them — silently, in about a millisecond.',
+      read: 'A comparison key, not a readable value. The SAME canvas hash under several IPs or User-Agents is strong evidence of one physical device.'
+    },
+    audio: {
+      kicker: 'Browser fingerprint', title: 'Audio fingerprint',
+      tagline: 'How this device’s audio stack renders a synthetic tone.',
+      what: 'A hash of how the device processes a generated sound. Tiny floating-point differences between audio implementations (OS + hardware + browser build) make it device-characteristic.',
+      how: 'fp.js synthesizes a tone through an OfflineAudioContext (oscillator → dynamics compressor), reads back the output samples, and hashes them. No sound is played.',
+      read: 'A matching audio hash points to the same audio stack — the same device/OS/browser combination.'
+    },
+    font: {
+      kicker: 'Browser fingerprint', title: 'Font fingerprint',
+      tagline: 'Which fonts are installed, distilled to one hash.',
+      what: 'A hash of the set of fonts available on the device — the OS defaults plus anything applications installed, which is fairly characteristic of a machine and its owner.',
+      how: 'fp.js measures the pixel size of test strings in ~41 candidate fonts against three generic families; a measurable difference means that font is present.',
+      read: 'A matching font hash suggests the same OS and installed software. The exact detected fonts are listed above.'
+    },
+    webgl: {
+      kicker: 'Browser fingerprint', title: 'WebGL / GPU fingerprint',
+      tagline: 'The graphics chip and driver the browser exposes.',
+      what: 'The GPU identity and capabilities reported through WebGL: the unmasked vendor and renderer strings, 16 GL parameters, and the supported-extension list.',
+      how: 'fp.js queries the WebGL context for those values and hashes them; the readable vendor/renderer strings are kept alongside.',
+      read: 'The renderer string is revealing. A SOFTWARE renderer (SwiftShader, llvmpipe) on an ordinary desktop User-Agent is a strong virtual-machine / headless / automation tell — flagged above when detected.'
+    },
+    fp_id: {
+      kicker: 'Device identity', title: 'Device fingerprint (fp_id)',
+      tagline: 'The one ID that ties every surface to a single physical device.',
+      what: 'The composite device identifier. It folds the canvas, WebGL, audio, and font hashes together with the device attributes listed above into a single value.',
+      how: 'fp.js computes it in the browser and writes it to the __abd_fp cookie, so the honeypot can serve the same device the SAME canary tokens even after it rotates its User-Agent, IP, or ASN.',
+      read: 'The same fp_id under two or more different identities is the disguise signal — one machine posing as several visitors. Such rows are tinted red in the table.'
+    },
+    ja4t: {
+      kicker: 'Network fingerprint', title: 'JA4T — TCP/IP stack fingerprint',
+      tagline: 'The OS kernel’s signature, read from the first packet of the connection.',
+      what: 'A fingerprint of the client operating system’s TCP/IP stack, taken from the very first packet (the TCP SYN). It encodes the advertised window size, the ordered list of TCP option kinds, the MSS, and the window scale — all set by the OS kernel.',
+      how: 'Captured passively by a network sensor before TLS is terminated. Because these kernel values survive proxies and VPNs (which only rewrite the IP), the stack betrays the real OS.',
+      read: 'The option ORDER is the tell: 2-4-8-1-3 is a Linux/Android kernel; 2-1-3-1-1-8-4 is Apple. If the JA4T says Linux but the User-Agent claims an iPhone, the OS is spoofed.'
+    },
+    ja4: {
+      kicker: 'Network fingerprint', title: 'JA4 — TLS handshake fingerprint',
+      tagline: 'The client’s TLS library identity, decoded from the ClientHello.',
+      what: 'A fingerprint of the TLS ClientHello. Its structured prefix (decoded above) summarizes the transport, TLS version, SNI, and cipher/extension counts; two truncated hashes cover the exact cipher and extension lists.',
+      how: 'Captured passively from the raw ClientHello before nginx terminates TLS, so it reflects the real client software, not the proxy.',
+      read: 'It identifies the client library or browser build. A JA4 that resolves to a scripting library behind a Chrome User-Agent is a mismatch worth investigating.'
+    },
+    ja3: {
+      kicker: 'Network fingerprint', title: 'JA3 — legacy TLS fingerprint',
+      tagline: 'The older MD5-based TLS ClientHello hash.',
+      what: 'The predecessor to JA4: an MD5 hash of selected ClientHello fields. Coarser and more brittle, but still useful for cross-referencing older threat-intelligence datasets.',
+      how: 'Computed from the same passively-captured ClientHello as JA4.',
+      read: 'Compare against known JA3 datasets. Because it is order-sensitive and unsalted, unrelated clients can occasionally collide — treat JA4 as the stronger signal.'
+    }
+  };
+
+  var OPT_NAMES = { '0': 'End of Options', '1': 'No-Op (padding)', '2': 'Max Segment Size',
+    '3': 'Window Scale', '4': 'SACK Permitted', '5': 'SACK', '8': 'Timestamps', '34': 'TCP Fast Open' };
+  var OS_BY_ORDER = { '2-4-8-1-3': 'Linux / Android', '2-1-3-1-1-8-4': 'Apple (macOS / iOS)' };
+  var TLS_VER = { '13': '1.3', '12': '1.2', '11': '1.1', '10': '1.0', '00': 'SSL 3.0' };
+  // Software / virtual GPU renderers — a VM / headless / automation tell.
+  var SW_RENDERER = ['swiftshader', 'llvmpipe', 'softpipe', 'microsoft basic render',
+    'mesa offscreen', 'google swiftshader', ' software'];
+
+  function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+
+  // Build a two-column facts table from [label, value, {mono?, warn?}] rows.
+  function factsTable(rows) {
+    var tbl = document.createElement('table');
+    tbl.className = 'sig-dialog__parsed';
+    var body = document.createElement('tbody');
+    rows.forEach(function (r) {
+      if (r[1] == null || r[1] === '') return;
+      var tr = document.createElement('tr');
+      var th = document.createElement('th'); th.textContent = r[0];
+      var td = document.createElement('td');
+      var opt = r[2] || {};
+      if (opt.mono !== false) td.className = 'mono';
+      if (opt.warn) td.classList.add('sig-dialog__warn');
+      td.textContent = r[1];
+      tr.appendChild(th); tr.appendChild(td); body.appendChild(tr);
+    });
+    tbl.appendChild(body);
+    return tbl.querySelector('tr') ? tbl : null;
+  }
+
+  function heading(text) {
+    var h = document.createElement('div'); h.className = 'sig-dialog__facts-h'; h.textContent = text; return h;
+  }
+
+  function parseJa4t(v) {
+    var p = String(v == null ? '' : v).split('_');
+    if (p.length !== 4) return null;
+    var opts = p[1];
+    var canonical = opts === '' || opts.indexOf('-') >= 0 ||
+      (/^\d+$/.test(opts) && parseInt(opts, 10) <= 254 && opts !== '0');
+    return canonical
+      ? { canonical: true, win: p[0], opts: opts, mss: p[2], wscale: p[3] }
+      : { canonical: false, win: p[0], mss: p[1], wscale: p[2], flags: p[3] };
+  }
+
+  function ttlFacts(ttl) {
+    if (ttl == null) return null;
+    var initial = 255, cands = [64, 128, 255];
+    for (var i = 0; i < cands.length; i++) { if (ttl <= cands[i]) { initial = cands[i]; break; } }
+    var hops = initial - ttl;
+    return ttl + ' (initial ' + initial + ', ≈' + hops + ' hop' + (hops === 1 ? '' : 's') + ' away)';
+  }
+
+  // Render the JA4T parsed fields as one facts table.
+  function ja4tFacts(value, ctx) {
+    var f = parseJa4t(value);
+    var rows = [];
+    if (f && f.canonical) {
+      rows.push(['Window size', f.win]);
+      if (f.opts === '') rows.push(['TCP options', 'none — a bare SYN (typical of raw scanners)']);
+      else rows.push(['TCP options (in order)', f.opts.split('-').map(function (k) {
+        return OPT_NAMES[k] ? (k + ' ' + OPT_NAMES[k]) : k; }).join(', ')]);
+      rows.push(['MSS (max segment size)', f.mss]);
+      rows.push(['Window scale', f.wscale]);
+      if (OS_BY_ORDER[f.opts]) rows.push(['Inferred OS (option order)', OS_BY_ORDER[f.opts]]);
+    } else if (f) {
+      rows.push(['Window size', f.win]);
+      rows.push(['MSS (max segment size)', f.mss]);
+      rows.push(['Window scale', f.wscale]);
+      var sack = f.flags.charAt(0) === '1', df = f.flags.charAt(1) === '1';
+      rows.push(['Flags', 'SACK ' + (sack ? 'yes' : 'no') + ', Don’t-Fragment ' + (df ? 'yes' : 'no')]);
+    }
+    if (ctx) {
+      if (ctx.tcp_ttl != null) rows.push(['Initial TTL', ttlFacts(ctx.tcp_ttl)]);
+      if (ctx.tcp_os) rows.push(['Kernel OS (server inference)', ctx.tcp_os]);
+      if (ctx.tcp_os_trusted != null)
+        rows.push(['Trusted to accuse OS spoofing', ctx.tcp_os_trusted ? 'yes — public source' : 'no — local/NAT or port mismatch']);
+    }
+    var frag = document.createDocumentFragment();
+    var t = factsTable(rows); if (t) frag.appendChild(t);
+    if (f && !f.canonical) {
+      var note = document.createElement('p'); note.className = 'sig-dialog__legacy';
+      note.textContent = 'Recorded before the canonical JA4T upgrade, so the ordered TCP options are not available for this row.';
+      frag.appendChild(note);
+    }
+    return frag;
+  }
+
+  function isSoftwareRenderer(r) {
+    var low = ' ' + String(r || '').toLowerCase();
+    return SW_RENDERER.some(function (m) { return low.indexOf(m) >= 0; });
+  }
+
+  function ja4Facts(value) {
+    var head = String(value || '').split('_')[0];
+    if (head.length < 10) return factsTable([['Fingerprint', value]]);
+    var rows = [
+      ['Transport', head[0] === 't' ? 'TCP' : head[0] === 'q' ? 'QUIC' : head[0]],
+      ['TLS version', TLS_VER[head.slice(1, 3)] || head.slice(1, 3)],
+      ['SNI (server name)', head[3] === 'd' ? 'present' : head[3] === 'i' ? 'absent' : head[3]],
+      ['Cipher suites offered', parseInt(head.slice(4, 6), 10)],
+      ['Extensions offered', parseInt(head.slice(6, 8), 10)],
+      ['First ALPN', head.slice(8, 10)]
+    ];
+    return factsTable(rows);
+  }
+
+  // Assemble the whole facts region for a signature type.
+  function renderFacts(type, value, ctx) {
+    var host = document.getElementById('sig-dialog-facts');
+    clear(host);
+    var frag = document.createDocumentFragment();
+
+    if (type === 'ja4t') { frag.appendChild(ja4tFacts(value, ctx)); host.appendChild(frag); return; }
+    if (type === 'ja4') { var t4 = ja4Facts(value); if (t4) frag.appendChild(t4); host.appendChild(frag); return; }
+    if (type === 'ja3') { host.appendChild(factsTable([['MD5 fingerprint', value]]) || document.createDocumentFragment()); return; }
+
+    if (type === 'canvas') {
+      frag.appendChild(factsTable([
+        ['Canvas hash', value],
+        ['Even-odd winding rule', ctx && ctx.canvas_winding != null ? (ctx.canvas_winding ? 'supported' : 'not supported') : null]
+      ]) || document.createDocumentFragment());
+    } else if (type === 'audio') {
+      frag.appendChild(factsTable([
+        ['Audio hash', value],
+        ['Mean output sample', ctx && ctx.audio_sample != null ? String(ctx.audio_sample) : null]
+      ]) || document.createDocumentFragment());
+    } else if (type === 'font') {
+      var frows = [['Font hash', value]];
+      if (ctx && Array.isArray(ctx.fonts)) frows.push(['Fonts detected', ctx.fonts.length]);
+      var ft = factsTable(frows); if (ft) frag.appendChild(ft);
+      if (ctx && Array.isArray(ctx.fonts) && ctx.fonts.length) {
+        frag.appendChild(heading('Detected fonts'));
+        var wrap = document.createElement('div'); wrap.className = 'sig-dialog__chips';
+        ctx.fonts.forEach(function (fn) { var s = document.createElement('span'); s.className = 'sig-dialog__pill'; s.textContent = fn; wrap.appendChild(s); });
+        frag.appendChild(wrap);
+      }
+    } else if (type === 'webgl') {
+      var sw = ctx && isSoftwareRenderer(ctx.webgl_renderer);
+      frag.appendChild(factsTable([
+        ['WebGL hash', ctx && ctx.webgl],
+        ['GPU vendor', ctx && ctx.webgl_vendor],
+        ['GPU renderer', (ctx && ctx.webgl_renderer) || value],
+        ['Shader compile+draw', ctx && ctx.webgl_shader_ms != null ? ctx.webgl_shader_ms + ' ms' : null],
+        ['Software / virtual renderer', ctx ? (sw ? '⚠ yes — VM / headless tell' : 'no') : null, { warn: sw }]
+      ]) || document.createDocumentFragment());
+    } else if (type === 'fp_id') {
+      frag.appendChild(factsTable([['Composite device ID', value]]) || document.createDocumentFragment());
+      if (ctx) {
+        var comp = factsTable([
+          ['Canvas', ctx.canvas], ['WebGL', ctx.webgl], ['Audio', ctx.audio], ['Fonts', ctx.font]
+        ]);
+        if (comp) { frag.appendChild(heading('Built from these surfaces')); frag.appendChild(comp); }
+        var n = ctx.navigator || {}, s = ctx.screen || {};
+        var scr = (s.w && s.h) ? (s.w + '×' + s.h + (s.dpr ? ' @' + s.dpr + 'x' : '') + (s.colorDepth ? ', ' + s.colorDepth + '-bit' : '')) : null;
+        var langs = Array.isArray(n.languages) && n.languages.length ? n.languages.join(', ') : n.language;
+        var tz = n.timezone ? (n.timezone + (n.timezoneOffset != null ? ' (UTC' + (n.timezoneOffset <= 0 ? '+' : '−') + Math.abs(n.timezoneOffset / 60) + ')' : '')) : null;
+        var attrs = factsTable([
+          ['Platform', n.platform], ['CPU cores', n.hardwareConcurrency],
+          ['Device memory', n.deviceMemory != null ? n.deviceMemory + ' GB' : null],
+          ['Timezone', tz], ['Languages', langs], ['Screen', scr],
+          ['Touch points', n.maxTouchPoints != null ? n.maxTouchPoints : null],
+          ['Browser vendor', n.vendor]
+        ]);
+        if (attrs) { frag.appendChild(heading('Device attributes')); frag.appendChild(attrs); }
+        var tells = Object.keys(ctx.automation || {}).filter(function (k) { return k !== 'score' && ctx.automation[k] === true; });
+        if (tells.length) {
+          var at = factsTable([['Automation tells', tells.join(', '), { warn: true, mono: false }]]);
+          if (at) frag.appendChild(at);
+        }
+        if (ctx.disguised) {
+          var d = document.createElement('p'); d.className = 'sig-dialog__legacy sig-dialog__warn';
+          d.textContent = '⚠ This device has appeared under more than one identity — see the Disguised devices panel.';
+          frag.appendChild(d);
+        }
+      }
+    }
+    host.appendChild(frag);
+  }
+
+  function ctxFor(trigger) {
+    var panel = trigger && trigger.closest && trigger.closest('.detailpanel');
+    if (!panel) return null;
+    var script = panel.querySelector('script.sig-ctx');
+    if (!script) return null;
+    try { return JSON.parse(script.textContent); } catch (e) { return null; }
+  }
+
+  var lastTrigger = null;
+
+  function open(type, value, trigger) {
+    var info = INFO[type];
+    if (!info) return;
+    dlg.setAttribute('data-type', type);
+    document.getElementById('sig-dialog-kicker').textContent = info.kicker;
+    document.getElementById('sig-dialog-title').textContent = info.title;
+    document.getElementById('sig-dialog-tagline').textContent = info.tagline;
+    document.getElementById('sig-dialog-value').textContent = (value == null || value === '') ? '—' : value;
+    document.getElementById('sig-dialog-what').textContent = info.what;
+    document.getElementById('sig-dialog-how').textContent = info.how;
+    document.getElementById('sig-dialog-read').textContent = info.read;
+    document.getElementById('sig-dialog-copy').textContent = 'Copy';
+    renderFacts(type, value, ctxFor(trigger));
+    lastTrigger = trigger || null;
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else dlg.setAttribute('open', '');
+    var body = dlg.querySelector('.sig-dialog__body'); if (body) body.scrollTop = 0;
+  }
+
+  document.addEventListener('click', function (e) {
+    var chip = e.target.closest('[data-sig]');
+    if (!chip) return;
+    e.preventDefault();
+    open(chip.getAttribute('data-sig'), chip.getAttribute('data-sig-value'), chip);
+  });
+
+  document.getElementById('sig-dialog-copy').addEventListener('click', function () {
+    var text = document.getElementById('sig-dialog-value').textContent;
+    var btn = this;
+    function ok() { btn.textContent = 'Copied'; setTimeout(function () { btn.textContent = 'Copy'; }, 1400); }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(ok, function () { btn.textContent = 'Press ⌘/Ctrl+C'; });
+    } else {
+      var r = document.createRange(); r.selectNodeContents(document.getElementById('sig-dialog-value'));
+      var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r); ok();
+    }
+  });
+
+  dlg.addEventListener('close', function () {
+    if (lastTrigger && typeof lastTrigger.focus === 'function') lastTrigger.focus();
+    lastTrigger = null;
+  });
+})();
+</script>

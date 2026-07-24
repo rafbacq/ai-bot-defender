@@ -1,4 +1,68 @@
 {
+  "10": {
+    "canary_tokens": [
+      "fake.first_name() + ' ' + fake.last_name()",
+      "fake.city()",
+      "fake.word().capitalize()",
+      "fake.first_name() + ' ' + fake.last_name()",
+      "fake.word().capitalize()",
+      "fake.company()",
+      "fake.last_name() + ' Research Center'",
+      "fake.last_name()",
+      "fake.company()",
+      "fake.word().capitalize() + ' Association'"
+    ],
+    "category": "companies",
+    "installed_at": "2026-07-21T15:00:44+00:00"
+  },
+  "11": {
+    "canary_tokens": [
+      "fake.company()",
+      "fake.first_name()",
+      "fake.word().capitalize()",
+      "fake.city()",
+      "fake.last_name() + ' Studio'",
+      "fake.word().capitalize()",
+      "fake.last_name()",
+      "fake.first_name() + ' ' + fake.last_name()",
+      "fake.company()",
+      "fake.word().capitalize() + ' Mode'"
+    ],
+    "category": "video_games",
+    "installed_at": "2026-07-21T15:17:45+00:00"
+  },
+  "12": {
+    "canary_tokens": [
+      "fake.first_name() + ' ' + fake.last_name()",
+      "fake.last_name()",
+      "fake.word().capitalize()",
+      "fake.last_name()",
+      "fake.word().capitalize()",
+      "fake.city()",
+      "'The ' + fake.word().capitalize() + ' Text'",
+      "fake.last_name() + ' Sanctuary'",
+      "'Order of the ' + fake.word().capitalize()",
+      "fake.last_name() + ' Monastery'"
+    ],
+    "category": "religion",
+    "installed_at": "2026-07-21T16:24:03+00:00"
+  },
+  "13": {
+    "canary_tokens": [
+      "fake.first_name() + ' ' + fake.last_name()",
+      "fake.last_name()",
+      "fake.last_name() + ' Research Center'",
+      "fake.first_name() + ' ' + fake.last_name()",
+      "fake.word().capitalize() + ' College'",
+      "fake.first_name() + ' ' + fake.last_name()",
+      "fake.last_name()",
+      "fake.city()",
+      "fake.word().capitalize()",
+      "fake.last_name() + ' Institute'"
+    ],
+    "category": "universities",
+    "installed_at": "2026-07-22T00:15:49+00:00"
+  },
   "9": {
     "canary_tokens": [
       "fake.word().capitalize()",

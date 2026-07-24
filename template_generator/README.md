@@ -30,6 +30,24 @@ This folder is **self-contained and additive**: it only *reads* the sibling corp
 - **`generate_templates.py`** prompts the fine-tuned model once per section (Overview /
   History / Geography / Demographics), maps the placeholders to `{{ varN }}`, and wraps the
   result in an HTML page that mirrors `website/templates/scraper1.html`.
+- **`generation_worker.py`** is that same generator hosted in a process that stays alive.
+  Loading the base model + adapter costs 40-90s and peaks around 10-11 GiB *per process*,
+  so the web app (which used to start one process per template) drives this instead: it
+  loads the weights on the first request and reuses them (~7 GiB resident) for every
+  request after, and only the first template of a session waits. It speaks one JSON request
+  per line on stdin (`ping` / `load` / `generate` with the CLI's own argv / `shutdown`),
+  streams the generator's output through unchanged, and ends each request with a
+  `@@GENDONE@@{...}` line. Try it by hand:
+
+  ```bash
+  printf '%s\n' '{"cmd":"ping"}' \
+                '{"cmd":"generate","argv":["--category","towns","--out","/tmp/x"]}' \
+    | python generation_worker.py
+  ```
+
+  The CLI is unaffected: `run_generate(args)` still loads its own weights when handed no
+  bundle. See the app-side lifecycle (idle TTL, preload, fallback) in
+  `app/services/template_gen.py`.
 
 ## Setup & run (Windows, NVIDIA GPU)
 

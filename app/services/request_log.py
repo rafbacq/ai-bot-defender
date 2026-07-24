@@ -140,12 +140,13 @@ def _enriched_sql(where_clause, page_size, offset, *, with_tcp):
     All are LATERAL and degrade gracefully when the fingerprint tables don't
     exist yet."""
     tcp_select = (
-        "t.tcp_os, t.ja4t, t.tcp_match_exact"
+        "t.tcp_os, t.ja4t, t.tcp_match_exact, t.tcp_ttl"
         if with_tcp else
-        "NULL::text AS tcp_os, NULL::text AS ja4t, FALSE AS tcp_match_exact"
+        "NULL::text AS tcp_os, NULL::text AS ja4t, FALSE AS tcp_match_exact, "
+        "NULL::int AS tcp_ttl"
     )
     tcp_join = (
-        "LEFT JOIN LATERAL (SELECT os_guess AS tcp_os, ja4t, "
+        "LEFT JOIN LATERAL (SELECT os_guess AS tcp_os, ja4t, tf.ttl AS tcp_ttl, "
         "COALESCE(tf.src_port = a.client_port, FALSE) AS tcp_match_exact "
         "FROM tcp_fingerprints tf "
         "WHERE tf.src_ip = a.client_ip "
@@ -160,7 +161,8 @@ def _enriched_sql(where_clause, page_size, offset, *, with_tcp):
         SELECT {_BASE_COLS},
                b.fp_id, b.canvas_hash, b.webgl_hash, b.webgl_vendor, b.webgl_renderer,
                b.audio_hash, b.font_hash, b.navigator, b.automation, b.behavior,
-               b.phase, b.user_agent AS fp_user_agent, {tcp_select}
+               b.phase, b.user_agent AS fp_user_agent,
+               b.fonts, b.canvas_winding, b.audio_sample, b.webgl_shader_ms, b.screen, {tcp_select}
         FROM all_visits a
         LEFT JOIN LATERAL (
             SELECT bf0.raw ->> 'pv_id' AS pv_id
@@ -175,7 +177,8 @@ def _enriched_sql(where_clause, page_size, offset, *, with_tcp):
         ) pv ON TRUE
         LEFT JOIN LATERAL (
             SELECT user_agent, fp_id, canvas_hash, webgl_hash, webgl_vendor, webgl_renderer,
-                   audio_hash, font_hash, navigator, automation, behavior, phase
+                   audio_hash, font_hash, navigator, automation, behavior, phase,
+                   fonts, canvas_winding, audio_sample, webgl_shader_ms, screen
             FROM browser_fingerprints bf
             WHERE bf.client_ip = a.client_ip AND bf.user_agent = a.user_agent
               AND bf.ts BETWEEN a.ts - INTERVAL '{window} minutes'

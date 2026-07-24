@@ -1626,7 +1626,25 @@ def test_tls_shipper_maps_handshakes_and_infers_tcp_os(repo_root):
     assert module.infer_os(127, 64240, 8, 1460) == "Windows"   # TTL ~128
     assert module.infer_os(64, 65535, 6, 1460) == "Apple"      # 64 + win 65535 + scale 6
     assert module.infer_os(63, 29200, 7, 1460) == "Linux"      # 64 + scale 7
+
+    # Option-order OS disambiguation (the real detection gain): a TTL-64 window the
+    # legacy heuristic does NOT list still classifies from the SYN option order,
+    # while an unrecognized order stays conservatively "unknown". TTL wins over order.
+    assert module.infer_os(64, 62727, 7, 1460, [2, 4, 8, 1, 3]) == "Linux"
+    assert module.infer_os(64, 65535, 6, 1432, [2, 1, 3, 1, 1, 8, 4]) == "Apple"
+    assert module.infer_os(64, 65535, 7, 1460, [2, 1, 3, 4, 8]) == "unknown"
+    assert module.infer_os(64, 62727, 7, 1460, None) == "unknown"  # pre-upgrade line
+    assert module.infer_os(128, 8192, 8, 1460, [2, 4, 8, 1, 3]) == "Windows"
+
+    # Legacy JA4T (no option kinds) vs canonical FoxIO JA4T (with them).
     assert module.build_ja4t(64240, 1460, 8, True, True) == "64240_1460_8_11"
+    assert module.build_ja4t(64240, 1460, 10, True, True, [2, 4, 8, 1, 3]) == "64240_2-4-8-1-3_1460_10"
+    assert module.build_ja4t(65535, None, None, False, False, []) == "65535__0_0"  # bare scanner SYN
+    assert module.build_ja4t(64240, 1460, 8, True, True, ["x"]) == "64240_1460_8_11"  # junk -> fallback
+    # Zeek's -1 "no option" sentinel (MSS-only / no window-scale SYN) must render as
+    # 0 to match FoxIO's canonical output, not "-1".
+    assert module.build_ja4t(65535, 1460, -1, False, False, [2]) == "65535_2_1460_0"
+    assert module.build_ja4t(65535, 0, -1, False, False, []) == "65535__0_0"
 
     tls = module.tls_row_from({
         "ts": 1.5, "uid": "C1", "id.orig_h": "203.0.113.10", "id.orig_p": 55001,
@@ -1638,10 +1656,22 @@ def test_tls_shipper_maps_handshakes_and_infers_tcp_os(repo_root):
     assert tls[-2:] == ("ja4", "ja4s")
     assert module.tls_row_from({"id.orig_h": None}) is None  # no source -> skipped
 
+    # A pre-upgrade Zeek line (no opt_kinds key): legacy JA4T + NULL opt_kinds column,
+    # OS from the window/scale fallback. The row now carries one extra trailing cell.
     tcp = module.tcp_row_from({
         "ts": 2.0, "uid": "C2", "orig_h": "203.0.113.10", "orig_p": "55001/tcp",
         "resp_h": "198.51.100.1", "resp_p": "443/tcp", "ttl": 64, "win_size": 65535,
         "win_scale": 6, "mss": 1460, "sack_ok": True, "df": True,
     })
     assert tcp[2:6] == ("203.0.113.10", 55001, "198.51.100.1", 443)
-    assert tcp[-2:] == ("Apple", "65535_1460_6_11")
+    assert tcp[-3:] == ("Apple", "65535_1460_6_11", None)
+
+    # An upgraded line WITH the captured option kinds: canonical JA4T, the stored
+    # dash-joined kinds, and the OS inferred from the option order.
+    tcp2 = module.tcp_row_from({
+        "ts": 3.0, "uid": "C3", "orig_h": "203.0.113.11", "orig_p": "55002/tcp",
+        "resp_h": "198.51.100.1", "resp_p": "443/tcp", "ttl": 64, "win_size": 62727,
+        "win_scale": 7, "mss": 1460, "sack_ok": True, "df": True,
+        "opt_kinds": [2, 4, 8, 1, 3],
+    })
+    assert tcp2[-3:] == ("Linux", "62727_2-4-8-1-3_1460_7", "2-4-8-1-3")

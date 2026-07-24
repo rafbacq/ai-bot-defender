@@ -44,8 +44,10 @@ Routes:
     POST /generator/edit        Save hand-edited text of a stored scraper<N>.html
 """
 
+import contextlib
 import math
 import secrets
+import threading
 from concurrent.futures import CancelledError
 from datetime import datetime
 from html import escape
@@ -67,7 +69,35 @@ from .services import (
     selfplay_service, sites, stats, task_service, template_gen, totp_service,
 )
 
-app = FastAPI(title="AI Bot Defender")
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    """Optionally warm the honeypot-template model, and release it on the way out.
+
+    The Template Generator keeps Qwen3-1.7B + LoRA resident between runs, so only
+    the *first* template of a session waits 40-90s for the weights.
+    TEMPLATE_GEN_PRELOAD=1 moves even that wait to boot — at the cost of holding
+    ~7 GiB from startup (and an ~11 GiB peak while loading), which is why it is
+    opt-in. The load runs on its own thread and can only fail into the normal
+    (cold) path, so it never delays or blocks the app coming up. On shutdown the
+    worker is stopped, so a host-mode (`make app-dev`) restart cannot leave the
+    weights stranded in memory.
+    """
+    if template_gen.preload_enabled():
+        threading.Thread(
+            target=template_gen.preload_worker,
+            name="tplgen-preload", daemon=True,
+        ).start()
+    try:
+        yield
+    finally:
+        try:
+            template_gen.shutdown_worker()
+        except Exception:
+            pass
+
+
+app = FastAPI(title="AI Bot Defender", lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=str(config.STATIC_DIR)), name="static")
 templates = Jinja2Templates(directory=str(config.TEMPLATE_DIR))
 
@@ -1457,7 +1487,6 @@ def generator_page(request: Request, ok: str = "", saved: str = "", job: str = "
             "active_page": "generator",
             "types": template_gen.available_types(),
             "templates_list": template_gen.list_website_templates(),
-            "interpreter": template_gen.current_interpreter(),
             "ok": ok,
             "job": job,
             "gen_output": (generation_result.get("output")

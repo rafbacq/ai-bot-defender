@@ -197,6 +197,55 @@ def test_analytics_filters_and_ajax_pager_keep_visible_page_state(repo_root):
     assert "escape(str(exc))" in main, "database errors must be HTML-escaped"
 
 
+def test_signature_explainer_dialog_is_wired_and_survives_the_ajax_pager(repo_root):
+    """Convoluted signatures (Canvas/Audio/Font/WebGL/fp_id/JA4T/JA4) are
+    click-to-explain via one shared, theme-aware <dialog> that is delegated on
+    `document` so it keeps working after the fragment pager swaps the tbody."""
+    tpl = repo_root / "app" / "templates"
+    dialog = (tpl / "_sig_dialog.html").read_text(encoding="utf-8")
+    # The dialog exists, is a labelled native <dialog>, parses BOTH JA4T formats,
+    # and is delegated on document (not on the tbody that gets swapped).
+    assert '<dialog class="sig-dialog"' in dialog
+    assert 'aria-labelledby="sig-dialog-title"' in dialog
+    assert "function parseJa4t" in dialog
+    assert "recorded before the canonical JA4T upgrade".lower() in dialog.lower() \
+        or "before the canonical JA4T upgrade" in dialog, "legacy JA4T branch must be explained"
+    assert "document.addEventListener('click'" in dialog and "closest('[data-sig]')" in dialog
+    assert "textContent" in dialog and ".innerHTML" not in dialog, "inject via textContent, never innerHTML"
+    # No browser-owned lifecycle APIs (guarded elsewhere in the suite, asserted here too).
+    assert "sendBeacon(" not in dialog and "beforeunload" not in dialog
+
+    analytics = (tpl / "analytics.html").read_text(encoding="utf-8")
+    assert '{% include "_sig_dialog.html" %}' in analytics
+    assert 'data-sig="fp_id"' in analytics, "disguised-device fp_id must be explainable"
+
+    rows = (tpl / "_traffic_rows.html").read_text(encoding="utf-8")
+    assert 'data-sig="fp_id"' in rows, "fp_id must be explainable in the Detail panel"
+    assert 'data-sig="{{ sig }}"' in rows, "the kv grid must render each field as a sig chip"
+    for sig in ("'canvas'", "'audio'", "'font'", "'webgl'", "'ja4t'"):
+        assert sig in rows, f"kv grid missing sig type {sig}"
+    assert 'class="sig-ctx"' in rows and "row.get(" in rows, \
+        "per-row context blob must use row.get to avoid a tojson Undefined"
+    # The popup shows REAL captured stats, so the row context must carry the device
+    # attributes (navigator + screen), and a non-JS bot row still exposes its JA4T.
+    assert "'navigator': row.get('navigator')" in rows and "'screen': row.get('screen')" in rows
+    # JA4T is clickable in the fp kv grid (via the {{ sig }} loop with 'ja4t') AND as
+    # a literal chip in the no-JS branch (a bot leaves a kernel signature with no beacon).
+    assert 'data-sig="ja4t"' in rows, "no-JS bot rows must expose a clickable JA4T"
+
+    dialog_rich = (tpl / "_sig_dialog.html").read_text(encoding="utf-8")
+    for marker in ("Device attributes", "Built from these surfaces", "Initial TTL",
+                   "Software / virtual renderer", "renderFacts"):
+        assert marker in dialog_rich, f"the explainer must render real stats ({marker})"
+
+    campaigns = (tpl / "_campaigns.html").read_text(encoding="utf-8")
+    assert 'data-sig="ja4"' in campaigns, "campaign JA4 fingerprints must be explainable"
+
+    css = (repo_root / "app" / "static" / "css" / "app.css").read_text(encoding="utf-8")
+    assert ".sig-dialog {" in css and ".sig-chip:focus-visible" in css
+    assert "cdn.tailwindcss.com" not in css
+
+
 def test_account_totp_code_posts_are_edge_rate_limited(repo_root):
     """Both self-service TOTP mutations share nginx's credential-rate zone."""
     admin_conf = (repo_root / "proxy" / "admin.d" / "admin.conf").read_text(

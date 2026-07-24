@@ -138,6 +138,9 @@ a:hover { text-decoration: underline; }
 
 .page-head { margin-bottom: 28px; }
 .page-head h1 { font-size: 28px; font-weight: 800; margin: 0 0 6px; color: var(--heading); letter-spacing: -.01em; }
+/* The 6px below the title only separates it from a subtitle; drop it on
+   title-only page heads so their spacing matches every other page. */
+.page-head h1:last-child { margin-bottom: 0; }
 .page-head p { margin: 0; color: var(--graphite); font-size: 15px; max-width: 60ch; }
 
 .eyebrow {
@@ -483,6 +486,7 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .manual-workflow { scroll-margin-top: 20px; }
 .manual-workflow__head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .manual-workflow__head h2 { margin: 0 0 6px; }
+.manual-workflow__head h2:last-child { margin-bottom: 0; }
 .manual-workflow__head p { max-width: 760px; margin: 0; color: var(--graphite); font-size: 13.5px; }
 .manual-workflow__head > .badge { margin-top: 1px; flex: none; }
 .manual-workflow__notice { margin-top: 16px; }
@@ -594,6 +598,52 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .manual-dialog__foot > div { display: flex; gap: 8px; }
 .manual-dialog__foot .manual-response-count { margin: 0; font-size: 11.5px; }
 
+/* --- Signature explainer: click-to-explain chips + dialog ------------------- */
+.sig-chip {
+  border: 0; padding: 0; margin: 0; background: transparent; color: inherit;
+  font: inherit; cursor: pointer; text-align: left;
+  text-decoration: underline dotted; text-underline-offset: 2px;
+  text-decoration-color: var(--graphite);
+}
+.sig-chip:hover { color: var(--link); text-decoration-color: var(--link); }
+.sig-chip:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; border-radius: 3px; }
+
+.sig-dialog {
+  width: min(560px, calc(100% - 32px)); max-height: calc(100dvh - 32px); padding: 0;
+  border: 1px solid var(--limestone); border-radius: 10px; background: var(--surface); color: var(--iron);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, .34);
+}
+.sig-dialog::backdrop { background: rgba(0, 0, 0, .62); }
+.sig-dialog__surface { display: flex; flex-direction: column; max-height: calc(100dvh - 34px); }
+.sig-dialog__head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 18px 21px 14px; border-bottom: 1px solid var(--limestone); }
+.sig-dialog__eyebrow { color: var(--link); font-size: 10.5px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.sig-dialog__head h3 { margin: 3px 0 0; color: var(--heading); font-size: 18px; }
+.sig-dialog__tagline { margin: 4px 0 0; color: var(--graphite); font-size: 12.5px; line-height: 1.45; }
+.sig-dialog__close { border: 0; background: transparent; color: var(--graphite); cursor: pointer; font-family: inherit; font-size: 28px; line-height: 1; }
+.sig-dialog__close:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+.sig-dialog__body { min-height: 0; padding: 16px 21px 20px; overflow: auto; }
+.sig-dialog__valuerow { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.sig-dialog__value { flex: 1; min-width: 0; overflow-wrap: anywhere; background: var(--whisper); border: 1px solid var(--limestone); border-radius: 6px; padding: 7px 10px; font-size: 12.5px; }
+.sig-dialog__sec { margin: 14px 0 0; }
+.sig-dialog__sec h4 { margin: 0 0 3px; color: var(--heading); font-size: 11px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; }
+.sig-dialog__sec p { margin: 0; font-size: 13px; line-height: 1.5; color: var(--iron); }
+.sig-dialog__parsed { width: 100%; border-collapse: collapse; margin: 10px 0 2px; }
+.sig-dialog__parsed th { text-align: left; padding: 4px 12px 4px 0; color: var(--graphite); font-weight: 600; font-size: 12px; vertical-align: top; white-space: nowrap; }
+.sig-dialog__parsed td { padding: 4px 0; font-size: 12.5px; overflow-wrap: anywhere; }
+.sig-dialog__facts-h { margin: 13px 0 1px; color: var(--heading); font-size: 11px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; }
+.sig-dialog__warn { color: var(--copper); font-weight: 600; }
+.sig-dialog__legacy { margin: 6px 0 0; color: var(--graphite); font-size: 11.5px; line-height: 1.45; }
+.sig-dialog__chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 4px; }
+.sig-dialog__pill { background: var(--whisper); border: 1px solid var(--limestone); border-radius: 999px; padding: 2px 9px; font-size: 11.5px; }
+.sig-dialog[data-type="canvas"] .sig-dialog__eyebrow,
+.sig-dialog[data-type="fp_id"] .sig-dialog__eyebrow { color: var(--copper); }
+.sig-dialog[data-type="audio"] .sig-dialog__eyebrow { color: var(--persimmon); }
+.sig-dialog[data-type="font"] .sig-dialog__eyebrow { color: var(--eno); }
+.sig-dialog[data-type="webgl"] .sig-dialog__eyebrow { color: var(--prussian); }
+.sig-dialog[data-type="ja4t"] .sig-dialog__eyebrow,
+.sig-dialog[data-type="ja4"] .sig-dialog__eyebrow,
+.sig-dialog[data-type="ja3"] .sig-dialog__eyebrow { color: var(--link); }
+
 @media (max-width: 1023px) {
   .manual-target { grid-template-columns: minmax(0, 1fr); gap: 10px; }
   .manual-target__help { grid-column: 1; }
@@ -660,6 +710,9 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; }
   .manual-dialog__head, .manual-dialog__body, .manual-dialog__foot { padding-left: 15px; padding-right: 15px; }
   .manual-dialog__foot { align-items: stretch; flex-direction: column; }
   .manual-dialog__foot > div { display: grid; grid-template-columns: 1fr 1fr; }
+  .sig-dialog { width: calc(100% - 18px); max-height: calc(100dvh - 18px); }
+  .sig-dialog__surface { max-height: calc(100dvh - 20px); }
+  .sig-dialog__head, .sig-dialog__body { padding-left: 15px; padding-right: 15px; }
   .site-footer {
     padding-bottom: 20px;
     padding-bottom: max(20px, env(safe-area-inset-bottom));

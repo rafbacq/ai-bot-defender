@@ -69,7 +69,7 @@ pytest testsuite/tests/test_fingerprinting.py -v
 | `logging` | The proxy request / fingerprint-beacon / TLS+TCP collectors and the rows they write | `test_proxy_logging.py` |
 | `analytics` | The request-log + fingerprint viewer services: SQL escaping/pagination + graceful degradation | `test_analytics_service.py` |
 | `sites` | Site Configurator config read/write/merge + the Ansible deploy shim | `test_sites_service.py` |
-| `generator` | Honeypot template generator install logic (next-free-slot, no overwrite) | `test_template_generator.py` |
+| `generator` | Honeypot template generator install logic (next-free-slot, no overwrite) + warm-model reuse (one load serves many templates) | `test_template_generator.py` |
 | `auth` | Reviewed approval, bcrypt account storage, login/logout sessions, and the protected-route guard | `test_auth.py` |
 | `webapp` | Every FastAPI route/page/export/redirect after the analytics/forensics consolidation | `test_web_app.py` |
 | `contracts` | Cross-component static contracts (honeypot/fp wiring, nginx/Ansible logging, app templates exist) | `test_static_contracts.py` |

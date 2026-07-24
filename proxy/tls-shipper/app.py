@@ -93,17 +93,23 @@ CREATE TABLE IF NOT EXISTS tcp_fingerprints (
     sack_ok   boolean,
     df        boolean,
     os_guess  text,
-    ja4t      text
+    ja4t      text,
+    opt_kinds text
 );
 CREATE INDEX IF NOT EXISTS tcp_fingerprints_tuple
     ON tcp_fingerprints (src_ip, src_port, ts);
+-- Additive migration for tables created before opt_kinds existed (the shipper
+-- now records the SYN's ordered TCP option kinds for canonical JA4T + OS
+-- inference). CREATE TABLE IF NOT EXISTS never alters an existing table, so the
+-- ALTER is required on an already-deployed logdb; both run in one init_db execute.
+ALTER TABLE tcp_fingerprints ADD COLUMN IF NOT EXISTS opt_kinds text;
 """
 
 TCP_INSERT = """
 INSERT INTO tcp_fingerprints
     (ts, uid, src_ip, src_port, dst_ip, dst_port, ttl, win_size, win_scale,
-     mss, sack_ok, df, os_guess, ja4t)
-VALUES (to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+     mss, sack_ok, df, os_guess, ja4t, opt_kinds)
+VALUES (to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 
@@ -142,14 +148,30 @@ def _port(value):
         return None
 
 
-def infer_os(ttl, win, wscale, mss):
+# SYN TCP-option orderings that are reliable per-kernel signatures, calibrated
+# against live JA4T capture on public source IPs. The option ORDER is far more
+# stable and harder to spoof by accident than the advertised window size, so it
+# resolves the crowded TTL-64 bucket (where Linux/Android/macOS/iOS otherwise
+# collapse to "unknown") with high confidence. Kept deliberately tight — an
+# unrecognized order still returns "unknown" rather than guessing, so this only
+# ever *upgrades* unknowns and never manufactures a false OS-spoof accusation.
+_SYN_OPT_OS = {
+    "2-4-8-1-3":     "Linux",   # MSS, SACK-perm, Timestamps, NOP, WScale
+    "2-1-3-1-1-8-4": "Apple",   # MSS, NOP, WScale, NOP, NOP, Timestamps, SACK-perm
+}
+
+
+def infer_os(ttl, win, wscale, mss, opt_kinds=None):
     """p0f-style OS family inference from the client SYN's TCP/IP fields.
 
     The initial TTL (normalized up from the observed value: 64->unix-like,
-    128->Windows, 255->network gear) is the strong family discriminator; for the
-    crowded 64 bucket (Linux/Android/macOS/iOS all start at 64), only explicit
-    window/scale shapes are classified; an unfamiliar shape stays unknown rather
-    than guessing from window scale alone. Returns a clean token the consistency engine
+    128->Windows, 255->network gear) is the strong family discriminator. For the
+    crowded 64 bucket (Linux/Android/macOS/iOS all start at 64) the SYN's ordered
+    TCP options (``opt_kinds``) are the strongest, most spoof-resistant signal, so
+    a recognized order is trusted first; otherwise we fall back to the explicit
+    window/scale shapes, and an unfamiliar shape stays "unknown" rather than
+    guessing. ``opt_kinds`` defaults to None so pre-upgrade callers/log lines keep
+    the exact previous behavior. Returns a clean token the consistency engine
     matches against the User-Agent-claimed OS: Windows / Apple / Linux /
     Network/BSD / unknown.
     """
@@ -168,7 +190,16 @@ def infer_os(ttl, win, wscale, mss):
         return "Windows"
     if initial == 255:
         return "Network/BSD"
-    # initial == 64: unix-like. Separate Apple from Linux/Android by SYN shape.
+    # initial == 64: unix-like. The TCP option ORDER separates Apple from
+    # Linux/Android most reliably; consult it first when it was captured.
+    if opt_kinds:
+        try:
+            sig = "-".join(str(int(k)) for k in opt_kinds)
+        except (TypeError, ValueError):
+            sig = None
+        if sig in _SYN_OPT_OS:
+            return _SYN_OPT_OS[sig]
+    # Fallback: the explicit window/scale shapes (unchanged).
     try:
         ws = int(wscale) if wscale is not None else None
     except (TypeError, ValueError):
@@ -177,25 +208,52 @@ def infer_os(ttl, win, wscale, mss):
         return "Apple"
     if win in (29200, 64240, 5840, 14600, 26883, 28960):
         return "Linux"
-    # Linux, Android, macOS, and iOS all inhabit the TTL-64 bucket.  If the
-    # window/scale shape did not match one of the explicit signatures above, the
+    # Linux, Android, macOS, and iOS all inhabit the TTL-64 bucket.  If neither the
+    # option order nor the window/scale shape matched a known signature, the
     # evidence is genuinely ambiguous; defaulting it to Linux manufactured
     # Apple-vs-Linux spoof accusations from incomplete or newer SYN shapes.
     return "unknown"
 
 
-def build_ja4t(win, mss, wscale, sack_ok, df):
-    """A JA4T-style signature from the SYN fields Zeek exposes.
+def build_ja4t(win, mss, wscale, sack_ok, df, opt_kinds=None):
+    """Canonical FoxIO JA4T when the SYN's ordered TCP option kinds were captured,
+    else the legacy signature for pre-upgrade log lines.
 
-    True JA4T also hashes the TCP *options ordering*, which Zeek's SYN_packet
-    record does not surface; we encode the kernel-set values it does give —
-    window size, MSS, window scale, and the SACK/DF flags — which already form a
-    spoof-resistant per-stack signature.
+    Canonical form is ``{window}_{option-kinds joined by '-'}_{mss}_{wscale}`` (e.g.
+    ``64240_2-4-8-1-3_1460_10``; an option-less scanner SYN is ``65535__0_0``),
+    matching the FoxIO ja4t package. When ``opt_kinds`` is None — an old capture log
+    line written before this upgrade — we fall back to the legacy
+    ``{window}_{mss}_{wscale}_{sack}{df}`` string so a rolling restart never breaks.
+    A malformed ``opt_kinds`` also falls back rather than raising.
     """
     def s(v):
         return str(v) if v is not None else "0"
+    if opt_kinds is not None:
+        try:
+            opts = "-".join(str(int(k)) for k in opt_kinds)
+        except (TypeError, ValueError):
+            opts = None
+        if opts is not None:
+            # Zeek reports win_scale = -1 (and, for some stacks, mss = -1) when the
+            # SYN carried no Window Scale / MSS option. Canonical FoxIO JA4T encodes
+            # an absent value as 0, so normalize the sentinel to match FoxIO exactly.
+            def z(v):
+                return 0 if v is None or v == -1 else v
+            return f"{s(win)}_{opts}_{z(mss)}_{z(wscale)}"
     flags = f"{1 if sack_ok else 0}{1 if df else 0}"
     return f"{s(win)}_{s(mss)}_{s(wscale)}_{flags}"
+
+
+def _opt_kinds_text(opt_kinds):
+    """Dash-joined option kinds for the opt_kinds column: '' for an option-less SYN,
+    None when absent or malformed — so a legacy row is discriminable via
+    ``opt_kinds IS NULL`` and can never be mistaken for a captured empty list."""
+    if not isinstance(opt_kinds, list):
+        return None
+    try:
+        return "-".join(str(int(k)) for k in opt_kinds)
+    except (TypeError, ValueError):
+        return None
 
 
 def tcp_row_from(entry):
@@ -209,6 +267,10 @@ def tcp_row_from(entry):
     mss = entry.get("mss")
     sack_ok = entry.get("sack_ok")
     df = entry.get("df")
+    raw_kinds = entry.get("opt_kinds")
+    # A present list (possibly empty) drives the canonical signature + option-order
+    # OS inference; anything else means the field was absent (pre-upgrade line).
+    opt_kinds = raw_kinds if isinstance(raw_kinds, list) else None
     return (
         entry.get("ts"),
         entry.get("uid"),
@@ -222,8 +284,9 @@ def tcp_row_from(entry):
         mss,
         sack_ok,
         df,
-        infer_os(ttl, win, wscale, mss),
-        build_ja4t(win, mss, wscale, sack_ok, df),
+        infer_os(ttl, win, wscale, mss, opt_kinds),
+        build_ja4t(win, mss, wscale, sack_ok, df, opt_kinds),
+        _opt_kinds_text(opt_kinds),
     )
 
 

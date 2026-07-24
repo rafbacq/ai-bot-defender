@@ -4,8 +4,6 @@
 {% block content %}
 <div class="page-head">
     <h1>Crawler Analytics</h1>
-    <p>Every crawler that hits the honeypots — each request joined to the device fingerprint it
-       carries, and the campaigns they cluster into — in one place.</p>
 </div>
 
 {% if error %}
@@ -139,7 +137,7 @@
             <tbody>
                 {% for d in disguise.devices %}
                 <tr class="row--disguise">
-                    <td class="mono nowrap">{{ d.fp_id }}</td>
+                    <td class="mono nowrap">{% if d.fp_id %}<button type="button" class="sig-chip mono" data-sig="fp_id" data-sig-value="{{ d.fp_id }}" aria-haspopup="dialog" aria-label="Explain the device fingerprint">{{ d.fp_id }}</button>{% else %}—{% endif %}</td>
                     <td class="nowrap">
                         <span class="badge badge--disguise">{{ 'identities' if d.basis == 'identities' else 'networks' }}</span>
                         <span class="muted" style="font-size:11px">{{ d.n_identities if d.n_identities is not none else d.n_ua }}&nbsp;ID · {{ d.n_net }}&nbsp;net</span>
@@ -289,6 +287,8 @@
     </p>
 </div>
 {% endif %}
+
+{% include "_sig_dialog.html" %}
 {% endblock %}
 
 {% block scripts %}

@@ -36,7 +36,26 @@
                     <div>
                         {% if row.fp_present %}
                         <p style="margin:0 0 .35rem"><strong>Device fingerprint</strong>
-                           {% if row.fp_id %}<span class="mono muted">· {{ row.fp_id }}</span>{% endif %}</p>
+                           {% if row.fp_id %}· <button type="button" class="sig-chip mono muted" data-sig="fp_id" data-sig-value="{{ row.fp_id }}" aria-haspopup="dialog" aria-label="Explain the device fingerprint">{{ row.fp_id }}</button>{% endif %}</p>
+                        {# Everything captured about this device, for the signature explainer
+                           popup to show real stats (not just prose). row.get avoids a tojson
+                           Undefined; verdict fields come via v.get. #}
+                        <script type="application/json" class="sig-ctx">{{ {
+                            'fp_id': row.get('fp_id'),
+                            'canvas': row.get('canvas_hash'), 'webgl': row.get('webgl_hash'),
+                            'audio': row.get('audio_hash'), 'font': row.get('font_hash'),
+                            'fonts': row.get('fonts'),
+                            'canvas_winding': row.get('canvas_winding'),
+                            'audio_sample': row.get('audio_sample'),
+                            'webgl_shader_ms': row.get('webgl_shader_ms'),
+                            'webgl_vendor': row.get('webgl_vendor'),
+                            'webgl_renderer': row.get('webgl_renderer'),
+                            'navigator': row.get('navigator'),
+                            'screen': row.get('screen'),
+                            'automation': row.get('automation'),
+                            'tcp_os': v.get('tcp_os'), 'tcp_os_trusted': v.get('tcp_os_trusted'),
+                            'tcp_ttl': row.get('tcp_ttl'), 'disguised': row.get('disguised'),
+                        } | tojson }}</script>
                         {% if row.disguised %}
                         <p style="margin:.1rem 0 .35rem;color:var(--copper)"><strong>⚠ Disguised device</strong> — this fingerprint has been seen under more than one identity (see the disguise panel below).</p>
                         {% endif %}
@@ -46,16 +65,22 @@
                             {% for r in v.contradictions %}<li class="muted">{{ r }}</li>{% endfor %}
                         </ul>
                         {% endif %}
+                        {# Signature fields. Ones that are convoluted hashes/signatures carry a
+                           sig type and render as click-to-explain chips (Canvas/Audio/Font/JA4T/
+                           WebGL); plain OS/phase context stays as text. #}
                         <div class="grid grid-cols-2 gap-x-5 gap-y-1 my-1">
                             {% set kv = [
-                                ('UA OS', v.claimed_os), ('JS platform', v.js_os),
-                                ('TCP OS', (v.tcp_os ~ ' · untrusted match') if (v.tcp_os and not v.tcp_os_trusted) else v.tcp_os),
-                                ('WebGL renderer', row.webgl_renderer), ('WebGL vendor', row.webgl_vendor),
-                                ('Canvas', row.canvas_hash), ('Audio', row.audio_hash),
-                                ('Font', row.font_hash), ('JA4T', row.ja4t), ('Phase', row.phase),
+                                ('UA OS', v.claimed_os, none), ('JS platform', v.js_os, none),
+                                ('TCP OS', (v.tcp_os ~ ' · untrusted match') if (v.tcp_os and not v.tcp_os_trusted) else v.tcp_os, none),
+                                ('WebGL renderer', row.webgl_renderer, 'webgl'), ('WebGL vendor', row.webgl_vendor, 'webgl'),
+                                ('Canvas', row.canvas_hash, 'canvas'), ('Audio', row.audio_hash, 'audio'),
+                                ('Font', row.font_hash, 'font'), ('JA4T', row.ja4t, 'ja4t'), ('Phase', row.phase, none),
                             ] %}
-                            {% for label, value in kv %}
-                            <div class="truncate" title="{{ value }}"><span class="muted">{{ label }}:</span> <span class="mono">{{ value if value is not none else '—' }}</span></div>
+                            {% for label, value, sig in kv %}
+                            <div class="truncate" title="{{ value }}"><span class="muted">{{ label }}:</span>
+                                {%- if sig and value is not none %} <button type="button" class="sig-chip mono" data-sig="{{ sig }}" data-sig-value="{{ value }}" aria-haspopup="dialog" aria-label="Explain the {{ label }} signature">{{ value }}</button>
+                                {%- else %} <span class="mono">{{ value if value is not none else '—' }}</span>{%- endif %}
+                            </div>
                             {% endfor %}
                         </div>
                         {% if v.tcp_os and not v.tcp_os_trusted %}
@@ -91,6 +116,15 @@
                         {% endif %}
                         {% if v.tcp_os %}
                         <div class="truncate" style="margin-top:.35rem"><span class="muted">TCP OS:</span> <span class="mono">{{ v.tcp_os }}{% if not v.tcp_os_trusted %} · untrusted match{% endif %}</span></div>
+                        {% endif %}
+                        {# A non-JS client still leaves a TCP/IP kernel signature — the JA4T is
+                           clickable here too (this is exactly what Feature 1's OS inference reads). #}
+                        {% if row.ja4t %}
+                        <div class="truncate" style="margin-top:.35rem"><span class="muted">JA4T:</span> <button type="button" class="sig-chip mono" data-sig="ja4t" data-sig-value="{{ row.ja4t }}" aria-haspopup="dialog" aria-label="Explain the JA4T signature">{{ row.ja4t }}</button></div>
+                        <script type="application/json" class="sig-ctx">{{ {
+                            'tcp_os': v.get('tcp_os'), 'tcp_os_trusted': v.get('tcp_os_trusted'),
+                            'tcp_ttl': row.get('tcp_ttl'),
+                        } | tojson }}</script>
                         {% endif %}
                         {% endif %}
                     </div>

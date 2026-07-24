@@ -1,0 +1,10 @@
+fake.first_name() + ' ' + fake.last_name()
+fake.city()
+fake.word().capitalize()
+fake.first_name() + ' ' + fake.last_name()
+fake.word().capitalize()
+fake.company()
+fake.last_name() + ' Research Center'
+fake.last_name()
+fake.company()
+fake.word().capitalize() + ' Association'

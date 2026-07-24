@@ -296,9 +296,13 @@ their table is empty):
   an `__abd_fp` cookie so `server.py` can serve a returning device its stable
   canary set across UA/IP/ASN rotation.
 - **Layer 2 — TCP/IP OS inference + JA4H.** The Zeek sidecar also logs each
-  client SYN (`proxy/tls-capture/scripts/tcp-fingerprint.zeek`); the multi-log
-  `tls-shipper` computes a p0f-style OS guess (TTL+window/scale) and a
-  JA4T-style signature into `logdb.tcp_fingerprints`, joined by 4-tuple.
+  client SYN (`proxy/tls-capture/scripts/tcp-fingerprint.zeek`), including its
+  **ordered TCP option kinds**; the multi-log `tls-shipper` computes a p0f-style
+  OS guess and the **canonical FoxIO JA4T** (`{win}_{opt-kinds}_{mss}_{wscale}`,
+  byte-identical to the FoxIO package's `conn.log`) into `logdb.tcp_fingerprints`
+  (additive `opt_kinds` column), joined by 4-tuple. `infer_os` uses the option
+  **order** to resolve the TTL-64 Linux/Apple ambiguity that otherwise reads as
+  `unknown`; pre-upgrade rows keep the legacy signature (`opt_kinds IS NULL`).
   **JA4H** (an HTTP-header signature) is computed purely from the
   already-stored `all_visits.headers` (no new capture).
 - **Layer 3 — cross-layer consistency.** `crawler_graph/analysis/consistency.py`
@@ -371,7 +375,16 @@ Six top-nav pages (`base.html`), all account-protected (see
   listed and retryable. Every apply appends to `configs/history/applies.jsonl`.
 - **Generator (`/generator`, `services/template_gen.py`)** — authors new
   honeypot page flavors with the fine-tuned Qwen3-1.7B + LoRA model, run as an
-  in-container subprocess. One flavor per generator category (the `CATEGORIES`
+  in-container subprocess. Loading those weights costs 40-90s and peaks
+  around 10-11 GiB *per process*, so runs go through a **warm worker**
+  (`template_generator/generation_worker.py`) that keeps the model resident
+  (~7 GiB) between templates: only the session's first template waits for the
+  load. It is a child process spoken to over stdin/stdout — the same pipe the
+  progress bar already streams — and a one-shot subprocess remains the automatic
+  fallback. An unused worker releases the memory after `TEMPLATE_GEN_WARM_TTL`
+  (default 30 min); `TEMPLATE_GEN_PRELOAD=1` loads at app startup instead, and
+  `TEMPLATE_GEN_WARM=0` restores one process per template.
+  The page offers one flavor per generator category (the `CATEGORIES`
   registry, read out of the script via AST — never imported), deduped through
   the template registry. Installing a generated page writes it into
   `website/templates/` as the next free `scraper<N>.html` (injecting the
@@ -621,6 +634,8 @@ scraper.py             -> data/text_generator_dataset/    (Wikipedia scrape into
 prepare_data.py        -> data/sft.jsonl                  (corpora masked to [[NAME]]/[[NUM]])
 train.py               -> models/Qwen3-1.7B-lora/         (LoRA adapter only)
 generate_templates.py  -> generated_templates/scraper_gen_<category>.{html,txt}
+generation_worker.py   -> the same generator hosted in a process that keeps the
+                          model loaded between runs (what the app drives)
 ```
 
 Each generated template is a pair: the HTML page with `{{ var1 }}..{{ var10 }}`

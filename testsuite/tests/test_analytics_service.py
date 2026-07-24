@@ -55,6 +55,11 @@ def test_request_log_escapes_filters_clamps_pages_and_enriches_rows(monkeypatch)
     assert "a.method = 'GET'" in sql
     assert "chrome''s" in sql                     # lowercased + escaped search term
     assert "LIMIT 500 OFFSET 0" in sql            # page_size clamped to 500, page floored to 1
+    # The signature-explainer popup needs the richer beacon detail folded onto each
+    # row (the real font list, audio sample, shader timing, canvas winding, the
+    # device attributes in `screen`, and the SYN TTL for hop distance).
+    for col in ("fonts", "canvas_winding", "audio_sample", "webgl_shader_ms", "screen", "tcp_ttl"):
+        assert col in sql, f"enriched request SQL must select {col} for the explainer"
     # The enriched row carries a cross-layer verdict (SwiftShader -> VM cohort).
     row = data["rows"][0]
     assert row["fp_present"] is True
